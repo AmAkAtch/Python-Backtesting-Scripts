@@ -1,0 +1,41 @@
+{
+	"schemaVersion": 1,
+	"id": "trmt",
+	"version": "${version}",
+	"name": "TRMT",
+	"description": "An erosion mod for Minecraft",
+	"authors": [
+		"milkucha"
+	],
+	"contact": {
+		"homepage": "https://github.com/milkucha/trmt",
+		"sources": "https://github.com/milkucha/trmt"
+	},
+	"license": "CC-BY-NC-4.0",
+	"icon": "assets/trmt/icon.png",
+	"environment": "*",
+	"entrypoints": {
+		"main": [
+			"milkucha.trmt.TRMT"
+		],
+		"client": [
+			"milkucha.trmt.client.TRMTClient"
+		],
+		"fabric-datagen": [
+			"milkucha.trmt.client.TRMTDataGenerator"
+		]
+	},
+	"mixins": [
+		"trmt.mixins.json",
+		{
+			"config": "trmt.client.mixins.json",
+			"environment": "client"
+		}
+	],
+	"depends": {
+		"fabricloader": ">=0.19.3",
+		"minecraft": "~26.2",
+		"java": ">=25",
+		"fabric-api": "*"
+	}
+}

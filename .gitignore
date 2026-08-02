@@ -1,0 +1,29 @@
+# CSV data files
+*.csv
+
+# Python cache & data
+__pycache__/
+*.py[cod]
+*$py.class
+data/
+data_cache/
+**/data/
+**/data_cache/
+**/results/
+
+# Java / Gradle build outputs
+*.class
+.gradle/
+**/build/
+**/bin/
+**/out/
+
+# Environment files
+.env
+.env.*
+
+# IDE & OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

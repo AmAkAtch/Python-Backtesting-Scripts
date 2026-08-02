@@ -1,0 +1,95 @@
+package milkucha.trmt.client;
+
+import milkucha.trmt.TRMT;
+import milkucha.trmt.TRMTBlocks;
+import milkucha.trmt.block.ErodedSandBlock;
+import milkucha.trmt.client.debug.ErosionDebugHud;
+import milkucha.trmt.client.network.ClientErosionCache;
+import milkucha.trmt.client.render.ErodedGrassBlockModels;
+import milkucha.trmt.network.SyncChunkPayload;
+import milkucha.trmt.network.UpdateStagePayload;
+import milkucha.trmt.network.VersionCheckPayload;
+import milkucha.trmt.network.VersionResponsePayload;
+import net.fabricmc.api.ClientModInitializer;
+import net.fabricmc.fabric.api.client.networking.v1.ClientConfigurationNetworking;
+import net.fabricmc.fabric.api.client.networking.v1.ClientPlayConnectionEvents;
+import net.fabricmc.fabric.api.client.networking.v1.ClientPlayNetworking;
+import net.fabricmc.fabric.api.client.rendering.v1.BlockColorRegistry;
+import net.fabricmc.fabric.api.event.player.UseBlockCallback;
+import net.minecraft.world.InteractionResult;
+import net.minecraft.world.item.BlockItem;
+import net.fabricmc.loader.api.FabricLoader;
+import net.minecraft.client.color.block.BlockTintSource;
+import net.minecraft.client.renderer.BiomeColors;
+import net.minecraft.client.renderer.block.BlockAndTintGetter;
+import net.minecraft.core.BlockPos;
+import net.minecraft.world.level.ChunkPos;
+import net.minecraft.world.level.block.state.BlockState;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
+
+public class TRMTClient implements ClientModInitializer {
+	@Override
+	public void onInitializeClient() {
+		TRMTClientConfig.load();
+
+		// Respond to the server's configuration-phase version query with our own version.
+		ClientConfigurationNetworking.registerGlobalReceiver(VersionCheckPayload.ID, (payload, context) -> {
+			String myVersion = FabricLoader.getInstance().getModContainer(TRMT.MOD_ID)
+				.map(c -> c.getMetadata().getVersion().getFriendlyString())
+				.orElse("0.0.0");
+			context.responseSender().sendPacket(new VersionResponsePayload(myVersion));
+		});
+
+		ErodedGrassBlockModels.register();
+		BlockColorRegistry.register(
+				List.of(new BlockTintSource() {
+					@Override
+					public int color(BlockState state) {
+						return 0x79C05A;
+					}
+
+					@Override
+					public int colorInWorld(BlockState state, BlockAndTintGetter world, BlockPos pos) {
+						return BiomeColors.getAverageGrassColor(world, pos);
+					}
+				}),
+				TRMTBlocks.ERODED_GRASS_BLOCK
+		);
+		ErosionDebugHud.register();
+
+		// Suppress client-side block-placement prediction above sunken eroded sand (stages 1–4).
+		UseBlockCallback.EVENT.register((player, world, hand, hitResult) -> {
+			var placePos = hitResult.getBlockPos().relative(hitResult.getDirection());
+			var below = world.getBlockState(placePos.below());
+			if (below.is(TRMTBlocks.ERODED_SAND)
+					&& below.getValue(ErodedSandBlock.STAGE) > 0
+					&& player.getItemInHand(hand).getItem() instanceof BlockItem) {
+				return InteractionResult.FAIL;
+			}
+			return InteractionResult.PASS;
+		});
+
+		// Full chunk sync received on join.
+		ClientPlayNetworking.registerGlobalReceiver(SyncChunkPayload.ID, (payload, context) -> {
+			Map<BlockPos, ClientErosionCache.Entry> chunkEntries = new HashMap<>(payload.entries().size());
+			for (SyncChunkPayload.Entry e : payload.entries()) {
+				chunkEntries.put(e.pos(), new ClientErosionCache.Entry(e.stage(), e.walkedOnCount(), e.threshold(), e.lastTouchedGameTime()));
+			}
+			ChunkPos chunkPos = new ChunkPos(payload.chunkX(), payload.chunkZ());
+			context.client().execute(() -> ClientErosionCache.getInstance().setChunk(chunkPos, chunkEntries));
+		});
+
+		// Single-block stage update (advance or reset).
+		ClientPlayNetworking.registerGlobalReceiver(UpdateStagePayload.ID, (payload, context) ->
+			context.client().execute(() ->
+				ClientErosionCache.getInstance().setEntry(payload.pos(), payload.stage(), payload.walkedOnCount(), payload.threshold(), payload.lastTouchedGameTime())
+			)
+		);
+
+		// Clear cached stages when disconnecting so stale data never leaks into the next session.
+		ClientPlayConnectionEvents.DISCONNECT.register((handler, client) ->
+				ClientErosionCache.getInstance().clear());
+	}
+}
