@@ -27,6 +27,7 @@ import json
 import math
 import time
 import random
+import hashlib
 import logging
 import warnings
 import dataclasses
@@ -73,12 +74,12 @@ logger = logging.getLogger("momentum_framework")
 
 CACHE_DIR = "./data_cache"
 RESULTS_DIR = "./results"
-USE_SYNTHETIC_FALLBACK = False   # set False in a network-enabled environment
+USE_SYNTHETIC_FALLBACK = True   # set False in a network-enabled environment
 TRANSACTION_COST_PCT = 0.0015   # 0.15% per executed trade (STT+fees+brokerage+slippage)
 MONTHLY_INJECTION = 10_000.0
 MIN_ALLOCATION = 10_000.0
 INDICATOR_PARAM_MIN = 5
-INDICATOR_PARAM_MAX = 250
+INDICATOR_PARAM_MAX = 300
 MAX_ENTRY_SLOTS = 10
 MAX_EXIT_SLOTS = 10
 
@@ -832,10 +833,93 @@ class IndicatorLibrary:
     REGISTRY: Dict[str, Dict[str, Any]] = {}
 
 
+# Named parameter-range groups grounded in standard technical-analysis practice.
+# Previously every trainable period used one blanket (INDICATOR_PARAM_MIN,
+# INDICATOR_PARAM_MAX) = (5, 300) range regardless of indicator -- an Optuna
+# trial sampling ADX(287) was exactly as likely as ADX(14), even though no
+# practitioner uses ADX above ~30. That's pure wasted search budget: TPE has to
+# spend trials learning "high ADX periods are useless" instead of ever getting
+# to explore the region that matters. Tightening oscillators/ADX/Aroon to their
+# real practical range concentrates the search where it can actually pay off.
+# Moving averages and long-lookback trend filters are the deliberate exception:
+# kept WIDER than common practice (which tops out ~200 for MAs) specifically to
+# let the optimizer discover unconventional long-horizon windows the tightened
+# groups would never let it try.
+PARAM_RANGE_GROUPS: Dict[str, Tuple[int, int]] = {
+    "moving_average": (5, 250),     # SMA/EMA/WMA/DEMA/TEMA/Hull/KAMA -- kept wide on purpose
+    "fast_oscillator": (2, 50),     # RSI/Stoch/CCI/Williams %R/CMO/MFI/TRIX -- RSI(14)/(2) bookend real usage
+    "adx_family": (5, 30),          # ADX/+DI/-DI/Vortex -- Wilder's original is 14, rarely tuned past 30
+    "aroon": (10, 60),              # default 25, rarely tuned far outside this
+    "volatility_band": (5, 60),     # ATR/Bollinger/Keltner/Donchian/hist&Chaikin vol -- ATR(14)/Bollinger(20) etc.
+    "momentum_family": (5, 60),     # momentum/ROC/DPO/z-score/linreg slope -- short-to-medium lookbacks
+    "long_lookback": (50, 300),     # 252-day high/low, regime filters -- meant to span up to ~1 trading year
+    "streak_count": (3, 20),        # ha_streak -- small integer counts
+}
+
+# Per-indicator, per-parameter-name overrides where the group default isn't right
+# on its own (MACD's three periods each need a distinct sub-range, etc). Falls
+# back to the indicator's assigned group for any param not listed here.
+PARAM_OVERRIDES: Dict[str, Dict[str, Tuple[int, int]]] = {
+    "macd_line":       {"fast": (5, 20), "slow": (15, 60)},
+    "macd_signal":     {"fast": (5, 20), "slow": (15, 60), "signal": (3, 15)},
+    "macd_hist":       {"fast": (5, 20), "slow": (15, 60), "signal": (3, 15)},
+    "macd_hist_of_ha": {"fast": (5, 20), "slow": (15, 60), "signal": (3, 15)},
+    "ma_ratio":        {"fast": (5, 30), "slow": (20, 250)},
+    "ultimate_osc":    {"p1": (5, 10), "p2": (10, 20), "p3": (20, 40)},
+    "awesome_osc":     {"fast": (3, 10), "slow": (20, 40)},
+    "stochastic_d":    {"smooth": (2, 10)},
+    "rsi_of_roc":      {"roc_period": (5, 30)},
+    "atr_normalized_momentum": {"mom_period": (5, 30)},
+}
+
+# Indicator -> parameter-range group. Anything not listed defaults to
+# "momentum_family" (a moderate, non-extreme range) rather than silently
+# reverting to the old wide blanket range.
+INDICATOR_GROUPS: Dict[str, str] = {
+    "sma": "moving_average", "ema": "moving_average", "wma": "moving_average",
+    "dema": "moving_average", "tema": "moving_average", "hull_ma": "moving_average",
+    "kama": "moving_average",
+    "rsi": "fast_oscillator", "stochastic_k": "fast_oscillator", "stochastic_d": "fast_oscillator",
+    "williams_r": "fast_oscillator", "cci": "fast_oscillator", "cmo": "fast_oscillator",
+    "mfi": "fast_oscillator", "trix": "fast_oscillator", "volume_weighted_rsi": "fast_oscillator",
+    "rsi_of_roc": "fast_oscillator",  # rsi_period only; roc_period overridden above
+    "adx": "adx_family", "plus_di": "adx_family", "minus_di": "adx_family",
+    "vortex_plus": "adx_family", "vortex_minus": "adx_family",
+    "aroon_up": "aroon", "aroon_down": "aroon",
+    "atr": "volatility_band", "bollinger_mid": "volatility_band", "bollinger_upper": "volatility_band",
+    "bollinger_lower": "volatility_band", "bollinger_bandwidth": "volatility_band",
+    "keltner_upper": "volatility_band", "keltner_lower": "volatility_band",
+    "historical_volatility": "volatility_band", "chaikin_volatility": "volatility_band",
+    "donchian_upper": "volatility_band", "donchian_lower": "volatility_band", "donchian_mid": "volatility_band",
+    "cmf": "volatility_band", "bb_percent_b": "volatility_band", "chandelier_exit_long": "volatility_band",
+    "supertrend_direction": "volatility_band",
+    "atr_normalized_momentum": "momentum_family",  # mom_period overridden above; atr_period uses this group
+    "momentum": "momentum_family", "roc": "momentum_family", "dpo": "momentum_family",
+    "price_channel_pos": "momentum_family", "zscore": "momentum_family", "linreg_slope": "momentum_family",
+    "vwap_deviation": "momentum_family", "volume_roc": "momentum_family",
+    "pure_buy_volume_ratio": "momentum_family",
+    "pct_from_high": "long_lookback", "pct_from_low": "long_lookback",
+    "ha_streak": "streak_count",
+}
+
+
+def _param_range(indicator_name: str, param_name: str) -> Tuple[int, int]:
+    """Resolve the (lo, hi) range for one indicator's parameter, checking the
+    per-indicator override first, then falling back to the indicator's group."""
+    override = PARAM_OVERRIDES.get(indicator_name, {}).get(param_name)
+    if override is not None:
+        return override
+    group = INDICATOR_GROUPS.get(indicator_name, "momentum_family")
+    return PARAM_RANGE_GROUPS[group]
+
+
 def _build_registry():
-    """Populate IndicatorLibrary.REGISTRY reflectively with trainable param ranges."""
-    period_like = {"period", "fast", "slow", "signal", "p1", "p2", "p3", "lookback",
-                   "roc_period", "rsi_period", "mom_period", "atr_period"}
+    """
+    Populate IndicatorLibrary.REGISTRY reflectively with trainable param ranges.
+    See PARAM_RANGE_GROUPS/PARAM_OVERRIDES/INDICATOR_GROUPS above for the
+    grouping rationale -- ranges are tailored per indicator family rather than
+    one blanket range for everything.
+    """
     specs = {
         "sma": {"period": 20}, "ema": {"period": 20}, "wma": {"period": 20},
         "dema": {"period": 20}, "tema": {"period": 20}, "hull_ma": {"period": 20},
@@ -866,10 +950,9 @@ def _build_registry():
         fn = getattr(IndicatorLibrary, name)
         param_ranges = {}
         for p, dv in defaults.items():
-            if p in period_like or p in ("period",):
-                param_ranges[p] = (INDICATOR_PARAM_MIN, INDICATOR_PARAM_MAX, dv)
-            else:
-                param_ranges[p] = (dv, dv, dv)
+            lo, hi = _param_range(name, p)
+            dv = int(np.clip(dv, lo, hi))  # keep the traditional default, clipped into the new range
+            param_ranges[p] = (lo, hi, dv)
         IndicatorLibrary.REGISTRY[name] = {"fn": fn, "params": param_ranges}
 
 
@@ -957,7 +1040,15 @@ class DataPipeline:
         momentum autocorrelation) used only when live data is unreachable, so
         the rest of the pipeline remains fully testable offline.
         """
-        rng = np.random.default_rng(abs(hash(ticker)) % (2**32))
+        # NOTE: Python's built-in hash() is randomized per-process (PYTHONHASHSEED) for
+        # security reasons -- using it here would silently make this "seeded" generator
+        # produce DIFFERENT synthetic data on every fresh process run, even for the exact
+        # same ticker/years, which would quietly break reproducibility of every comparison
+        # in this file (including the memory/re-validation feature in run_full_pipeline,
+        # which specifically re-runs a prior config expecting the same data). hashlib's
+        # md5 is stable across processes and Python versions, which is what we need here.
+        stable_hash = int(hashlib.md5(ticker.encode()).hexdigest(), 16) % (2**32)
+        rng = np.random.default_rng(stable_hash)
         requested_days = self.years * 252
         end = pd.Timestamp.today().normalize()
         # NOTE: pd.bdate_range(end=..., periods=N) can return fewer than N rows when
@@ -1088,7 +1179,9 @@ class WatchlistEntry:
 
 class WatchlistEngine:
     """
-    Ranks tickers waiting for capital using one of 6 selectable priority models.
+    Ranks tickers waiting for capital using one of 6 selectable heuristic
+    priority models, or (runtime-only, not part of Optuna's search space
+    since the model doesn't exist during search) a fitted ML ranker.
     Higher score => higher execution priority.
     """
 
@@ -1097,8 +1190,9 @@ class WatchlistEngine:
         "pure_momentum", "pure_buying_volume", "heikin_ashi_strength",
     )
 
-    def __init__(self, cfg: StrategyConfig):
+    def __init__(self, cfg: StrategyConfig, ml_ranker: Optional["MLWatchlistRanker"] = None):
         self.cfg = cfg
+        self.ml_ranker = ml_ranker
 
     def rank(
         self,
@@ -1136,6 +1230,23 @@ class WatchlistEngine:
                 score = snap.get("v_buy", 0.0)
             elif model == "heikin_ashi_strength":
                 score = snap.get("ha_strength", 0.0)
+            elif model == "ml_ranked":
+                if self.ml_ranker is None or self.ml_ranker.model is None:
+                    score = 0.0  # no fitted model available -- degrades to a no-op ranking (insertion order)
+                else:
+                    ma = snap.get("ma", p_now)
+                    # Mirrors the feature semantics MLWatchlistRanker.build_training_set used:
+                    # price_dist there is "drift since the anchor point 'age' days ago" -- here
+                    # that anchor is the price when the ticker first entered the watchlist.
+                    features = {
+                        "price_dist": (p_now - e.signal_price) / max(e.signal_price, 1e-6),
+                        "age": float(age),
+                        "ma_dist": (p_now - ma) / max(ma, 1e-6),
+                        "momentum": snap.get("momentum", 0.0),
+                        "v_buy": snap.get("v_buy", 0.0),
+                        "ha_strength": snap.get("ha_strength", 0.0),
+                    }
+                    score = self.ml_ranker.score(features)
             else:
                 raise ValueError(f"Unknown watchlist model: {model}")
             scored.append((score, e))
@@ -1209,6 +1320,7 @@ class PortfolioEngine:
     def __init__(
         self, cfg: StrategyConfig, injection_days: Union[List[int], Dict[Tuple[int, int], int]],
         starting_cash: float = 0.0, sector_map: Optional[Dict[str, str]] = None,
+        ml_ranker: Optional["MLWatchlistRanker"] = None,
     ):
         self.cfg = cfg
         # Either a fixed set of days-of-month, or a dict mapping (year, month) -> target
@@ -1218,7 +1330,7 @@ class PortfolioEngine:
         self.cash = starting_cash
         self.positions: Dict[str, Position] = {}
         self.watchlist: List[WatchlistEntry] = []
-        self.watchlist_engine = WatchlistEngine(cfg)
+        self.watchlist_engine = WatchlistEngine(cfg, ml_ranker=ml_ranker)
         self.sector_map = sector_map or {}
         self.equity_curve: List[Tuple[pd.Timestamp, float]] = []
         self.trade_log: List[dict] = []
@@ -1438,13 +1550,14 @@ class Backtester:
     def __init__(
         self, cfg: StrategyConfig, market_data: Dict[str, pd.DataFrame],
         injection_days: List[int], sector_map: Optional[Dict[str, str]] = None,
-        benchmark: Optional[pd.Series] = None,
+        benchmark: Optional[pd.Series] = None, ml_ranker: Optional["MLWatchlistRanker"] = None,
     ):
         self.cfg = cfg
         self.market_data = market_data
         self.injection_days = injection_days
         self.sector_map = sector_map or {t: t.split(".")[0][:3] for t in market_data}
         self.benchmark = benchmark  # e.g. a broad index close series for regime filter
+        self.ml_ranker = ml_ranker  # only used when cfg.watchlist_model == "ml_ranked"
 
     # ---------------------------------------------------------- precompute
     def _precompute(self, tickers: List[str]) -> Dict[str, dict]:
@@ -1539,19 +1652,18 @@ class Backtester:
         # Detect that upfront and construct the cash-only equity curve directly via
         # the same injection/mark-to-market calls the full loop would have made
         # (the only two operations that matter when no position is ever opened),
-        # skipping everything else. Verified bit-exact against the full loop's
-        # output on a guaranteed-dead config; measured ~19x faster on such configs.
+        # skipping everything else.
         any_entry_possible = any(
             bool(pre[t]["entry"].reindex(all_dates).fillna(False).any()) for t in tickers
         )
         if not any_entry_possible:
-            portfolio = PortfolioEngine(self.cfg, self.injection_days, starting_cash=0.0, sector_map=self.sector_map)
+            portfolio = PortfolioEngine(self.cfg, self.injection_days, starting_cash=0.0, sector_map=self.sector_map, ml_ranker=self.ml_ranker)
             for date in all_dates:
                 portfolio.maybe_inject_cash(date)
                 portfolio.mark_to_market(date, {})
             return BacktestResult.from_portfolio(portfolio, self.cfg, benchmark=self.benchmark)
 
-        portfolio = PortfolioEngine(self.cfg, self.injection_days, starting_cash=0.0, sector_map=self.sector_map)
+        portfolio = PortfolioEngine(self.cfg, self.injection_days, starting_cash=0.0, sector_map=self.sector_map, ml_ranker=self.ml_ranker)
         exit_engine = ExitEngine(self.cfg)
 
         # Signals derived from indicator crossings at Day T close are buffered here and only
@@ -1560,8 +1672,8 @@ class Backtester:
         # buffered: those are resting stop orders that fire intraday against the current
         # day's price, which is standard execution-model treatment and distinct from an
         # indicator "signal" that requires the close to even be computed.
-        pending_entries: set = set()
-        pending_indicator_exits: set = set()
+        pending_entries: Dict[str, None] = {}
+        pending_indicator_exits: Dict[str, None] = {}
 
         for i, date in enumerate(all_dates):
             portfolio.maybe_inject_cash(date)
@@ -1587,7 +1699,7 @@ class Backtester:
             for t in list(pending_indicator_exits):
                 if t in portfolio.positions and t in price_lookup:
                     portfolio.exit_position(t, price_lookup[t], date, reason="indicator_exit")
-                pending_indicator_exits.discard(t)
+                pending_indicator_exits.pop(t, None)
 
             # -------- 2. check mechanical stop exits (TP / trailing / ATR chandelier) same-day -----
             for t in list(portfolio.positions.keys()):
@@ -1603,7 +1715,7 @@ class Backtester:
             # -------- 3. fill entries that were signalled on Day T-1 (respecting regime filter) ----
             regime_pass = bool(regime_ok.loc[date]) if date in regime_ok.index else True
             for t in list(pending_entries):
-                pending_entries.discard(t)
+                pending_entries.pop(t, None)
                 if not regime_pass or t not in price_lookup or t in portfolio.positions:
                     continue
                 price = price_lookup[t]
@@ -1616,9 +1728,9 @@ class Backtester:
             for t in tickers:
                 d = pre[t]
                 if date in d["entry"].index and t not in portfolio.positions and bool(d["entry"].loc[date]):
-                    pending_entries.add(t)
+                    pending_entries[t] = None
                 if date in d["exit"].index and t in portfolio.positions and bool(d["exit"].loc[date]):
-                    pending_indicator_exits.add(t)
+                    pending_indicator_exits[t] = None
 
             # -------- 5. allocate freed / injected cash to top watchlist candidate(s) ---------------
             pv = portfolio.cash + sum(p.shares * price_lookup.get(tt, p.entry_price) for tt, p in portfolio.positions.items())
@@ -2072,7 +2184,8 @@ class RobustnessSuite:
                 new_params = {}
                 for p, v in slot.params.items():
                     pct = rng.uniform(*pct_range) * rng.choice([-1, 1])
-                    new_val = int(np.clip(round(v * (1 + pct)), INDICATOR_PARAM_MIN, INDICATOR_PARAM_MAX))
+                    lo, hi = _param_range(slot.name, p)
+                    new_val = int(np.clip(round(v * (1 + pct)), lo, hi))
                     new_params[p] = new_val
                 slot.params = new_params
             nb_bt = Backtester(perturbed, self.market_data, injection_days=injection_days, benchmark=self.benchmark)
@@ -2202,6 +2315,97 @@ CURRENT_WINNER_PATH = os.path.join(RESULTS_DIR, "current_winner_config.json")
 FINAL_WINNER_PATH = os.path.join(RESULTS_DIR, "final_winner_config.json")
 
 
+def _load_prior_winner_config(path: str) -> Optional[StrategyConfig]:
+    """Load a previously persisted winner config from disk, if it exists and parses."""
+    if not os.path.exists(path):
+        return None
+    try:
+        with open(path, "r") as f:
+            payload = json.load(f)
+        return StrategyConfig.from_dict(payload["config"])
+    except Exception as e:
+        logger.warning(f"Could not load prior config from {path}: {e}")
+        return None
+
+
+def _config_to_optuna_params(
+    cfg: StrategyConfig, indicator_names: List[str], comparators: List[str], watchlist_models: List[str],
+) -> Dict[str, Any]:
+    """
+    Reverse-maps a StrategyConfig back into the exact flat parameter dict
+    Optuna's study.enqueue_trial() needs to reproduce it -- i.e. the same
+    {param_name: value} shape that _suggest_config/_suggest_slot's
+    trial.suggest_*() calls would have produced. This is what lets a
+    previously-found winner be re-injected as a guaranteed first trial in a
+    new search (see run_full_pipeline's "memory" section) instead of starting
+    the TPE sampler from nothing every single run.
+
+    Values are clipped into whatever the CURRENT indicator parameter ranges
+    are (see PARAM_RANGE_GROUPS) before being enqueued -- if those ranges have
+    since been tightened, Optuna's suggest_int() would otherwise raise a
+    hard error on an out-of-range enqueued value. The fresh full-window
+    backtest that validates "is this config still relevant" (see
+    run_full_pipeline) runs the ORIGINAL unclipped values directly against
+    IndicatorLibrary, so that validation is unaffected by this clipping --
+    only the re-seeded search trial is.
+    """
+    params: Dict[str, Any] = {
+        "n_entry_slots": int(np.clip(max(1, len(cfg.entry_slots)), 1, MAX_ENTRY_SLOTS)),
+        "n_exit_slots": int(np.clip(len(cfg.exit_slots), 0, MAX_EXIT_SLOTS)),
+    }
+
+    def slot_params(prefix: str, slot: IndicatorSlot):
+        active = not slot.is_empty() and slot.name in indicator_names
+        params[f"{prefix}_active"] = active
+        if not active:
+            return
+        params[f"{prefix}_name"] = slot.name
+        spec = IndicatorLibrary.REGISTRY[slot.name]["params"]
+        for p, (lo, hi, _dv) in spec.items():
+            if lo == hi:
+                continue  # fixed param, not sampled, nothing to enqueue
+            raw_val = slot.params.get(p, _dv)
+            params[f"{prefix}_{slot.name}_{p}"] = int(np.clip(raw_val, lo, hi))
+        comparator = slot.comparator if slot.comparator in comparators else comparators[0]
+        params[f"{prefix}_comparator"] = comparator
+        if comparator in ("greater_than", "less_than"):
+            params[f"{prefix}_threshold"] = float(np.clip(slot.threshold, 0.0, 100.0))
+
+    entry_slots = cfg.entry_slots or [IndicatorSlot(name=None)]
+    for i, slot in enumerate(entry_slots):
+        slot_params(f"entry{i}", slot)
+    for i, slot in enumerate(cfg.exit_slots):
+        slot_params(f"exit{i}", slot)
+
+    use_tp = cfg.take_profit_pct is not None
+    use_tsl = cfg.trailing_stop_pct is not None
+    use_chandelier = cfg.atr_chandelier_mult is not None
+    params["use_tp"] = use_tp
+    params["use_tsl"] = use_tsl
+    params["use_atr_chandelier"] = use_chandelier
+    if use_tp:
+        params["take_profit_pct"] = float(np.clip(cfg.take_profit_pct, 0.05, 0.60))
+    if use_tsl:
+        params["trailing_stop_pct"] = float(np.clip(cfg.trailing_stop_pct, 0.03, 0.30))
+    if use_chandelier:
+        params["atr_chandelier_mult"] = float(np.clip(cfg.atr_chandelier_mult, 1.5, 5.0))
+
+    params["use_heikin_ashi"] = cfg.use_heikin_ashi
+    params["atr_period"] = int(np.clip(cfg.atr_period, 5, 60))
+    # "ml_ranked" is a runtime-only mode (see WatchlistEngine), never one of Optuna's
+    # sampled categorical choices -- fall back to the default heuristic if encountered
+    # (shouldn't normally happen since ml_ranked configs are never persisted as winners).
+    params["watchlist_model"] = cfg.watchlist_model if cfg.watchlist_model in watchlist_models else watchlist_models[0]
+    params["wl_w_price_dist"] = float(np.clip(cfg.watchlist_weight_price_dist, 0.0, 1.0))
+    params["wl_w_age"] = float(np.clip(cfg.watchlist_weight_age, 0.0, 1.0))
+    params["wl_ma_period"] = int(np.clip(cfg.watchlist_proximity_ma_period, *PARAM_RANGE_GROUPS["moving_average"]))
+    params["regime_filter_enabled"] = cfg.regime_filter_enabled
+    params["regime_sma_period"] = int(np.clip(cfg.regime_index_sma_period, 50, 250))
+    params["sector_cap_pct"] = float(np.clip(cfg.sector_cap_pct, 0.15, 1.0))
+    params["vol_sizing_enabled"] = cfg.vol_sizing_enabled
+    return params
+
+
 class ObjectiveFunction:
     """Custom multi-objective loss combining Sharpe, CAGR, Max Drawdown, and a robustness penalty."""
 
@@ -2286,7 +2490,7 @@ class StrategyOptimizer:
     def __init__(
         self, market_data: Dict[str, pd.DataFrame], tickers: List[str], injection_days: List[int],
         benchmark: Optional[pd.Series] = None, objective_fn: Optional[ObjectiveFunction] = None,
-        robust_objective: bool = False, robust_n_sip: int = 3,
+        robust_objective: bool = False, robust_n_sip: int = 3, live_robustness_check: bool = True,
     ):
         self.market_data = market_data
         self.tickers = tickers
@@ -2301,6 +2505,14 @@ class StrategyOptimizer:
         # schedule, at the cost of ~(1 + robust_n_sip)x backtests per trial.
         self.robust_objective = robust_objective
         self.robust_n_sip = robust_n_sip
+        # Every time a NEW best is found (not every trial -- new winners get rarer as
+        # search progresses, so the added cost is bounded), run a cheap SIP-sensitivity
+        # + parameter-neighborhood check right then rather than waiting for the whole
+        # search to finish. This surfaces an overfit "winner" in real time instead of
+        # discovering it only in the post-hoc report after the full trial budget is
+        # already spent. Deliberately lighter than the final suite (5 SIP schedules +
+        # 2 neighbors here vs 15 + 5 for the true final winner).
+        self.live_robustness_check = live_robustness_check
         self.best_score = -np.inf
         self.best_cfg: Optional[StrategyConfig] = None
         self.best_result: Optional[BacktestResult] = None
@@ -2342,7 +2554,7 @@ class StrategyOptimizer:
             watchlist_model=trial.suggest_categorical("watchlist_model", self.WATCHLIST_MODELS),
             watchlist_weight_price_dist=trial.suggest_float("wl_w_price_dist", 0.0, 1.0),
             watchlist_weight_age=trial.suggest_float("wl_w_age", 0.0, 1.0),
-            watchlist_proximity_ma_period=trial.suggest_int("wl_ma_period", INDICATOR_PARAM_MIN, INDICATOR_PARAM_MAX),
+            watchlist_proximity_ma_period=trial.suggest_int("wl_ma_period", *PARAM_RANGE_GROUPS["moving_average"]),
             regime_filter_enabled=trial.suggest_categorical("regime_filter_enabled", [True, False]),
             regime_index_sma_period=trial.suggest_int("regime_sma_period", 50, 250),
             sector_cap_pct=trial.suggest_float("sector_cap_pct", 0.15, 1.0),
@@ -2352,6 +2564,29 @@ class StrategyOptimizer:
     def _persist_current_winner(self, cfg: StrategyConfig, score: float, result: BacktestResult, trial_number: int):
         # 1. Output the detailed visual report directly to the terminal
         print_detailed_winner_report(trial_number, score, result, cfg)
+
+        # 1b. Lightweight live robustness check -- see live_robustness_check docstring
+        # in __init__. NOT the full 15-SIP/5-neighbor post-hoc suite (that stays
+        # reserved for the true final winner in run_full_pipeline; running the full
+        # suite on every improving trial would be prohibitively expensive), but
+        # enough to catch an obviously fragile "winner" in real time.
+        live_robustness = None
+        if self.live_robustness_check and result.n_trades > 0:
+            suite = RobustnessSuite(self.market_data, benchmark=self.benchmark)
+            sip = suite.sip_sensitivity(cfg, self.tickers, n_fixed=3, n_dynamic=2)
+            neigh = suite.parameter_neighborhood_check(cfg, self.tickers, self.injection_days, n_neighbors=2)
+            live_robustness = {
+                "std_cagr_time_weighted": sip["std_cagr_time_weighted"],
+                "std_xirr": sip["std_xirr"],
+                "neighborhood_degradation_pct": neigh["mean_degradation_pct"],
+                "neighborhood_stable": neigh["is_stable_plateau"],
+            }
+            logger.info(
+                f"  Live robustness (5 SIP schedules, 2 param neighbors): "
+                f"SIP-CAGR std={live_robustness['std_cagr_time_weighted']:.3%}, "
+                f"neighborhood degradation={live_robustness['neighborhood_degradation_pct']:.1f}% "
+                f"({'stable' if live_robustness['neighborhood_stable'] else 'UNSTABLE -- may be overfit'})"
+            )
 
         # 2. Persist complete metrics to current_winner_config.json
         payload = {
@@ -2377,6 +2612,7 @@ class StrategyOptimizer:
             "avg_trade_pnl": result.avg_trade_pnl,
             "best_trade": result.best_trade,
             "worst_trade": result.worst_trade,
+            "live_robustness_check": live_robustness,
             "config": cfg.to_dict(),
             "timestamp": pd.Timestamp.now().isoformat(),
         }
@@ -2404,12 +2640,26 @@ class StrategyOptimizer:
 
         return score
 
-    def optimize(self, n_trials: int = 50, n_jobs: int = 1, seed: int = 42) -> StrategyConfig:
+    def optimize(self, n_trials: int = 50, n_jobs: int = 1, seed: int = 42,
+                 seed_configs: Optional[List[StrategyConfig]] = None) -> StrategyConfig:
         import optuna
         optuna.logging.set_verbosity(optuna.logging.WARNING)
         sampler = optuna.samplers.TPESampler(seed=seed)
         study = optuna.create_study(direction="maximize", sampler=sampler)
-        
+
+        # "Memory": re-inject any previously-found winner(s) as guaranteed first trials
+        # rather than starting the TPE sampler from nothing every run. TPE builds its
+        # probability model from every observed trial, so seeding with known-good
+        # configs gives it a strong prior to refine around instead of exploring blind.
+        # See run_full_pipeline for where these are loaded + freshly re-validated.
+        if seed_configs:
+            for sc in seed_configs:
+                try:
+                    study.enqueue_trial(_config_to_optuna_params(
+                        sc, self.INDICATOR_NAMES, self.COMPARATORS, self.WATCHLIST_MODELS))
+                except Exception as e:
+                    logger.warning(f"Could not enqueue seed config for warm-start: {e}")
+
         # CHANGED: Enable show_progress_bar=True for real-time optimization status
         study.optimize(
             self.objective, 
@@ -2448,14 +2698,19 @@ def run_full_pipeline(
     run_robustness: bool = True,
     robust_objective: bool = False,
     robust_n_sip: int = 3,
+    live_robustness_check: bool = True,
 ) -> None:
     """
     End-to-end driver:
       1. Download / cache universe data.
       2. Run Optuna hyperparameter search over StrategyConfig space, with
-         immediate current_winner_config.json persistence on every new best.
+         immediate current_winner_config.json persistence on every new best,
+         plus (if live_robustness_check) a lightweight SIP+neighborhood check
+         on every new winner as it's found, not just at the very end.
       3. Refit the two-pass ML watchlist ranker against the winning config's
-         empirical trade log.
+         empirical trade log, then run ONE comparison backtest swapping the
+         heuristic watchlist model for the fitted ranker to see whether it
+         actually improves on what the search found.
       4. Run the full robustness suite (15-run SIP sensitivity, parameter
          neighborhood check, walk-forward out-of-sample check, Deflated
          Sharpe Ratio, Monte Carlo permutation).
@@ -2478,11 +2733,62 @@ def run_full_pipeline(
 
     injection_days = [5]  # default single SIP date for the main optimization run
 
+    # ---- Memory: re-validate any previously found winner(s) before searching further ----
+    # Every run persists current_winner_config.json (best seen so far in that run) and
+    # final_winner_config.json (that run's ultimate best). On a fresh run, load both if
+    # present and re-run each on THIS run's full window (current universe/years -- which
+    # may differ from whatever they were last found on) to check they're still relevant
+    # rather than assuming stale numbers from a JSON file still hold. The best validated
+    # prior becomes both (a) the new search's starting floor -- it only reports a "new
+    # winner" if something genuinely beats history, not just beats a cold random start --
+    # and (b) a guaranteed-first trial that warm-starts Optuna's TPE sampler instead of
+    # exploring blind every single run.
+    prior_paths = {"current_winner": CURRENT_WINNER_PATH, "final_winner": FINAL_WINNER_PATH}
+    validated_priors: List[Tuple[StrategyConfig, "BacktestResult", float]] = []  # (cfg, result, score)
+    seen_cfg_dicts = set()
+    prelim_objective = ObjectiveFunction()
+    for label, path in prior_paths.items():
+        prior_cfg = _load_prior_winner_config(path)
+        if prior_cfg is None:
+            continue
+        cfg_key = json.dumps(prior_cfg.to_dict(), sort_keys=True, default=str)
+        if cfg_key in seen_cfg_dicts:
+            continue  # current == final winner from a run that never improved past trial 0
+        seen_cfg_dicts.add(cfg_key)
+
+        logger.info(f"Found prior {label} config at {path} -- re-validating on the current full window...")
+        prior_bt = Backtester(prior_cfg, market_data, injection_days, benchmark=benchmark)
+        prior_res = prior_bt.run(tickers=list(market_data.keys()))
+        prior_score = prelim_objective(prior_res)
+        logger.info(
+            f"  {label}: Sharpe={prior_res.sharpe:.3f}, CAGR(TWR)={prior_res.cagr:.3%}, "
+            f"XIRR={prior_res.xirr:.3%}, MaxDD={prior_res.max_drawdown:.3%}, "
+            f"trades={prior_res.n_trades}, score={prior_score:.4f} "
+            f"-- {'still looks viable' if prior_res.n_trades > 0 and prior_score > 0 else 'no longer productive on this window'}"
+        )
+        validated_priors.append((prior_cfg, prior_res, prior_score))
+
+    seed_result_start = None
+    if validated_priors:
+        validated_priors.sort(key=lambda x: x[2], reverse=True)
+        best_prior_cfg, best_prior_res, best_prior_score = validated_priors[0]
+        seed_result_start = (best_prior_cfg, best_prior_res, best_prior_score)
+        logger.info(f"Using best validated prior (score={best_prior_score:.4f}) as this run's starting floor "
+                     f"and warm-start seed for {len(validated_priors)} config(s).")
+
     optimizer = StrategyOptimizer(market_data, list(market_data.keys()), injection_days, benchmark=benchmark,
-                                   robust_objective=robust_objective, robust_n_sip=robust_n_sip)
+                                   robust_objective=robust_objective, robust_n_sip=robust_n_sip,
+                                   live_robustness_check=live_robustness_check)
+    if seed_result_start is not None:
+        best_prior_cfg, best_prior_res, best_prior_score = seed_result_start
+        optimizer.best_score = best_prior_score
+        optimizer.best_cfg = best_prior_cfg
+        optimizer.best_result = best_prior_res
+
     logger.info(f"Starting Optuna search: {n_trials} trials, n_jobs={n_jobs}, "
                 f"robust_objective={robust_objective}" + (f" ({robust_n_sip} SIP runs/trial)" if robust_objective else ""))
-    best_cfg = optimizer.optimize(n_trials=n_trials, n_jobs=n_jobs)
+    best_cfg = optimizer.optimize(n_trials=n_trials, n_jobs=n_jobs,
+                                   seed_configs=[c for c, _, _ in validated_priors] if validated_priors else None)
 
     if best_cfg is None:
         logger.error("Optimization produced no valid strategy; aborting.")
@@ -2498,12 +2804,61 @@ def run_full_pipeline(
     ranker.fit(market_data, optimizer.best_result.trade_log)
     logger.info(f"ML watchlist ranker fit complete. Empirical mean holding period (H_bar): {ranker.h_bar} days")
 
+    # ---- Does the ML ranker actually help? ----
+    # The ranker above is fit AFTER the winning config is already selected, using
+    # whichever heuristic watchlist model that config happened to use -- so nothing
+    # about the search itself validates the ML ranker's real worth. Run one more
+    # simulation with the SAME winning config but watchlist_model swapped to the
+    # fitted ML ranker, and compare directly. If it looks like a genuine improvement
+    # (not just noise), verify it survives a lightweight SIP-date sensitivity check
+    # before trusting it -- the same overfitting risk that applies to indicator
+    # params applies here too.
+    suite = RobustnessSuite(market_data, benchmark=benchmark)
+    ml_comparison = None
+    if ranker.model is not None:
+        ml_cfg = dataclasses.replace(best_cfg, watchlist_model="ml_ranked")
+        ml_bt = Backtester(ml_cfg, market_data, injection_days, benchmark=benchmark, ml_ranker=ranker)
+        ml_res = ml_bt.run(tickers=list(market_data.keys()))
+
+        base = optimizer.best_result
+        logger.info(
+            f"ML-ranked watchlist comparison (same config, only ranking model swapped):\n"
+            f"    Sharpe:  {base.sharpe:.3f} -> {ml_res.sharpe:.3f}\n"
+            f"    CAGR(TWR): {base.cagr:.3%} -> {ml_res.cagr:.3%}\n"
+            f"    XIRR:      {base.xirr:.3%} -> {ml_res.xirr:.3%}\n"
+            f"    MaxDD:     {base.max_drawdown:.3%} -> {ml_res.max_drawdown:.3%}\n"
+            f"    Trades:    {base.n_trades} -> {ml_res.n_trades}"
+        )
+        # Require improvement on BOTH Sharpe and CAGR -- a model that trades one off
+        # against the other (e.g. higher Sharpe from just trading less) isn't a clean win.
+        ml_looks_better = ml_res.sharpe > base.sharpe and ml_res.cagr > base.cagr
+        ml_sip_report = None
+        if ml_looks_better:
+            logger.info("  -> ML ranker looks better on both Sharpe and CAGR; verifying via lightweight SIP-date check...")
+            ml_sip_report = suite.sip_sensitivity(ml_cfg, list(market_data.keys()), n_fixed=5, n_dynamic=2)
+            logger.info(f"  ML-ranked SIP sensitivity: std_cagr(TWR)={ml_sip_report['std_cagr_time_weighted']:.3%} "
+                        f"(compare to the base config's own SIP std reported below)")
+        else:
+            logger.info("  -> ML ranker did not clearly improve on the heuristic model; keeping the heuristic winner.")
+
+        ml_comparison = {
+            "baseline": {"sharpe": base.sharpe, "cagr_time_weighted": base.cagr, "xirr": base.xirr,
+                         "max_drawdown": base.max_drawdown, "n_trades": base.n_trades,
+                         "watchlist_model": best_cfg.watchlist_model},
+            "ml_ranked": {"sharpe": ml_res.sharpe, "cagr_time_weighted": ml_res.cagr, "xirr": ml_res.xirr,
+                          "max_drawdown": ml_res.max_drawdown, "n_trades": ml_res.n_trades},
+            "ml_improved_sharpe_and_cagr": ml_looks_better,
+            "ml_sip_sensitivity": ml_sip_report,
+        }
+        with open(os.path.join(RESULTS_DIR, "ml_watchlist_comparison.json"), "w") as f:
+            json.dump(ml_comparison, f, indent=2, default=str)
+    else:
+        logger.info("ML ranker did not fit (insufficient training samples) -- skipping comparison run.")
+
     if not run_robustness:
         return
 
     # ---- Robustness / sensitivity / validation suite ----
-    suite = RobustnessSuite(market_data, benchmark=benchmark)
-
     logger.info("Running 15-run SIP date sensitivity suite...")
     sip_report = suite.sip_sensitivity(best_cfg, list(market_data.keys()))
     logger.info(f"SIP sensitivity: mean_return={sip_report['mean_return']:.3%} (contribution-relative), "
@@ -2544,6 +2899,7 @@ def run_full_pipeline(
         "deflated_sharpe_ratio": dsr,
         "monte_carlo": mc_report,
         "ml_ranker_h_bar_days": ranker.h_bar,
+        "ml_watchlist_comparison": ml_comparison,
         "timestamp": pd.Timestamp.now().isoformat(),
     }
     with open(os.path.join(RESULTS_DIR, "robustness_report.json"), "w") as f:
@@ -2561,6 +2917,9 @@ if __name__ == "__main__":
     parser.add_argument("--universe-limit", type=int, default=None,
                          help="Optional cap on number of tickers (useful for a fast local smoke test)")
     parser.add_argument("--skip-robustness", action="store_true", help="Skip the robustness/sensitivity suite")
+    parser.add_argument("--skip-live-robustness", action="store_true",
+                         help="Skip the lightweight SIP+neighborhood check that otherwise runs every time a "
+                              "new best trial is found during search (not just at the very end)")
     parser.add_argument("--robust-objective", action="store_true",
                          help="Penalize SIP-timing instability inside every trial's objective, not just post-hoc "
                               "(costs ~1+robust-n-sip extra backtests per trial)")
@@ -2573,4 +2932,5 @@ if __name__ == "__main__":
         n_trials=args.trials, universe_subset=subset, years=args.years,
         n_jobs=args.jobs, run_robustness=not args.skip_robustness,
         robust_objective=args.robust_objective, robust_n_sip=args.robust_n_sip,
+        live_robustness_check=not args.skip_live_robustness,
     )

@@ -1,0 +1,45 @@
+Here is the updated **Master Architecture Comparison Table** incorporating your newly provided Indian Equities Engine (**Script 11: `diamond_extractor_v5.py**` / *Diamond Extractor v5.0*).
+
+### 🔍 Analysis of Script 11 (v5.0): What Stood Out & Why It Works
+
+#### 1. Cash-Flow-Deducted Daily Return Adjustments
+
+In dollar-cost-averaging (SIP) backtesters, a monthly cash injection (e.g., ₹8,000) lands directly in the portfolio cash pool. If unadjusted, the account value jumps on that day, causing standard backtesters to count new money as a **1-day capital gain**.
+
+* **The Fix in v5.0:**
+
+$$R_t = \frac{V_t - I_t - V_{t-1}}{V_{t-1}}$$
+
+
+
+By explicitly subtracting $I_t$ (daily cash injection) from portfolio valuation $V_t$ before computing returns, all downstream metrics—**Sharpe Ratio, Sortino Ratio, Skewness, and Kurtosis**—measure true investment performance rather than deposit speed.
+
+#### 2. Point-in-Time Nifty 50 Reconstruction (`IndexInclExcl.xls`)
+
+Standard stock backtests select today's Nifty 50 constituents and run them backward to 2015. This introduces **survivorship bias**, as companies that collapsed (e.g., Yes Bank, DHFL) are missing, while recent outperformers (e.g., Trent, Bel) are included years before they joined the index.
+
+* **The Fix in v5.0:** `fetch_and_build_point_in_time_universe()` downloads NSE's official inclusion/exclusion event history, starts with today's live constituent set, and steps backward to undo historical additions/removals. It builds a date-indexed JSON map that restricts new entries on any given day to stocks that were *actually in the index on that date*.
+
+#### 3. Active-Only Conditional Parameter Perturbation
+
+In older versions, neighborhood stability checks perturbed a fixed set of variables (e.g., $s\_ma$, $l\_ma$, $n\_trail\_p$, $n\_atr\_m$). If a candidate strategy used a plain moving average crossunder ($n\_exit\_m = 0$), $n\_trail\_p$ and $n\_atr\_m$ were inactive. Perturbing them resulted in zero change to backtest output, causing the check to pass trivially.
+
+* **The Fix in v5.0:** `passes_neighborhood_check()` inspects active strategy flags:
+* Only perturbs $sl\_ma$ if $entry\_f \in \{1, 2\}$ or $div\_exit\_m == 1$.
+* Only perturbs $n\_trail\_p$ if $n\_exit\_m == 1$.
+* Only perturbs $n\_atr\_m$ if $n\_exit\_m == 2$.
+This ensures every perturbation tests a parameter that directly affects strategy execution.
+
+
+
+#### 4. Additive Watchlist-Age Rank Boosting
+
+When multiple assets generate breakout signals simultaneously, ranking algorithms (like momentum or drawdown) select the highest-ranked asset. If a specific asset remains at the top of the ranking, older valid candidates in the watchlist can be starved of capital indefinitely.
+
+* **The Fix in v5.0:**
+
+$$\text{Rank} = \text{Base\_Rank} + w_{\text{age}} \times \min\left(1.0, \frac{\text{Days Waiting}}{\text{WL\_AGE\_NORM\_DAYS}}\right)$$
+
+
+
+This adds a small, linear priority boost based on how long a candidate has sat in the queue, allowing aged setups to compete fairly for capital deployment.

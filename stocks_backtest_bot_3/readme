@@ -1,0 +1,30 @@
+### 🔍 Analysis of Script 7: What Stood Out & Why It Works
+
+#### 1. The Early Exit Invalidation Latch (`use_early_exit`)
+
+In traditional Moving Average strategies, a trader must wait for the Fast MA to cross back *below* the Slow MA to close a trade. However, in strong uptrends, the Fast and Slow MAs may sit high above long-term trend support. If price crashes abruptly, waiting for the MAs to cross causes the strategy to give back massive amounts of open profit.
+
+Script 7 solves this by injecting an early exit conditional:
+
+```python
+if (short_ma[i] > super_ma[i]) and (long_ma[i] > super_ma[i]) and (closes[i] < long_ma[i]):
+    should_exit = True
+    exit_price = curr_open
+
+```
+
+* **Meaning:** If both MAs are in a strong macro bull trend (above the `Super_MA`), but price suddenly breaks **below the Long MA**, the structural trend is invalidated. The strategy liquidates at the next bar's open without waiting for the lagging short/long MA crossunder.
+
+#### 2. Trailing 5-Year Portfolio Drawdown "Kill Switch"
+
+Earlier equity scripts only evaluated average drawdown across the entire history. Script 7 enforces a strict 5-year rolling check:
+
+```python
+recent_start = max_year - 5 - min_year
+for i in range(max(0, recent_start), max_year - min_year + 1):
+    if avg_portfolio_pnl[i] < MAX_YEAR_DRAWDOWN: # -15% limit
+        return -999, {}, []
+
+```
+
+* **Impact:** If a strategy lost more than $15\%$ in any single year between 2021 and 2026, it is discarded immediately—regardless of how high its 10-year cumulative return was.

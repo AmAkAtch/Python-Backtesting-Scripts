@@ -1,0 +1,68 @@
+Aside from changing the operational `TIMEFRAME` from **`1d`** (Daily) to **`15m`** (15-Minute candles), here are the specific architectural and logic changes introduced in this version compared to the previous RSI Crossover script:
+
+---
+
+## 🔑 Key Changes & Enhancements
+
+### 1. Shift to Median-Based Scoring ("Universal Soldier" Logic)
+
+* **Previous Behavior:** Summed up total aggregated PnL across all coins (`weighted_pnl`). A single massive outlier (e.g., an extreme historical run in `SHIB` or `SOL`) could skew the total score, making a bad strategy look good.
+* **New Behavior:** Calculates an individual time-weighted score for **every single coin independently** (`this_coin_score`). The system then takes the **median score** across all coins:
+```python
+median_coin_score = np.median(coin_scores)
+final_score = median_coin_score * pf
+
+```
+
+
+* **Impact:** A strategy can no longer win off 1 or 2 lucky coins. It must perform consistently across the middle of the asset distribution.
+
+---
+
+### 2. Dual-Layer Defensive Scoring Engine
+
+The evaluation step now strictly separates portfolio protection from single-coin scoring:
+
+* **Layer 1 (Portfolio Risk Protection):** Aggregates total portfolio PnL specifically for the **Trailing 3-Year Kill Switch check**. If the net portfolio loses > $500 in any of the last 3 years, the setup fails immediately.
+* **Layer 2 (Single-Asset Outlier Defense):** Computes per-asset time-weighted performance to feed into the Median calculation.
+
+---
+
+### 3. Start Date Adjustment
+
+* **`START_DATE` Changed:** Updated from `"2018-01-01 00:00:00"` to `"2022-01-01 00:00:00"`.
+* **Reasoning:** Pulling 15-minute historical data back to 2018 generates millions of rows per coin, creating memory bottlenecks and extreme API download times. Shifting to 2022 keeps the dataset manageable while covering multiple market cycles (2022 bear market, 2023–2024 recovery, and recent market regimes).
+
+---
+
+### 4. Zero-Division Guardrail in Stability Calculation
+
+* Added a safety condition when evaluating parameter neighbors:
+```python
+if abs(score) < 0.01: 
+    stability_ratio = 0
+else: 
+    stability_ratio = avg_neighbor_score / score
+
+```
+
+
+* Prevents `ZeroDivisionError` or invalid `NaN` / `Inf` values when a candidate score approaches zero.
+
+---
+
+### 5. Return To Standard Simultaneous Signal Execution
+
+* **Reverted Latched Mode:** Removed the latched state machine (`is_waiting_for_filters`) from Script 3 and reverted back to **strict simultaneous bar execution** (`backtest_yearly_runner`). Entries trigger only if the RSI crossover and trend filters align on the exact same bar.
+
+---
+
+## 📊 Summary Comparison
+
+| Dimension | Previous Script (Script 3) | Current Script |
+| --- | --- | --- |
+| **Score Driver** | Portfolio Total Weighted PnL | **Median Coin Score** |
+| **Outlier Resilience** | Moderate (Vulnerable to single-coin spikes) | **High (Forces broad asset consistency)** |
+| **Signal Mode** | Latched / Waiting State | **Strict Simultaneous Execution** |
+| **Dataset Horizon** | 2018 – Present | **2022 – Present** |
+| **Stability Division Guard** | None | **Zero-Division Check Included** |

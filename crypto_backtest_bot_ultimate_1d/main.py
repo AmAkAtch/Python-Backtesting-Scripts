@@ -423,7 +423,7 @@ def fetch_top100_universe():
 
     print(f"Universe size after filtering: {len(tickers)} (excluded {len(excluded_log)}: "
           f"{', '.join(excluded_log[:15])}{' ...' if len(excluded_log) > 15 else ''})")
-    sanity_majors = ['ETHUSDT', 'SOLUSDT', 'DOGEUSDT', 'XLMUSDT']
+    sanity_majors = ['ETHUSDT', 'SOLUSDT', 'DOGEUSDT', 'XLMUSDT', 'BTCUSDT']
     present = [m for m in sanity_majors if m in tickers]
     print(f"Sanity check -- expected majors present: {present} "
           f"({'OK' if len(present) >= 3 else 'WARNING: fewer majors than expected, check filters'})")
