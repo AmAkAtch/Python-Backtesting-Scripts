@@ -170,6 +170,8 @@ class StrategyConfig:
     regime_index_sma_period: int = 200
     sector_cap_pct: float = 0.25                  # max % of portfolio value in one sector
     vol_sizing_enabled: bool = True
+    equal_weight_sizing_enabled: bool = False      # cost-basis equal-weight sizing (see PortfolioEngine.try_enter)
+    cooldown_days: int = 0                         # min days after an exit before that ticker can re-enter (0 = off)
 
     def to_dict(self) -> dict:
         d = dataclasses.asdict(self)
@@ -1335,6 +1337,7 @@ class PortfolioEngine:
         self.equity_curve: List[Tuple[pd.Timestamp, float]] = []
         self.trade_log: List[dict] = []
         self._last_injected_month: Optional[Tuple[int, int]] = None
+        self.last_exit_date: Dict[str, pd.Timestamp] = {}  # per-ticker, for cfg.cooldown_days
         # Explicit ledger of every external cash flow (SIP injections today; any future
         # withdrawals/redemptions would append here too). This is the source of truth
         # for XIRR (money-weighted return) and for the exact daily Time-Weighted Return
@@ -1392,16 +1395,35 @@ class PortfolioEngine:
                   atr_value: Optional[float] = None) -> bool:
         if ticker in self.positions:
             return False
-        allocation = MIN_ALLOCATION
-        if self.cfg.vol_sizing_enabled and atr_value and not np.isnan(atr_value) and atr_value > 0:
-            # Risk-parity-style sizing: allocate MORE to lower-volatility names (smaller
-            # ATR relative to price => larger vol_scalar), never LESS -- the spec's 10k
-            # allocation floor is a hard minimum, so this only scales up, capped at 2x.
-            target_daily_risk_pct = 0.02
-            vol_scalar = float(np.clip((price * target_daily_risk_pct) / atr_value, 1.0, 2.0))
-            allocation = MIN_ALLOCATION * vol_scalar
+        # Cooldown: skip re-entry into a ticker for cfg.cooldown_days after its last exit --
+        # prevents immediate whipsaw re-entry right after being stopped out.
+        if self.cfg.cooldown_days > 0:
+            last_exit = self.last_exit_date.get(ticker)
+            if last_exit is not None and (date - last_exit).days < self.cfg.cooldown_days:
+                return False
+
+        if self.cfg.equal_weight_sizing_enabled:
+            # Cost-basis equal-weight sizing: Target = (Cash Pool + Invested Cost) / N_eligible,
+            # floored at MIN_ALLOCATION. Uses COST basis (sum of shares*entry_price), not
+            # mark-to-market value, so unrealized gains on existing positions don't inflate
+            # the size of unrelated new trades. N_eligible = current watchlist queue + this
+            # candidate, i.e. how many tickers are actually contending for capital today.
+            # Mutually exclusive with vol_sizing_enabled (both are sizing strategies; this
+            # one takes precedence when both are on, since combining them isn't well-defined).
+            invested_cost = sum(p.shares * p.entry_price for p in self.positions.values())
+            n_eligible = max(1, len(self.watchlist) + 1)
+            allocation = max((self.cash + invested_cost) / n_eligible, MIN_ALLOCATION)
+        else:
+            allocation = MIN_ALLOCATION
+            if self.cfg.vol_sizing_enabled and atr_value and not np.isnan(atr_value) and atr_value > 0:
+                # Risk-parity-style sizing: allocate MORE to lower-volatility names (smaller
+                # ATR relative to price => larger vol_scalar), never LESS -- the spec's 10k
+                # allocation floor is a hard minimum, so this only scales up, capped at 2x.
+                target_daily_risk_pct = 0.02
+                vol_scalar = float(np.clip((price * target_daily_risk_pct) / atr_value, 1.0, 2.0))
+                allocation = MIN_ALLOCATION * vol_scalar
         if self.cash < allocation:
-            # can't afford the vol-scaled size -- fall back to the floor allocation if affordable
+            # can't afford the scaled size -- fall back to the floor allocation if affordable
             if allocation > MIN_ALLOCATION and self.cash >= MIN_ALLOCATION:
                 allocation = MIN_ALLOCATION
             else:
@@ -1427,6 +1449,7 @@ class PortfolioEngine:
         net_proceeds = proceeds - cost
         self.cash += net_proceeds
         pnl = net_proceeds - pos.allocated_cash
+        self.last_exit_date[ticker] = date
         self.trade_log.append({
             "date": str(date.date()), "ticker": ticker, "action": "SELL", "reason": reason,
             "price": price, "shares": pos.shares, "pnl": pnl, "cash_after": self.cash,
@@ -1674,6 +1697,14 @@ class Backtester:
         # indicator "signal" that requires the close to even be computed.
         pending_entries: Dict[str, None] = {}
         pending_indicator_exits: Dict[str, None] = {}
+        # Latched "waiting mode" queue: an entry signal blocked by the regime filter is
+        # NOT dropped -- it waits here and is retried every subsequent day until the
+        # regime clears (entering then, at that day's price) or the ticker becomes
+        # otherwise ineligible (already owned). Without this, a signal that fires while
+        # the regime filter happens to be off is simply lost forever, which can silently
+        # starve a strategy of trades during exactly the choppy periods a regime filter
+        # is meant to sit out and then re-enter after.
+        latched_entries: Dict[str, None] = {}
 
         for i, date in enumerate(all_dates):
             portfolio.maybe_inject_cash(date)
@@ -1712,12 +1743,18 @@ class Backtester:
                 if should_exit:
                     portfolio.exit_position(t, price_lookup[t], date, reason)
 
-            # -------- 3. fill entries that were signalled on Day T-1 (respecting regime filter) ----
+            # -------- 3. fill entries: fresh T-1 signals + latched signals waiting on regime -------
             regime_pass = bool(regime_ok.loc[date]) if date in regime_ok.index else True
-            for t in list(pending_entries):
+            entries_to_try = list(pending_entries) + [t for t in latched_entries if t not in pending_entries]
+            for t in entries_to_try:
                 pending_entries.pop(t, None)
-                if not regime_pass or t not in price_lookup or t in portfolio.positions:
+                if t not in price_lookup or t in portfolio.positions:
+                    latched_entries.pop(t, None)  # data unavailable or already owned -- drop, not latch
                     continue
+                if not regime_pass:
+                    latched_entries[t] = None  # keep waiting for the regime filter to clear
+                    continue
+                latched_entries.pop(t, None)
                 price = price_lookup[t]
                 pv = portfolio.cash + sum(p.shares * price_lookup.get(tt, p.entry_price) for tt, p in portfolio.positions.items())
                 entered = portfolio.try_enter(t, price, date, pv, atr_value=snapshot.get(t, {}).get("atr"))
@@ -1890,7 +1927,22 @@ class PerformanceMetrics:
             if bench_ret.std() > 0:
                 cov = np.cov(daily_ret.values, bench_ret.values)
                 beta = float(cov[0, 1] / cov[1, 1]) if cov[1, 1] > 0 else 0.0
-                ann_strategy, ann_bench = daily_ret.mean() * 252, bench_ret.mean() * 252
+                # Geometric (CAGR-consistent) annualization, NOT raw arithmetic mean*252.
+                # Arithmetic annualization has no normalization for how volatile the
+                # return series is, so a low-trade-count strategy that hits a deep
+                # drawdown then recovers can produce an absurd "annualized return" from
+                # arithmetic mean alone (verified: a -97% drawdown scenario gave +15%
+                # arithmetic vs the correct -5% geometric) -- exactly the failure mode
+                # that produced a reported 1509% alpha on a real run. CAGR/Sharpe/Sortino
+                # above already use daily_ret.mean() too, but always as part of a RATIO
+                # (divided by std, or geometrically compounded), which is far more robust;
+                # alpha previously used the raw arithmetic annualization with no such
+                # normalization, so it alone inherited the full blow-up.
+                n_days = len(daily_ret)
+                strategy_growth = float((1.0 + daily_ret).prod())
+                bench_growth = float((1.0 + bench_ret).prod())
+                ann_strategy = strategy_growth ** (252.0 / n_days) - 1.0 if strategy_growth > 0 else -1.0
+                ann_bench = bench_growth ** (252.0 / n_days) - 1.0 if bench_growth > 0 else -1.0
                 alpha = float(ann_strategy - beta * ann_bench)
                 excess = daily_ret - bench_ret
                 tracking_error = float(excess.std() * math.sqrt(252))
@@ -2199,7 +2251,110 @@ class RobustnessSuite:
             "mean_degradation_pct": float(degradation * 100), "is_stable_plateau": is_plateau,
         }
 
-    # ---------------------------------------------------------- Walk-forward / out-of-sample split
+    # ---------------------------------------------------------- Walk-forward: anchored expanding folds
+    def walk_forward_expanding_folds(
+        self, cfg: StrategyConfig, tickers: List[str], injection_days: List[int], n_folds: int = 4,
+    ) -> Dict[str, Any]:
+        """
+        Upgrade over the single static 70/30 split (train_test_split_check): runs
+        n_folds anchored expanding-window folds -- fold k trains on [start,
+        boundary_k] and tests on (boundary_k, boundary_{k+1}], for k=1..n_folds.
+        Every later segment of history gets to act as an un-peeked out-of-sample
+        test at least once (not just the final 30%), and any drift in how well the
+        config generalizes across different time periods becomes visible instead
+        of hidden behind one lucky or unlucky split point.
+        """
+        all_dates = pd.DatetimeIndex(sorted(set().union(
+            *[self.market_data[t].index for t in tickers if t in self.market_data])))
+        if len(all_dates) < 200:
+            return {"error": "insufficient history for walk-forward folds"}
+
+        boundaries = np.linspace(0, len(all_dates) - 1, n_folds + 2)[1:].astype(int)
+        folds = []
+        for k in range(n_folds):
+            train_end = all_dates[boundaries[k]]
+            test_end = all_dates[boundaries[k + 1]]
+            train_bt = Backtester(cfg, self.market_data, injection_days=injection_days, benchmark=self.benchmark)
+            train_res = train_bt.run(tickers=tickers, end=str(train_end.date()))
+            test_bt = Backtester(cfg, self.market_data, injection_days=injection_days, benchmark=self.benchmark)
+            test_res = test_bt.run(tickers=tickers, start=str((train_end + pd.Timedelta(days=1)).date()),
+                                    end=str(test_end.date()))
+
+            def decay(is_val, oos_val):
+                return float((is_val - oos_val) / abs(is_val)) if abs(is_val) > 1e-9 else 0.0
+
+            folds.append({
+                "fold": k + 1, "train_end": str(train_end.date()), "test_end": str(test_end.date()),
+                "train_sharpe": train_res.sharpe, "test_sharpe": test_res.sharpe,
+                "train_cagr": train_res.cagr, "test_cagr": test_res.cagr,
+                "test_n_trades": test_res.n_trades,
+                "sharpe_decay_pct": decay(train_res.sharpe, test_res.sharpe) * 100,
+            })
+
+        mean_decay = float(np.mean([f["sharpe_decay_pct"] for f in folds])) / 100.0
+        # Overfit if the AVERAGE decay is severe, or if MOST individual folds show severe
+        # decay -- a strategy that only survives one lucky fold isn't robust, even if the
+        # average looks acceptable.
+        n_severe_folds = sum(1 for f in folds if f["sharpe_decay_pct"] > 50.0)
+        return {
+            "n_folds": n_folds, "folds": folds,
+            "mean_sharpe_decay_pct": mean_decay * 100,
+            "n_severe_folds": n_severe_folds,
+            "likely_overfit": bool(mean_decay > 0.5 or n_severe_folds > n_folds // 2),
+        }
+
+    # ---------------------------------------------------------- Per-asset consistency (anti-overfitting)
+    @staticmethod
+    def per_asset_consistency_check(trade_log: List[dict], min_profitable_frac: float = 0.5) -> Dict[str, Any]:
+        """
+        A strategy that only wins because of 1-2 lucky monster-run tickers, while
+        most of the traded universe actually loses money, isn't a real systemic
+        edge -- it's a power-law fluke that Sharpe/CAGR alone won't reveal (those
+        are computed on the AGGREGATE equity curve, which one huge winner can
+        dominate). Groups closed trades by ticker, sums each ticker's net P&L, and
+        requires at least min_profitable_frac of individually-traded tickers to be
+        profitable on their own.
+        """
+        per_ticker_pnl: Dict[str, float] = {}
+        for t in trade_log:
+            if t.get("action") == "SELL" and "pnl" in t:
+                per_ticker_pnl[t["ticker"]] = per_ticker_pnl.get(t["ticker"], 0.0) + t["pnl"]
+        if not per_ticker_pnl:
+            return {"n_tickers_traded": 0, "frac_profitable": 0.0, "median_pnl": 0.0, "passes_gate": False}
+        pnls = list(per_ticker_pnl.values())
+        n_profitable = sum(1 for p in pnls if p > 0)
+        frac_profitable = n_profitable / len(pnls)
+        return {
+            "n_tickers_traded": len(pnls), "n_profitable": n_profitable,
+            "frac_profitable": float(frac_profitable), "median_pnl": float(np.median(pnls)),
+            "per_ticker_pnl": per_ticker_pnl, "passes_gate": bool(frac_profitable >= min_profitable_frac),
+        }
+
+    # ---------------------------------------------------------- Annual profit concentration (anti-overfitting)
+    @staticmethod
+    def annual_profit_concentration_check(trade_log: List[dict], max_single_year_frac: float = 0.55) -> Dict[str, Any]:
+        """
+        Rejects strategies whose lifetime profit is dominated by a single lucky
+        year (e.g. one huge bull run) rather than a repeatable edge. Sums closed-
+        trade P&L by the calendar year of the SELL date, and flags if any single
+        year contributed more than max_single_year_frac of total NOMINAL
+        (positive-years-only) profit.
+        """
+        yearly_pnl: Dict[int, float] = {}
+        for t in trade_log:
+            if t.get("action") == "SELL" and "pnl" in t:
+                year = pd.Timestamp(t["date"]).year
+                yearly_pnl[year] = yearly_pnl.get(year, 0.0) + t["pnl"]
+        total_nominal_profit = sum(p for p in yearly_pnl.values() if p > 0)
+        if total_nominal_profit <= 0:
+            return {"max_year_frac": 0.0, "passes_gate": False, "yearly_pnl": yearly_pnl}
+        max_year_frac = max((p / total_nominal_profit for p in yearly_pnl.values() if p > 0), default=0.0)
+        return {
+            "max_year_frac": float(max_year_frac), "yearly_pnl": yearly_pnl,
+            "passes_gate": bool(max_year_frac <= max_single_year_frac),
+        }
+
+    # ---------------------------------------------------------- Walk-forward / out-of-sample split (single, legacy)
     def train_test_split_check(
         self, cfg: StrategyConfig, tickers: List[str], injection_days: List[int],
         train_frac: float = 0.7,
@@ -2214,6 +2369,11 @@ class RobustnessSuite:
         each, and reports how much skill survives. A config whose
         out-of-sample Sharpe/CAGR collapses relative to in-sample is
         overfit, however good its full-history numbers look.
+
+        NOTE: walk_forward_expanding_folds() above is the more rigorous upgrade
+        (multiple anchored folds instead of one static split) and is what
+        run_full_pipeline uses by default now; this single-split version is kept
+        for anyone who wants the cheaper, lighter check.
         """
         all_dates = pd.DatetimeIndex(sorted(set().union(
             *[self.market_data[t].index for t in tickers if t in self.market_data])))
@@ -2403,14 +2563,23 @@ def _config_to_optuna_params(
     params["regime_sma_period"] = int(np.clip(cfg.regime_index_sma_period, 50, 250))
     params["sector_cap_pct"] = float(np.clip(cfg.sector_cap_pct, 0.15, 1.0))
     params["vol_sizing_enabled"] = cfg.vol_sizing_enabled
+    params["equal_weight_sizing_enabled"] = cfg.equal_weight_sizing_enabled
+    params["cooldown_days"] = int(np.clip(cfg.cooldown_days, 0, 20))
     return params
 
 
 class ObjectiveFunction:
     """Custom multi-objective loss combining Sharpe, CAGR, Max Drawdown, and a robustness penalty."""
 
-    def __init__(self, w_sharpe=0.4, w_cagr=0.3, w_dd=0.2, w_robustness=0.1):
+    def __init__(self, w_sharpe=0.4, w_cagr=0.3, w_dd=0.2, w_robustness=0.1, max_drawdown_gate=-0.50):
         self.w_sharpe, self.w_cagr, self.w_dd, self.w_robustness = w_sharpe, w_cagr, w_dd, w_robustness
+        # A drawdown this severe isn't investable with real capital no matter how good
+        # Sharpe/CAGR look on paper -- verified directly: a config with Sharpe 1.923 and
+        # CAGR 17.87% still "won" under the soft w_dd=0.2 weighting despite an 80.82% max
+        # drawdown, because good Sharpe/CAGR could always outweigh the drawdown term. This
+        # gate makes catastrophic drawdown disqualifying on its own, separate from the
+        # weighted score.
+        self.max_drawdown_gate = max_drawdown_gate
 
     def __call__(self, result: BacktestResult, robustness_penalty: float = 0.0) -> float:
         # Heavy penalty for dead strategies with 0 trades
@@ -2420,6 +2589,13 @@ class ObjectiveFunction:
         dd_term = -result.max_drawdown  # max_drawdown is negative; flip sign
         score = (self.w_sharpe * result.sharpe + self.w_cagr * result.cagr
                 - self.w_dd * dd_term - self.w_robustness * robustness_penalty)
+
+        # Escalating (not flat) penalty past the gate, so Optuna still gets a gradient
+        # pushing away from worse and worse drawdowns rather than a wall where -55% and
+        # -95% drawdown score identically.
+        if result.max_drawdown < self.max_drawdown_gate:
+            overshoot = self.max_drawdown_gate - result.max_drawdown  # positive amount past the gate
+            score -= 5.0 * overshoot
         return float(score)
 
 def print_detailed_winner_report(trial_number: int, score: float, result: BacktestResult, cfg: StrategyConfig):
@@ -2559,6 +2735,8 @@ class StrategyOptimizer:
             regime_index_sma_period=trial.suggest_int("regime_sma_period", 50, 250),
             sector_cap_pct=trial.suggest_float("sector_cap_pct", 0.15, 1.0),
             vol_sizing_enabled=trial.suggest_categorical("vol_sizing_enabled", [True, False]),
+            equal_weight_sizing_enabled=trial.suggest_categorical("equal_weight_sizing_enabled", [True, False]),
+            cooldown_days=trial.suggest_int("cooldown_days", 0, 20),
         )
 
     def _persist_current_winner(self, cfg: StrategyConfig, score: float, result: BacktestResult, trial_number: int):
@@ -2870,15 +3048,32 @@ def run_full_pipeline(
     logger.info(f"Neighborhood check: mean degradation={neighborhood_report['mean_degradation_pct']:.1f}%, "
                 f"stable_plateau={neighborhood_report['is_stable_plateau']}")
 
-    logger.info("Running walk-forward out-of-sample split check (70/30)...")
-    walk_forward_report = suite.train_test_split_check(best_cfg, list(market_data.keys()), injection_days)
+    logger.info("Running walk-forward out-of-sample check (4 anchored expanding folds)...")
+    walk_forward_report = suite.walk_forward_expanding_folds(best_cfg, list(market_data.keys()), injection_days, n_folds=4)
     if "error" not in walk_forward_report:
+        fold_summary = ", ".join(
+            f"F{f['fold']}:{f['sharpe_decay_pct']:.0f}%" for f in walk_forward_report["folds"]
+        )
         logger.info(
-            f"Walk-forward: in-sample Sharpe={walk_forward_report['in_sample']['sharpe']:.3f} vs "
-            f"out-of-sample Sharpe={walk_forward_report['out_of_sample']['sharpe']:.3f} "
-            f"(decay={walk_forward_report['sharpe_decay_pct']:.1f}%) | "
+            f"Walk-forward (4 folds): mean Sharpe decay={walk_forward_report['mean_sharpe_decay_pct']:.1f}% "
+            f"[{fold_summary}], {walk_forward_report['n_severe_folds']}/{walk_forward_report['n_folds']} folds severe | "
             f"{'*** LIKELY OVERFIT ***' if walk_forward_report['likely_overfit'] else 'holds up out-of-sample'}"
         )
+
+    logger.info("Running per-asset consistency check...")
+    per_asset_report = RobustnessSuite.per_asset_consistency_check(optimizer.best_result.trade_log)
+    logger.info(
+        f"Per-asset consistency: {per_asset_report['n_profitable']}/{per_asset_report['n_tickers_traded']} "
+        f"tickers individually profitable ({per_asset_report['frac_profitable']:.1%}) | "
+        f"{'PASS' if per_asset_report['passes_gate'] else '*** FAIL -- edge may be 1-2 lucky tickers, not systemic ***'}"
+    )
+
+    logger.info("Running annual profit concentration check...")
+    concentration_report = RobustnessSuite.annual_profit_concentration_check(optimizer.best_result.trade_log)
+    logger.info(
+        f"Annual concentration: single worst year = {concentration_report['max_year_frac']:.1%} of total profit | "
+        f"{'PASS' if concentration_report['passes_gate'] else '*** FAIL -- may be a single lucky year, not a repeatable edge ***'}"
+    )
 
     # NOTE: previously this used equity_curve.pct_change(), which records every SIP
     # injection day as a huge fake "return" (including an inf on day 1) -- same root
@@ -2895,6 +3090,8 @@ def run_full_pipeline(
     robustness_payload = {
         "sip_sensitivity": sip_report,
         "parameter_neighborhood": neighborhood_report,
+        "per_asset_consistency": per_asset_report,
+        "annual_profit_concentration": concentration_report,
         "walk_forward_out_of_sample": walk_forward_report,
         "deflated_sharpe_ratio": dsr,
         "monte_carlo": mc_report,
