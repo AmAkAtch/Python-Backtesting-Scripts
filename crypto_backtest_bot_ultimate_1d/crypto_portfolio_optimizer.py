@@ -714,6 +714,16 @@ def simulate_portfolio_fixed_signal(
         max_concurrent_positions,
         allow_portfolio_pyramid,
         min_ticket,
+        # -- frozen exit-family numeric params (needed to actually run the
+        #    live per-trade Hybrid/%-Trail/ATR-Trail exit state machine;
+        #    exit types 3/4/5 are already fully captured in real_exit_signal
+        #    and ignore these) --
+        signal_exit_type, sl_mult, tp_mult, trail_mult, trail_pct, exit_atr_mult,
+        # -- capital-deployment forks (Optuna-searched, fully independent) --
+        entry_funding_method,   # 0=cash-pool-only  1=trim-overweight-only  2=full-bidirectional-rebalance
+        exit_proceeds_method,   # 0=leave liquid     1=redistribute evenly across remaining open positions
+        sizing_denom_method,    # 0=max_concurrent_positions  1=causal running-avg concurrency + buffer  2=current open count (always fully deployed)
+        concurrency_buffer,     # extra assumed slots, only used when sizing_denom_method == 1
         # common
         eligible_mask,
         months, sip_flag,
@@ -744,7 +754,16 @@ def simulate_portfolio_fixed_signal(
     shares_held = np.zeros(n_stocks)
     high_since_entry = np.zeros(n_stocks)
     stop_loss_price = np.zeros(n_stocks)
+    tp_trigger_price = np.zeros(n_stocks)
     half_sold = np.zeros(n_stocks, dtype=np.bool_)
+    pending_partial = np.zeros(n_stocks, dtype=np.bool_)
+
+    # Causal (expanding-window, no-lookahead) running average of realized
+    # concurrent open-position count -- only used by sizing_denom_method==1.
+    cum_n_open_sum = 0.0
+    cum_n_open_days = 0
+    sum_n_open_report = 0.0
+    max_n_open_report = 0
 
     # Watchlist shadow state
     wl_active = np.zeros(n_stocks, dtype=np.bool_)
@@ -810,7 +829,34 @@ def simulate_portfolio_fixed_signal(
             if btc_close[d] > 0:
                 bench_shares += monthly_sip / btc_close[d]
 
-        # ---- Phase A: settle pending real exits ----
+        # ---- Phase A1: settle pending partial exits (Hybrid 50% take-profit) ----
+        for s in range(n_stocks):
+            if pending_partial[s] and in_pos[s]:
+                fill = opens[d, s]
+                if not (fill > 0):
+                    fill = closes[d - 1, s]
+                if fill > 0 and shares_held[s] > 0:
+                    sell_shares = shares_held[s] * 0.5
+                    proceeds = sell_shares * fill * (1.0 - sell_cost_pct)
+                    cost_basis = sell_shares * entry_prices[s]
+                    profit = proceeds - cost_basis
+                    # Dollar P&L is booked now so PF/ROI reflect it immediately;
+                    # trade/winning_trades/losing_trades counts only increment
+                    # on the FULL close below (one round-trip = one trade row,
+                    # same convention as the signal-research engine).
+                    if profit >= 0:
+                        total_wins += profit
+                    else:
+                        total_losses += -profit
+                    cash_pool += proceeds
+                    shares_held[s] -= sell_shares
+                    half_sold[s] = True
+                    if stop_loss_price[s] < entry_prices[s]:
+                        stop_loss_price[s] = entry_prices[s]  # breakeven floor
+                pending_partial[s] = False
+
+        # ---- Phase A2: settle pending real exits (full close) ----
+        freed_this_day = 0.0
         for s in range(n_stocks):
             if pending_exit[s] and in_pos[s]:
                 fill = opens[d, s]
@@ -829,34 +875,203 @@ def simulate_portfolio_fixed_signal(
                     total_bars += d - entry_days[s]
                     trades += 1
                     cash_pool += exit_val
+                    freed_this_day += exit_val
                     in_pos[s] = False
                     shares_held[s] = 0.0
+                    half_sold[s] = False
                     n_open -= 1
                 pending_exit[s] = False
+                pending_partial[s] = False
 
-        # ---- Phase A: settle pending entries from watchlist ----
+        # ---- Fork B: exit-proceeds handling ----
+        # exit_proceeds_method 1 = immediately buy freed_this_day / n_open more
+        # of every position still open (real buys, real cost); 0 = leave it in
+        # cash_pool for the next new signal (previous / default behaviour).
+        if exit_proceeds_method == 1 and freed_this_day > 0.0 and n_open > 0:
+            top_up_each = freed_this_day / n_open
+            for s in range(n_stocks):
+                if not in_pos[s]:
+                    continue
+                fill = opens[d, s]
+                if not (fill > 0):
+                    fill = closes[d - 1, s]
+                if fill <= 0:
+                    continue
+                ticket = min(top_up_each, cash_pool / (1.0 + buy_cost_pct))
+                cost = ticket * (1.0 + buy_cost_pct)
+                if cost <= cash_pool and ticket > 0.0:
+                    sh = ticket / fill
+                    new_shares = shares_held[s] + sh
+                    # blend cost basis across the top-up, same convention as
+                    # the signal engine's pyramid-layer blending
+                    entry_prices[s] = (entry_prices[s] * shares_held[s] + fill * sh) / new_shares
+                    shares_held[s] = new_shares
+                    cash_pool -= cost
+
+        # ---- Fork C: sizing denominator for the NEXT new entry ----
+        if sizing_denom_method == 1:
+            causal_avg_n_open = (cum_n_open_sum / cum_n_open_days) if cum_n_open_days > 0 else 1.0
+            denom_assumed = causal_avg_n_open + concurrency_buffer
+        elif sizing_denom_method == 2:
+            denom_assumed = float(n_open + 1)  # always fully deployed across exactly what's open
+        else:
+            denom_assumed = float(max_concurrent_positions)
+
+        # ---- Phase A3: settle pending entries from watchlist (fork-aware) ----
         for s in range(n_stocks):
             if pending_entry[s] and not in_pos[s] and n_open < max_concurrent_positions:
                 fill = opens[d, s]
                 if not (fill > 0):
                     fill = closes[d - 1, s]
-                if fill > 0 and cash_pool >= min_ticket:
-                    # equal-weight target among currently open + this one
-                    target = (cash_pool + 0.0) / max(1, max_concurrent_positions - n_open)
-                    ticket = min(target, cash_pool)
-                    if ticket >= min_ticket:
-                        cost = ticket * (1.0 + buy_cost_pct)
-                        if cost <= cash_pool:
-                            sh = ticket / fill
-                            shares_held[s] = sh
-                            entry_prices[s] = fill
-                            entry_days[s] = d
-                            high_since_entry[s] = fill
-                            in_pos[s] = True
-                            cash_pool -= cost
-                            n_open += 1
-                            # remove from watchlist once bought
-                            wl_active[s] = False
+                if fill <= 0:
+                    pending_entry[s] = False
+                    continue
+
+                n_open_after = n_open + 1
+                effective_n = max(denom_assumed, float(n_open_after))
+
+                if entry_funding_method == 0:
+                    # cash-pool-only: never touch existing positions (this is
+                    # exactly the original / default behaviour, generalised
+                    # only so its denominator can come from Fork C too)
+                    target = cash_pool / max(1.0, effective_n - n_open)
+                    # cap the ticket so ticket*(1+buy_cost_pct) never exceeds
+                    # cash_pool -- otherwise, whenever cash is the binding
+                    # constraint (ticket lands exactly on cash_pool, which
+                    # happens routinely: the very first entry into an empty
+                    # portfolio, or the last free slot), the cost markup
+                    # alone pushes `cost` a hair above `cash_pool` and the
+                    # `cost <= cash_pool` check below fails FOREVER -- same
+                    # target recomputed, same failure, every single day,
+                    # silently starving the portfolio of trades. This bug
+                    # predates this fork work; it was just rarely triggered
+                    # by the old default (dividing by max_concurrent_positions,
+                    # usually >=3, so target rarely landed exactly on cash_pool).
+                    ticket = min(target, cash_pool / (1.0 + buy_cost_pct))
+                else:
+                    # A1/A2: target is a share of TOTAL portfolio value
+                    # (cash + all open positions marked at today's open,
+                    # since that's the price this whole Phase-A step trades at)
+                    port_val = cash_pool
+                    for s2 in range(n_stocks):
+                        if in_pos[s2]:
+                            px2 = opens[d, s2]
+                            if not (px2 > 0):
+                                px2 = closes[d - 1, s2]
+                            if px2 > 0:
+                                port_val += shares_held[s2] * px2
+                    target = port_val / effective_n
+
+                    if entry_funding_method == 1:
+                        # Trim-overweight-only: sell down (only) the excess
+                        # each overweight position holds above target, only
+                        # as much as needed to cover the newcomer's
+                        # shortfall -- stop as soon as it's covered.
+                        # Positions at/below target are never touched.
+                        shortfall = target - cash_pool
+                        if shortfall > 0.0:
+                            raised = 0.0
+                            for s2 in range(n_stocks):
+                                if s2 == s or not in_pos[s2]:
+                                    continue
+                                if raised >= shortfall:
+                                    break
+                                px2 = opens[d, s2]
+                                if not (px2 > 0):
+                                    px2 = closes[d - 1, s2]
+                                if px2 <= 0:
+                                    continue
+                                cur_val = shares_held[s2] * px2
+                                trim_val = min(max(0.0, cur_val - target), shortfall - raised)
+                                if trim_val > 0.0:
+                                    trim_shares = trim_val / px2
+                                    proceeds = trim_shares * px2 * (1.0 - sell_cost_pct)
+                                    cost_basis = trim_shares * entry_prices[s2]
+                                    profit = proceeds - cost_basis
+                                    if profit >= 0:
+                                        total_wins += profit
+                                    else:
+                                        total_losses += -profit
+                                    cash_pool += proceeds
+                                    shares_held[s2] -= trim_shares
+                                    raised += trim_val
+                    else:
+                        # Full bidirectional rebalance: every open position
+                        # (existing + newcomer) is pushed toward target.
+                        # Pass 1 -- sell every existing position's OWN
+                        # excess above target (never more than that, so one
+                        # heavily overweight position can't get fully
+                        # liquidated just to fund the newcomer -- each
+                        # position's trim is capped at its own distance
+                        # from target).
+                        for s2 in range(n_stocks):
+                            if s2 == s or not in_pos[s2]:
+                                continue
+                            px2 = opens[d, s2]
+                            if not (px2 > 0):
+                                px2 = closes[d - 1, s2]
+                            if px2 <= 0:
+                                continue
+                            cur_val = shares_held[s2] * px2
+                            excess = cur_val - target
+                            if excess > 0.0:
+                                trim_shares = excess / px2
+                                proceeds = trim_shares * px2 * (1.0 - sell_cost_pct)
+                                cost_basis = trim_shares * entry_prices[s2]
+                                profit = proceeds - cost_basis
+                                if profit >= 0:
+                                    total_wins += profit
+                                else:
+                                    total_losses += -profit
+                                cash_pool += proceeds
+                                shares_held[s2] -= trim_shares
+                        # Pass 2 -- buy every existing UNDERWEIGHT position
+                        # back up toward target, funded from whatever cash
+                        # is now available (best-effort in iteration order;
+                        # if cash runs short, later ones simply get less).
+                        for s2 in range(n_stocks):
+                            if s2 == s or not in_pos[s2]:
+                                continue
+                            px2 = opens[d, s2]
+                            if not (px2 > 0):
+                                px2 = closes[d - 1, s2]
+                            if px2 <= 0:
+                                continue
+                            cur_val = shares_held[s2] * px2
+                            deficit = target - cur_val
+                            if deficit > 0.0:
+                                buy_val = min(deficit, cash_pool / (1.0 + buy_cost_pct))
+                                if buy_val > 0.0:
+                                    cost2 = buy_val * (1.0 + buy_cost_pct)
+                                    if cost2 <= cash_pool:
+                                        sh2 = buy_val / px2
+                                        new_shares2 = shares_held[s2] + sh2
+                                        entry_prices[s2] = (
+                                            (entry_prices[s2] * shares_held[s2] + px2 * sh2)
+                                            / new_shares2)
+                                        shares_held[s2] = new_shares2
+                                        cash_pool -= cost2
+                    ticket = min(target, cash_pool / (1.0 + buy_cost_pct))
+
+                if ticket >= min_ticket:
+                    cost = ticket * (1.0 + buy_cost_pct)
+                    if cost <= cash_pool:
+                        sh = ticket / fill
+                        shares_held[s] = sh
+                        entry_prices[s] = fill
+                        entry_days[s] = d
+                        high_since_entry[s] = fill
+                        half_sold[s] = False
+                        e_atr = atr[d, s] if atr[d, s] > 0 else atr[d - 1, s]
+                        if not (e_atr > 0):
+                            e_atr = fill * 0.02
+                        stop_loss_price[s] = fill - e_atr * sl_mult
+                        tp_trigger_price[s] = fill + e_atr * tp_mult
+                        in_pos[s] = True
+                        cash_pool -= cost
+                        n_open += 1
+                        # remove from watchlist once bought
+                        wl_active[s] = False
                 pending_entry[s] = False
 
         # ---- Update highs / evaluate real-position exits ----
@@ -866,9 +1081,47 @@ def simulate_portfolio_fixed_signal(
             c = closes[d, s]
             if c > 0:
                 high_since_entry[s] = max(high_since_entry[s], c)
-            # Frozen real exit from the signal winner
-            if real_exit_signal[d, s] or (btc_bearish[d] and False):  # BTC override handled upstream
+
+            exit_full = False
+            exit_partial = False
+
+            if signal_exit_type == EXIT_HYBRID:
+                if not half_sold[s] and c >= tp_trigger_price[s]:
+                    exit_partial = True
+                if half_sold[s]:
+                    potential_new_sl = c - atr[d, s] * trail_mult
+                    if potential_new_sl > stop_loss_price[s]:
+                        stop_loss_price[s] = potential_new_sl
+                if c < stop_loss_price[s]:
+                    exit_full = True
+            elif signal_exit_type == EXIT_PCT_TRAIL:
+                if c < high_since_entry[s] * (1.0 - trail_pct / 100.0):
+                    exit_full = True
+            elif signal_exit_type == EXIT_ATR_TRAIL:
+                if c < high_since_entry[s] - (exit_atr_mult * atr[d, s]):
+                    exit_full = True
+
+            # exit types 3/4/5 (MA crossunder / RSI crossunder / MA crossover
+            # exit) are already fully baked into real_exit_signal by
+            # build_signal_arrays, as is the BTC exit-override for every
+            # exit type -- so it's always checked here regardless of which
+            # branch above fired.
+            if real_exit_signal[d, s]:
+                exit_full = True
+
+            if exit_full:
                 pending_exit[s] = True
+                pending_partial[s] = False  # a full exit supersedes a pending partial
+            elif exit_partial:
+                pending_partial[s] = True
+
+        # ---- causal concurrency bookkeeping (today's realized n_open,
+        #      available for tomorrow's sizing decision only -- no lookahead) ----
+        cum_n_open_sum += n_open
+        cum_n_open_days += 1
+        sum_n_open_report += n_open
+        if n_open > max_n_open_report:
+            max_n_open_report = n_open
 
         # ---- Watchlist maintenance ----
         for s in range(n_stocks):
@@ -908,7 +1161,26 @@ def simulate_portfolio_fixed_signal(
                 wl_entry_price[s] = closes[d, s] if closes[d, s] > 0 else 0.0
 
         # ---- Rank active watchlist & promote the best into pending_entry ----
-        if n_open < max_concurrent_positions and cash_pool >= min_ticket:
+        # Funding method 0 (cash-pool-only) can only ever afford a new entry
+        # out of idle cash, so the gate stays cash-based. Methods 1/2 can
+        # also raise capital by trimming existing positions, so gating on
+        # cash_pool alone would silently starve them the moment cash runs
+        # low (which, under a fully-deployed rebalancing strategy, is most
+        # of the time) -- gate on total mark-to-market portfolio value
+        # instead; the actual per-position ticket size is still checked
+        # against min_ticket where the real trim math runs, so an
+        # optimistic promotion here that can't actually raise enough simply
+        # fails to fill and tries again another day, at no cost.
+        if entry_funding_method == 0:
+            can_afford_new_entry = cash_pool >= min_ticket
+        else:
+            port_val_for_gate = cash_pool
+            for s2 in range(n_stocks):
+                if in_pos[s2] and closes[d, s2] > 0:
+                    port_val_for_gate += shares_held[s2] * closes[d, s2]
+            can_afford_new_entry = port_val_for_gate >= min_ticket
+
+        if n_open < max_concurrent_positions and can_afford_new_entry:
             best_s = -1
             best_score = -1e18
             for s in range(1, n_stocks):
@@ -996,13 +1268,15 @@ def simulate_portfolio_fixed_signal(
         mean_r = 0.0
 
     avg_bars = (total_bars / trades) if trades > 0 else 0.0
+    avg_n_open = (sum_n_open_report / cum_n_open_days) if cum_n_open_days > 0 else 0.0
     return (final_wealth, final_bench, total_invested,
             total_wins, total_losses, trades,
             winning_trades, losing_trades, avg_bars,
             sharpe, sortino, max_dd,
             cf_days[:cf_cnt].copy(), cf_amounts[:cf_cnt].copy(),
             bench_cf_days[:bench_cf_cnt].copy(), bench_cf_amounts[:bench_cf_cnt].copy(),
-            daily_port_val.copy(), daily_bench_val.copy())
+            daily_port_val.copy(), daily_bench_val.copy(),
+            avg_n_open, max_n_open_report)
 
 
 # =============================================================================
@@ -1094,19 +1368,19 @@ def build_signal_arrays(signal_p, opens, closes, atr, adx, years_arr, n_stocks):
                     entry_signal[d, s] = False
 
         # ---- real-position exit (frozen) ----
-        if xt == EXIT_HYBRID:
-            # We need per-trade state; approximate with a simple ATR trail
-            # for the boolean matrix.  Full hybrid is applied inside the
-            # portfolio simulator when a real position is open.
-            # For the boolean “should we be looking to exit” we use ATR trail.
-            mult = signal_p.get("trail_mult", 6.0)
-            for d in range(1, n_days):
-                # placeholder – actual hybrid logic runs on live positions
-                pass
-        elif xt == EXIT_PCT_TRAIL:
-            # likewise needs high-since-entry; handled live
-            pass
-        elif xt == EXIT_ATR_TRAIL:
+        # EXIT_HYBRID / EXIT_PCT_TRAIL / EXIT_ATR_TRAIL genuinely need
+        # per-position state (high-since-entry, half-sold, a trailing stop
+        # anchored to THIS trade's entry) that doesn't exist in a per-day
+        # boolean matrix keyed only on (day, coin) -- so real_exit is
+        # deliberately left False for these three here. They are evaluated
+        # LIVE, per open position, inside simulate_portfolio_fixed_signal
+        # (see its "Update highs / evaluate real-position exits" block),
+        # which mirrors the signal engine's simulate_signal_trades exit
+        # state machine exactly. The BTC exit-override block below still
+        # applies to all six exit types uniformly, so real_exit[d,s] can
+        # still be True here for these three when BTC turns bearish -- the
+        # live loop ORs that in on top of its own price-based exit check.
+        if xt in (EXIT_HYBRID, EXIT_PCT_TRAIL, EXIT_ATR_TRAIL):
             pass
         elif xt == EXIT_MA_CROSSUNDER:
             ma = get_ma_cached(closes, s, signal_p["exit_ma_len"], signal_p["exit_ma_type"])
@@ -1186,26 +1460,30 @@ def money_weighted_annual_return(cf_days, cf_amounts):
 
 
 def compute_score_portfolio(metrics, yearly, is_oos=False):
+    """Returns (score, reason). reason is 'pass' or a short string naming
+    the first gate that failed and the actual-vs-threshold numbers, so
+    callers can log *why* a trial was rejected instead of just the -999."""
     trades = metrics.get("trades", 0)
     if trades < MIN_TRADES_GATE:
-        return -999.0
+        return -999.0, f"trades {trades} < MIN_TRADES_GATE {MIN_TRADES_GATE}"
     months = metrics.get("month_cnt", 0)
-    if months < (MIN_MONTHS_GATE if not is_oos else max(6, int(MIN_MONTHS_GATE * WFO_OOS_PCT / WFO_IS_PCT))):
-        return -999.0
+    months_needed = MIN_MONTHS_GATE if not is_oos else max(6, int(MIN_MONTHS_GATE * WFO_OOS_PCT / WFO_IS_PCT))
+    if months < months_needed:
+        return -999.0, f"months {months} < required {months_needed}"
     max_dd = abs(metrics.get("max_dd", 1.0))
     if max_dd > MAX_DD_GATE:
-        return -999.0
+        return -999.0, f"max_dd {max_dd:.1%} > MAX_DD_GATE {MAX_DD_GATE:.1%}"
     pf = metrics.get("pf", 0.0)
     if pf < 1.10:
-        return -999.0
+        return -999.0, f"profit_factor {pf:.2f} < 1.10"
     roi = metrics.get("roi", 0.0)
     if roi <= 0:
-        return -999.0
+        return -999.0, f"roi {roi:.1%} <= 0"
     wt = metrics.get("winning_trades", 0)
     lt = metrics.get("losing_trades", 0)
     wr = wt / (wt + lt) if (wt + lt) > 0 else 0.0
     if wr < MIN_WIN_RATE_GATE:
-        return -999.0
+        return -999.0, f"win_rate {wr:.1%} < MIN_WIN_RATE_GATE {MIN_WIN_RATE_GATE:.1%}"
 
     # Concentration hard gate
     if yearly:
@@ -1213,7 +1491,7 @@ def compute_score_portfolio(metrics, yearly, is_oos=False):
         if total_profit > 0:
             max_share = max(y.get("nominal_profit", 0) / total_profit for y in yearly)
             if max_share > CONCENTRATION_GATE:
-                return -999.0
+                return -999.0, f"concentration {max_share:.1%} > CONCENTRATION_GATE {CONCENTRATION_GATE:.1%} (one year dominates total profit)"
 
     ann = metrics.get("annual_return", 0.0)
     calmar = (ann / max_dd) if max_dd > 0 else 0.0
@@ -1260,7 +1538,7 @@ def compute_score_portfolio(metrics, yearly, is_oos=False):
              + consistency * W_CONSISTENCY + regime * W_REGIME)
     # soft confidence
     score *= min(1.0, math.sqrt(trades / max(MIN_TRADES_GATE, 1)))
-    return score
+    return score, "pass"
 
 
 # =============================================================================
@@ -1316,6 +1594,14 @@ def evaluate_watchlist_params(wl_p, signal_p, opens, closes, atr, adx,
         wl_p["max_concurrent_positions"],
         wl_p.get("allow_portfolio_pyramid", False),
         wl_p.get("min_ticket", MIN_TICKET_SIZE),
+        signal_p["exit_type"],
+        signal_p.get("sl_mult", 4.0), signal_p.get("tp_mult", 30.0),
+        signal_p.get("trail_mult", 6.0), signal_p.get("trail_pct", 15.0),
+        signal_p.get("exit_atr_mult", 3.0),
+        wl_p.get("wl_entry_funding_method", 0),
+        wl_p.get("wl_exit_proceeds_method", 0),
+        wl_p.get("wl_sizing_denom_method", 0),
+        wl_p.get("wl_concurrency_buffer", 1.0),
         eligible_mask, months, sip_flag,
         int(start_day), int(end_day),
         float(starting_wealth),
@@ -1328,7 +1614,7 @@ def evaluate_watchlist_params(wl_p, signal_p, opens, closes, atr, adx,
     (f_wealth, f_bench, t_invested, wins, losses, trades,
      wt, lt, avg_bars, sharpe, sortino, max_dd,
      cf_days, cf_amounts, bcf_days, bcf_amounts,
-     daily_port, daily_bench) = result
+     daily_port, daily_bench, avg_n_open, max_n_open) = result
 
     if t_invested <= 0 and starting_wealth <= 0:
         return -999.0, {}
@@ -1378,8 +1664,10 @@ def evaluate_watchlist_params(wl_p, signal_p, opens, closes, atr, adx,
         "month_cnt": max(1, int((end_day - start_day) / 30)),
         "avg_runup": 0.05, "avg_loss": 0.03,  # placeholders; full trade log would fill
         "yearly": yearly,
+        "avg_n_open": avg_n_open, "max_n_open": max_n_open,
     }
-    score = compute_score_portfolio(metrics, yearly, is_oos=is_oos)
+    score, gate_reason = compute_score_portfolio(metrics, yearly, is_oos=is_oos)
+    metrics["gate_reason"] = gate_reason
     return score, metrics
 
 
@@ -1429,6 +1717,47 @@ def _suggest_watchlist_params(trial):
     else:
         p["w_mom"] = p["w_adx"] = p["w_vol"] = 0.33
 
+    # -- Capital-deployment forks (independent -- Optuna explores all
+    #    combinations, including the original cash-pool-only / leave-liquid
+    #    / max-concurrent-positions setup as one of them) --
+    #
+    # wl_entry_funding_method:
+    #   0 = cash-pool-only (default/previous behaviour) -- a new position is
+    #       only ever funded from idle cash; existing positions are untouched.
+    #   1 = trim-overweight-only -- use idle cash first; if short of the new
+    #       equal-weight target, sell down (only) the existing positions
+    #       currently above that target and use the proceeds. Positions
+    #       already at/below target are left alone.
+    #   2 = full bidirectional rebalance -- every open position (existing +
+    #       new) is pushed toward total_portfolio_value / effective_slots,
+    #       buying underweight ones and selling overweight ones as needed.
+    p["wl_entry_funding_method"] = trial.suggest_categorical(
+        "wl_entry_funding_method", [0, 1, 2])
+
+    # wl_exit_proceeds_method:
+    #   0 = leave freed capital in cash_pool for the next new signal (previous
+    #       behaviour).
+    #   1 = immediately buy freed_capital / n_open_remaining more of every
+    #       still-open position (a real buy, real transaction cost).
+    p["wl_exit_proceeds_method"] = trial.suggest_categorical(
+        "wl_exit_proceeds_method", [0, 1])
+
+    # wl_sizing_denom_method -- what "effective number of slots" the
+    # equal-weight target is divided by:
+    #   0 = max_concurrent_positions (the hard cap above) -- conservative,
+    #       reserves capital for future diversification.
+    #   1 = causal (expanding-window, no-lookahead) running average of
+    #       realized concurrent-open-position count, plus a searched buffer.
+    #   2 = current open count only -- always fully deploy across exactly
+    #       however many positions are open right now, no capital reserve
+    #       ("invest everything, split evenly among whatever's open").
+    p["wl_sizing_denom_method"] = trial.suggest_categorical(
+        "wl_sizing_denom_method", [0, 1, 2])
+    if p["wl_sizing_denom_method"] == 1:
+        p["wl_concurrency_buffer"] = trial.suggest_float("wl_concurrency_buffer", 0.5, 3.0)
+    else:
+        p["wl_concurrency_buffer"] = 1.0
+
     return p
 
 
@@ -1475,26 +1804,134 @@ def run_optimization():
     print("\nSignal is FROZEN. Optuna searches only watchlist ranking,")
     print("removal rules, max positions, and sizing.\n")
 
+    # ---- One-time upfront report: how much raw activity does the frozen
+    #      signal actually generate in the inner-train window? This is the
+    #      ceiling on how many real trades ANY watchlist/capital config can
+    #      possibly produce -- if this number is already low, a wave of
+    #      early -999 trials is expected (MIN_TRADES_GATE not cleared) and
+    #      is not evidence of a bug; if it's high and trials still reject
+    #      on trades, that points at the watchlist/promotion layer instead.
+    print("=" * 70)
+    print("SIGNAL ACTIVITY CHECK (inner-train window, before any watchlist")
+    print("ranking/removal/sizing is applied -- this is the raw ceiling)")
+    print("=" * 70)
+    diag_entry_sig, diag_real_ex, _, _, diag_btc_bear = build_signal_arrays(
+        signal_p, opens, closes, atr, adx, years_arr, closes.shape[1])
+    # slice the OUTPUT (not the inputs) to the inner-train window -- using
+    # sliced inputs here would populate get_ma_cached/get_raw_rsi_cached's
+    # caches (keyed only on stock_idx/period/type, not on the array itself)
+    # with results computed from a shorter array, and every later call in
+    # this same process that reuses the same key against the FULL-length
+    # opens/closes/atr/adx would then silently read back that stale,
+    # too-short cached array -- exactly the kind of bug that produces a
+    # confusing IndexError deep inside a later trial.
+    diag_entry_sig_window = diag_entry_sig[:inner_split]
+    diag_real_ex_window = diag_real_ex[:inner_split]
+    raw_entries = int(diag_entry_sig_window.sum())
+    raw_exits = int(diag_real_ex_window.sum())
+    per_coin_entries = diag_entry_sig_window.sum(axis=0)
+    n_coins_with_any_signal = int((per_coin_entries > 0).sum())
+    print(f"  Raw entry signals fired: {raw_entries}  (across {n_coins_with_any_signal}/"
+          f"{closes.shape[1]} coins, {inner_split} days)")
+    print(f"  Raw real-exit signals fired: {raw_exits}")
+    if closes.shape[1] > 1:
+        top_coins = np.argsort(-per_coin_entries)[:5]
+        breakdown = ", ".join(f"{stock_names[s]}={int(per_coin_entries[s])}"
+                               for s in top_coins if per_coin_entries[s] > 0)
+        if breakdown:
+            print(f"  Busiest coins: {breakdown}")
+    print(f"  MIN_TRADES_GATE requires {MIN_TRADES_GATE} closed trades in this window.")
+    if raw_entries == 0:
+        print("  *** ZERO raw entry signals -- the frozen signal never fires at all")
+        print("      on this universe/window. No watchlist config can produce a trade.")
+        print("      Check signal_p's entry_type/thresholds and BTC gate, or the")
+        print("      universe/date range, before spending Optuna budget on this.")
+    elif raw_entries < MIN_TRADES_GATE:
+        print(f"  *** Only {raw_entries} raw entries exist, below MIN_TRADES_GATE itself")
+        print("      -- even a config that promotes and closes every single one")
+        print("      cannot clear the trades gate. Expect -999 across the board")
+        print("      until this changes (different signal, wider window, or lower")
+        print("      MIN_TRADES_GATE).")
+    else:
+        headroom = raw_entries / MIN_TRADES_GATE
+        print(f"  {headroom:.1f}x headroom over the gate -- plausible for some configs")
+        print("  to clear it, but tight rank/removal/max_concurrent_positions choices")
+        print("  can still starve most signals before they're ever promoted.")
+    print("=" * 70 + "\n")
+
     best_is_score = -999999.0
     best_wl_params = None
     all_trial_scores = []
+    gate_tally = {}
+    gate_tally_lock = threading.Lock()
+    trial_counter = {"n": 0}
+    VERBOSE_TRIAL_LIMIT = 15     # print full detail for the first N trials
+    TALLY_EVERY = 25             # print a rejection-reason histogram every N trials
+
+    def _record_and_log(trial_number, wl_p, train_score, train_m, val_score, val_m, final_score):
+        with gate_tally_lock:
+            trial_counter["n"] += 1
+            n = trial_counter["n"]
+            train_reason = (train_m or {}).get("gate_reason", "?")
+            if train_reason != "pass":
+                key = "train:" + train_reason.split(" ")[0]
+            elif val_m is not None and val_m.get("gate_reason", "pass") != "pass":
+                key = "val:" + val_m["gate_reason"].split(" ")[0]
+            else:
+                key = "pass"
+            gate_tally[key] = gate_tally.get(key, 0) + 1
+
+            verbose = n <= VERBOSE_TRIAL_LIMIT
+            if verbose:
+                fork_desc = (f"funding={wl_p.get('wl_entry_funding_method')} "
+                             f"exit_proceeds={wl_p.get('wl_exit_proceeds_method')} "
+                             f"sizing_denom={wl_p.get('wl_sizing_denom_method')} "
+                             f"rank={wl_p.get('wl_rank_method')} remove={wl_p.get('wl_remove_method')} "
+                             f"max_pos={wl_p.get('max_concurrent_positions')} "
+                             f"min_ticket={wl_p.get('min_ticket'):.0f}")
+                tm = train_m or {}
+                print(f"[trial {trial_number}] {fork_desc}")
+                print(f"    TRAIN: trades={tm.get('trades',0)} avg_n_open={tm.get('avg_n_open',0):.2f} "
+                      f"max_n_open={tm.get('max_n_open',0)} max_dd={abs(tm.get('max_dd',0)):.1%} "
+                      f"pf={tm.get('pf',0):.2f} roi={tm.get('roi',0):.1%} "
+                      f"wr={(tm.get('winning_trades',0)/max(1,tm.get('winning_trades',0)+tm.get('losing_trades',0))):.1%} "
+                      f"months={tm.get('month_cnt',0)}  -> score={train_score:.3f} [{tm.get('gate_reason','?')}]")
+                if val_m is not None:
+                    vm = val_m
+                    print(f"    VAL:   trades={vm.get('trades',0)} avg_n_open={vm.get('avg_n_open',0):.2f} "
+                          f"max_n_open={vm.get('max_n_open',0)} max_dd={abs(vm.get('max_dd',0)):.1%} "
+                          f"pf={vm.get('pf',0):.2f} roi={vm.get('roi',0):.1%} "
+                          f"months={vm.get('month_cnt',0)}  -> score={val_score:.3f} [{vm.get('gate_reason','?')}]")
+                print(f"    => final trial score: {final_score:.3f}")
+
+            if n % TALLY_EVERY == 0:
+                total = sum(gate_tally.values())
+                summary = ", ".join(f"{k}={v} ({v/total:.0%})"
+                                     for k, v in sorted(gate_tally.items(), key=lambda kv: -kv[1]))
+                print(f"\n--- after {n} trials, rejection-reason tally: {summary} ---\n")
+
 
     if OPTUNA_AVAILABLE:
         def objective(trial):
             wl_p = _suggest_watchlist_params(trial)
-            train_score, _ = evaluate_watchlist_params(
+            train_score, train_m = evaluate_watchlist_params(
                 wl_p, signal_p, opens, closes, atr, adx,
                 months, years_arr, eligible, master_dates, quote_vol,
                 0, inner_split, sip_flag, is_oos=False)
             if train_score <= -900:
+                _record_and_log(trial.number, wl_p, train_score, train_m, None, None, -999.0)
                 return -999.0
-            val_score, _ = evaluate_watchlist_params(
+            val_score, val_m = evaluate_watchlist_params(
                 wl_p, signal_p, opens, closes, atr, adx,
                 months, years_arr, eligible, master_dates, quote_vol,
                 inner_split, is_end, sip_flag, is_oos=True)
             if val_score <= -900:
-                return train_score * 0.05 - 5.0   # heavy fallback, never beats dual-pass
-            return min(train_score, val_score)
+                final = train_score * 0.05 - 5.0   # heavy fallback, never beats dual-pass
+                _record_and_log(trial.number, wl_p, train_score, train_m, val_score, val_m, final)
+                return final
+            final = min(train_score, val_score)
+            _record_and_log(trial.number, wl_p, train_score, train_m, val_score, val_m, final)
+            return final
 
         study = optuna.create_study(
             direction="maximize",
