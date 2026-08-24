@@ -1,7 +1,7 @@
 {
     "engine_version": "portfolio-wl-2.0.0",
     "oos_score": 0.0,
-    "is_score": -4.96485884146536,
+    "is_score": -4.964676514074042,
     "robustness_ratio": 0.0,
     "robustness_tier": "IS-champion",
     "signal_params": {
@@ -32,21 +32,21 @@
         "wl_rank_method": 4,
         "wl_remove_method": 5,
         "max_concurrent_positions": 3,
-        "allow_portfolio_pyramid": 0,
-        "min_ticket_mult": 1.4573058648893384,
-        "min_ticket": 2914.611729778677,
+        "allow_portfolio_pyramid": 1,
+        "min_ticket_mult": 1.997561782356388,
+        "min_ticket": 3995.123564712776,
         "wl_max_age_days": 30,
         "wl_rsi_f_len": 14,
         "wl_rsi_f_smt": 14,
         "wl_rsi_s_len": 14,
         "wl_rsi_s_smt": 14,
-        "wl_rank_drop_thresh": 0.3904453873701549,
-        "w_mom": 0.2925829400634254,
-        "w_adx": 0.2362201743574768,
-        "w_vol": 0.47119688557909783,
+        "wl_rank_drop_thresh": -0.6485464831883346,
+        "w_mom": 0.08174103269009103,
+        "w_adx": 0.34114169056521254,
+        "w_vol": 0.5771172767446964,
         "wl_entry_funding_method": 2,
         "wl_exit_proceeds_method": 0,
         "wl_sizing_denom_method": 1,
-        "wl_concurrency_buffer": 2.40538245021172
+        "wl_concurrency_buffer": 2.340525678752025
     }
 }

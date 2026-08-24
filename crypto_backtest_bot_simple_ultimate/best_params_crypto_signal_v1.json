@@ -1,7 +1,7 @@
 {
     "engine_version": "signal-1.2.0",
     "oos_score": 3.1,
-    "is_score": 3.3887452033774363,
+    "is_score": 2.3887452033774363,
     "robustness_ratio": 100,
     "robustness_tier": "OOS GATE FAILURE -- this candidate never even cleared the OOS gates (see diagnosis above); the IS-side numbers below are the only evidence of any edge at all",
     "params": {

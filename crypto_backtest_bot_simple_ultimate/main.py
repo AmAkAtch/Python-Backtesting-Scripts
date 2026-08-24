@@ -252,6 +252,34 @@ R_WINSORIZE_CAP = 20.0
 CONCENTRATION_SOFT_THRESHOLD = 0.80
 CONCENTRATION_PENALTY_MULT   = 0.70
 
+# -- Naive portfolio-risk diagnostics -- SOFT score penalties only, same
+#    philosophy as concentration above. This engine deliberately has no
+#    real wealth curve (see evaluate_params_signal's docstring) since
+#    that's crypto_portfolio_optimizer.py's job -- but a signal whose
+#    trades are individually fine yet cluster together in time (many
+#    losers at once, a long unbroken losing streak, many coins crashing
+#    on the same days) will make ANY capital-allocation scheme downstream
+#    struggle, no matter how the portfolio optimizer's watchlist/funding
+#    logic is tuned. These are cheap, trade-log-only proxies for that risk,
+#    used to gently steer the search away from it -- not a real portfolio
+#    simulation and not a hard gate, since some clustering is unavoidable
+#    in a correlated asset class like crypto.
+NAIVE_RISK_PCT_PER_TRADE = 0.01   # fixed-fractional risk assumed for the scored naive equity curve
+NAIVE_DD_SOFT_THRESHOLD  = 0.50   # naive max drawdown above this triggers a penalty
+NAIVE_DD_PENALTY_MULT    = 0.75
+# losing streaks are compared to what's STATISTICALLY EXPECTED at this
+# trial's own win rate (a 35%-win-rate trend system naturally has long
+# losing streaks -- that's normal, not a red flag) rather than a fixed
+# absolute count, so this doesn't unfairly punish a healthy low-win-rate
+# system for behaving exactly as a low-win-rate system should.
+STREAK_RATIO_SOFT_THRESHOLD = 1.5   # observed streak vs statistically-expected streak
+STREAK_PENALTY_MULT         = 0.85
+# fraction of all concurrently-open trades that were eventual losers, at
+# the single worst (most-correlated) moment in the backtest
+CORRELATED_LOSS_FRACTION_THRESHOLD = 0.70
+CORRELATED_LOSS_MIN_COUNT          = 3     # ignore tiny-sample noise (e.g. 1-of-1 open = trivially 100%)
+CORRELATED_LOSS_PENALTY_MULT       = 0.80
+
 # -- Composite score weights -- must sum to 1.00 --
 W_SQN        = 0.30
 W_EXPECTANCY = 0.30
@@ -397,7 +425,10 @@ def load_previous_winner(filename=BEST_PARAMS_FILE):
     return -999999, -999999, None
 
 
-def save_winner(oos_score, is_score, params, filename=BEST_PARAMS_FILE, tier=None):
+def save_winner(oos_score, is_score, params, filename=BEST_PARAMS_FILE, tier=None,
+                 naive_dd_1pct=None, naive_dd_2pct=None,
+                 max_consecutive_losses=None, streak_ratio=None,
+                 worst_day_loser_fraction=None):
     clean_params = {}
     for k, v in params.items():
         if isinstance(v, (bool, np.bool_)):
@@ -412,6 +443,11 @@ def save_winner(oos_score, is_score, params, filename=BEST_PARAMS_FILE, tier=Non
         'is_score':  float(is_score),
         'robustness_ratio': float(oos_score / is_score) if is_score > 0 else 0.0,
         'robustness_tier': tier if tier is not None else 'unrated',
+        'naive_dd_estimate_1pct_risk': float(naive_dd_1pct) if naive_dd_1pct is not None else None,
+        'naive_dd_estimate_2pct_risk': float(naive_dd_2pct) if naive_dd_2pct is not None else None,
+        'max_consecutive_losses': int(max_consecutive_losses) if max_consecutive_losses is not None else None,
+        'streak_ratio': float(streak_ratio) if streak_ratio is not None else None,
+        'worst_day_loser_fraction': float(worst_day_loser_fraction) if worst_day_loser_fraction is not None else None,
         'params': clean_params
     }
     try:
@@ -1334,6 +1370,120 @@ def evaluate_params_signal(p, opens, closes, atr, adx, years_arr,
 # 7. SCORING (trade-log based)
 # ==========================================
 
+def compute_naive_risk_metrics(entry_days, exit_days, r_multiple,
+                                risk_per_trade_pct=NAIVE_RISK_PCT_PER_TRADE):
+    """
+    Advisory, trade-log-only proxies for portfolio-level risk -- NOT a real
+    portfolio simulation (that's crypto_portfolio_optimizer.py's job; this
+    has no position sizing, concurrency limits, or capital constraints).
+    Exists because trade-level stats (SQN, expectancy, profit factor) are
+    computed on an unordered bag of R-multiples and can look perfectly
+    healthy even when losses cluster together in calendar time -- which a
+    real, capital-constrained portfolio would feel as a brutal, correlated
+    drawdown. Cheap enough to run on every scored trial.
+
+    Returns a dict with:
+      naive_max_dd, naive_ulcer_index, naive_total_return -- from a naive
+        fixed-fractional-risk equity curve, trades applied in EXIT-day
+        order (ignores real concurrency, so this is a LOWER bound on real
+        drawdown if trades genuinely overlap -- see estimate_naive_drawdown
+        note in run_optimization for the same caveat).
+      max_consecutive_losses -- longest run of consecutive losing trades
+        in exit-day order.
+      max_concurrent_open, max_concurrent_losers, worst_day_loser_fraction
+        -- a sweep over calendar days (using entry_day..exit_day as each
+        trade's "open" window) to find the single most-correlated moment:
+        how many trades were open at once, how many of those were eventual
+        losers, and what fraction that represents.
+    """
+    n = len(r_multiple)
+    empty = {
+        'naive_max_dd': 0.0, 'naive_ulcer_index': 0.0, 'naive_total_return': 0.0,
+        'max_consecutive_losses': 0, 'expected_streak': 0.0, 'streak_ratio': 0.0,
+        'max_concurrent_open': 0, 'max_concurrent_losers': 0,
+        'worst_day_loser_fraction': 0.0,
+    }
+    if n == 0:
+        return empty
+    entry_days = np.asarray(entry_days)
+    exit_days = np.asarray(exit_days)
+    r = np.asarray(r_multiple, dtype=np.float64)
+
+    # -- naive fixed-fractional equity curve: max drawdown + Ulcer Index --
+    order = np.argsort(exit_days)
+    r_sorted = r[order]
+    equity = 1.0
+    peak = 1.0
+    max_dd = 0.0
+    dd_sq_sum = 0.0
+    for rr in r_sorted:
+        equity *= (1.0 + rr * risk_per_trade_pct)
+        equity = max(equity, 1e-6)
+        if equity > peak:
+            peak = equity
+        dd = (peak - equity) / peak
+        if dd > max_dd:
+            max_dd = dd
+        dd_sq_sum += dd * dd
+    ulcer_index = math.sqrt(dd_sq_sum / n)
+    naive_total_return = equity - 1.0
+
+    # -- longest consecutive losing streak, compared to what's statistically
+    #    expected at this trial's own loss rate (Erdos-Renyi longest-run
+    #    approximation) so a healthy low-win-rate trend system doesn't get
+    #    unfairly flagged for behaving exactly as it should --
+    max_streak = 0
+    cur_streak = 0
+    for rr in r_sorted:
+        if rr < 0:
+            cur_streak += 1
+            if cur_streak > max_streak:
+                max_streak = cur_streak
+        else:
+            cur_streak = 0
+    loss_rate = float((r < 0).mean())
+    if 0.0 < loss_rate < 1.0 and n > 5:
+        expected_streak = math.log(n) / math.log(1.0 / loss_rate)
+    else:
+        expected_streak = 0.0
+    streak_ratio = (max_streak / expected_streak) if expected_streak > 0 else 0.0
+
+    # -- concurrent / correlated loss exposure: sweep-line over calendar
+    #    days using each trade's [entry_day, exit_day] as its open window --
+    day0 = int(entry_days.min())
+    day1 = int(exit_days.max()) + 2
+    span = day1 - day0 + 1
+    open_delta = np.zeros(span)
+    loser_delta = np.zeros(span)
+    losers_mask = r < 0
+    for i in range(n):
+        s = int(entry_days[i]) - day0
+        e = int(exit_days[i]) - day0 + 1
+        open_delta[s] += 1
+        open_delta[e] -= 1
+        if losers_mask[i]:
+            loser_delta[s] += 1
+            loser_delta[e] -= 1
+    open_curve = np.cumsum(open_delta)
+    loser_curve = np.cumsum(loser_delta)
+    peak_day = int(np.argmax(loser_curve))
+    max_concurrent_losers = int(loser_curve[peak_day])
+    worst_day_total_open = int(open_curve[peak_day])
+    max_concurrent_open = int(open_curve.max())
+    worst_day_loser_fraction = (max_concurrent_losers / worst_day_total_open
+                                 if worst_day_total_open > 0 else 0.0)
+
+    return {
+        'naive_max_dd': max_dd, 'naive_ulcer_index': ulcer_index,
+        'naive_total_return': naive_total_return,
+        'max_consecutive_losses': max_streak, 'expected_streak': expected_streak,
+        'streak_ratio': streak_ratio,
+        'max_concurrent_open': max_concurrent_open,
+        'max_concurrent_losers': max_concurrent_losers,
+        'worst_day_loser_fraction': worst_day_loser_fraction,
+    }
+
+
 def compute_score_signal(r_multiple, pct_return, bars_held, entry_years,
                           stock_idx, entry_days, exit_days,
                           entry_prices, exit_prices, layers_used,
@@ -1444,6 +1594,20 @@ def compute_score_signal(r_multiple, pct_return, bars_held, entry_years,
     if max_year_share > CONCENTRATION_SOFT_THRESHOLD or max_coin_share > CONCENTRATION_SOFT_THRESHOLD:
         concentration_penalty = CONCENTRATION_PENALTY_MULT
 
+    # -- naive portfolio-risk penalties (see compute_naive_risk_metrics'
+    #    docstring): three independent, mild soft penalties, so a trial
+    #    that trips more than one gets a meaningfully lower score without
+    #    any single dimension being able to zero it out entirely --
+    risk_m = compute_naive_risk_metrics(entry_days, exit_days, r_multiple)
+    risk_penalty = 1.0
+    if risk_m['naive_max_dd'] > NAIVE_DD_SOFT_THRESHOLD:
+        risk_penalty *= NAIVE_DD_PENALTY_MULT
+    if risk_m['streak_ratio'] > STREAK_RATIO_SOFT_THRESHOLD:
+        risk_penalty *= STREAK_PENALTY_MULT
+    if (risk_m['max_concurrent_losers'] >= CORRELATED_LOSS_MIN_COUNT
+            and risk_m['worst_day_loser_fraction'] > CORRELATED_LOSS_FRACTION_THRESHOLD):
+        risk_penalty *= CORRELATED_LOSS_PENALTY_MULT
+
     wr_bonus = max(0.0, win_rate - 0.50) * 4.0
     stat_conf = min(1.0, math.sqrt(n_trades / target_trades))
 
@@ -1452,7 +1616,7 @@ def compute_score_signal(r_multiple, pct_return, bars_held, entry_years,
         expectancy_r            * W_EXPECTANCY +
         recency_weighted_avg_r  * W_RECENCY +
         wr_bonus                * W_WR_BONUS
-    ) * stat_conf * concentration_penalty
+    ) * stat_conf * concentration_penalty * risk_penalty
 
     # -- entry-date clustering diagnostic (separate from R-based concentration
     #    above): what fraction of TRADE COUNT entered in the single busiest
@@ -1492,6 +1656,14 @@ def compute_score_signal(r_multiple, pct_return, bars_held, entry_years,
         'entry_year_counts': entry_year_counts,
         'max_entry_year_concentration': max_entry_year_concentration,
         'avg_pyramid_layers': avg_layers, 'pct_trades_pyramided': pct_pyramided,
+        'risk_penalty': risk_penalty,
+        'naive_max_dd': risk_m['naive_max_dd'],
+        'naive_ulcer_index': risk_m['naive_ulcer_index'],
+        'max_consecutive_losses': risk_m['max_consecutive_losses'],
+        'streak_ratio': risk_m['streak_ratio'],
+        'max_concurrent_open': risk_m['max_concurrent_open'],
+        'max_concurrent_losers': risk_m['max_concurrent_losers'],
+        'worst_day_loser_fraction': risk_m['worst_day_loser_fraction'],
     })
     return score, metrics
 
@@ -2125,6 +2297,50 @@ def run_optimization():
             run_overfitting_diagnostic(all_trial_srs, oos_m)
             report_yearly_table(oos_m, label="OUT-OF-SAMPLE YEAR-BY-YEAR R BREAKDOWN")
 
+        # -- Naive portfolio-risk diagnostics (advisory, see
+        #    compute_naive_risk_metrics' docstring). report_m's naive_max_dd
+        #    was already computed at NAIVE_RISK_PCT_PER_TRADE (1%) inside
+        #    compute_score_signal and factored into its score via
+        #    risk_penalty above -- this just also computes the 2%-risk
+        #    variant for context and prints everything clearly. Falls back
+        #    to IS if OOS failed its gates (oos_m may have too short/empty
+        #    a trade log in that case). --
+        report_m = oos_m if oos_score > -900 else is_m
+        naive_dd_1pct = report_m.get('naive_max_dd', 0.0)
+        naive_dd_2pct = compute_naive_risk_metrics(
+            report_m['entry_days'], report_m['exit_days'], report_m['r_multiple_raw'],
+            risk_per_trade_pct=0.02)['naive_max_dd']
+        max_streak = report_m.get('max_consecutive_losses', 0)
+        streak_ratio = report_m.get('streak_ratio', 0.0)
+        max_conc_open = report_m.get('max_concurrent_open', 0)
+        max_conc_losers = report_m.get('max_concurrent_losers', 0)
+        worst_day_frac = report_m.get('worst_day_loser_fraction', 0.0)
+        risk_penalty_applied = report_m.get('risk_penalty', 1.0)
+
+        print(f"\n{'='*78}")
+        print("NAIVE PORTFOLIO-RISK DIAGNOSTICS (advisory, NOT a real portfolio")
+        print("simulation -- run crypto_portfolio_optimizer.py for that; see")
+        print("compute_naive_risk_metrics' docstring for exactly what this captures)")
+        print(f"{'='*78}")
+        print(f"  Naive max drawdown:   ~{naive_dd_1pct:.1%} @1% risk/trade, "
+              f"~{naive_dd_2pct:.1%} @2% risk/trade")
+        print(f"  Longest losing streak: {max_streak} trades in a row "
+              f"({streak_ratio:.1f}x what this win rate would statistically predict)")
+        print(f"  Worst correlated moment: {max_conc_losers}/{max_conc_open} concurrently-open "
+              f"trades were eventual losers ({worst_day_frac:.0%})")
+        if risk_penalty_applied < 1.0:
+            print(f"  -> risk_penalty = {risk_penalty_applied:.2f}x was already applied to this "
+                  f"trial's score for the reasons above.")
+        if naive_dd_1pct > NAIVE_DD_SOFT_THRESHOLD:
+            print("  *** Even at a conservative 1% risk per trade, this implies a >50%")
+            print("      equity swing -- this signal's losing trades cluster heavily in")
+            print("      calendar time (a market-wide event, most likely) even though its")
+            print("      per-trade stats above look fine in isolation. The portfolio")
+            print("      optimizer's max_dd gate is likely to reject nearly everything")
+            print("      built on this signal. Worth confirming before spending an 8000-")
+            print("      trial budget on it.")
+        print(f"{'='*78}")
+
         # -- ALWAYS save + report the best candidate found, honestly tiered.
         #    A hard "don't save below 50%" gate meant a bad run left you with
         #    literally nothing. Now you always get the best available result
@@ -2141,8 +2357,13 @@ def run_optimization():
             tier = "POOR (<30%) -- high risk of not holding up; treat as a starting point, not a system"
         else:
             tier = "OOS GATE FAILURE -- this candidate never even cleared the OOS gates (see diagnosis above); the IS-side numbers below are the only evidence of any edge at all"
+        if naive_dd_1pct > NAIVE_DD_SOFT_THRESHOLD:
+            tier += f" | NAIVE DD ~{naive_dd_1pct:.0%} even at 1% risk/trade -- see note above"
 
-        save_winner(oos_score, is_score, best_params, tier=tier)
+        save_winner(oos_score, is_score, best_params, tier=tier,
+                    naive_dd_1pct=naive_dd_1pct, naive_dd_2pct=naive_dd_2pct,
+                    max_consecutive_losses=max_streak, streak_ratio=streak_ratio,
+                    worst_day_loser_fraction=worst_day_frac)
         print(f"\n{'='*78}\nFINAL RESULT -- ROBUSTNESS TIER: {tier}\n{'='*78}")
         print_performance_report(oos_score if oos_score > -900 else is_score,
                                  oos_m if oos_score > -900 else is_m,
