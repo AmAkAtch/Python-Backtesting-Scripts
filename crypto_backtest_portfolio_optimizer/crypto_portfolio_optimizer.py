@@ -141,6 +141,10 @@ MAX_DD_GATE          = 0.55
 # -- Recency / regime (from signal + old portfolio engines) --
 RECENCY_WEIGHT_MIN   = 0.80
 RECENCY_WEIGHT_MAX   = 1.00
+RECENCY_HALF_LIFE_YEARS = 2.0   # see _recency_weight() -- half-life-style
+                                 # decay, same bounded range as before, just
+                                 # concentrated near the recent end of the
+                                 # window instead of spread evenly across it
 BULL_YEAR_BTC_THRESHOLD = 0.10
 BEAR_YEAR_BTC_THRESHOLD = -0.10
 MIN_YEAR_COVERAGE_FOR_SCORING = 0.75
@@ -215,9 +219,21 @@ FALLBACK_UNIVERSE = [
 
 
 def _recency_weight(year, min_year, max_year):
+    """Half-life-style exponential decay from RECENCY_WEIGHT_MAX (max_year)
+    down to RECENCY_WEIGHT_MIN (min_year), normalized to hit exactly those
+    two endpoints -- same bounded range as the old linear ramp, mirrors
+    main.py's version so both engines score recency the same way."""
     if max_year <= min_year:
         return RECENCY_WEIGHT_MAX
-    frac = (year - min_year) / (max_year - min_year)
+    years_back = max_year - year
+    span_years = max_year - min_year
+    raw = 0.5 ** (years_back / RECENCY_HALF_LIFE_YEARS)
+    raw_floor = 0.5 ** (span_years / RECENCY_HALF_LIFE_YEARS)
+    denom = 1.0 - raw_floor
+    if denom <= 1e-12:
+        frac = (year - min_year) / span_years
+    else:
+        frac = (raw - raw_floor) / denom
     return RECENCY_WEIGHT_MIN + (RECENCY_WEIGHT_MAX - RECENCY_WEIGHT_MIN) * frac
 
 
@@ -277,12 +293,25 @@ def load_signal_winner(path=SIGNAL_WINNER_FILE):
     print(f"  entry_type: {params['entry_type']}   exit_type: {params['exit_type']}")
     print(f"  BTC gates: entry={params['use_btc_entry_gate']}  "
           f"exit_override={params['use_btc_exit_override']}")
+    signal_universe = raw.get("universe") if isinstance(raw, dict) else None
+    if signal_universe:
+        print(f"  universe (signal): {len(signal_universe)} coins pinned from the signal run")
+    else:
+        print(f"  universe (signal): none saved in this file (older engine_version) -- "
+              f"this optimizer will have to re-fetch its own universe independently, "
+              f"which is NOT guaranteed to be the same coins the signal was optimized "
+              f"on. Re-run the signal engine to regenerate {path} with a pinned universe.")
     print("=" * 70)
-    return params
+    return params, signal_universe
 
 
 # =============================================================================
-# 2. UNIVERSE (identical spirit to the signal engine)
+# 2. UNIVERSE (built as a filtered SUBSET of the signal engine's exact
+#    universe whenever one is available -- see fetch_top_universe() below.
+#    This is what guarantees the watchlist/portfolio is optimized on the
+#    same coins the signal was optimized on, instead of two engines each
+#    independently querying CoinGecko at different times and silently
+#    drifting onto different coin sets as market-cap ranks shift day to day.)
 # =============================================================================
 
 def _is_excluded(symbol_upper):
@@ -306,9 +335,75 @@ def _get_binance_usdt_symbols():
         return None
 
 
-def fetch_top_universe():
-    print(f"Fetching top-{TOP_N_COINS}-by-market-cap universe from CoinGecko...")
+def fetch_top_universe(signal_universe=None):
+    """Build the portfolio/watchlist coin universe.
+
+    If `signal_universe` is given (the exact, ordered ticker list the
+    signal engine persisted for the run this optimizer is loading), the
+    universe is built EXCLUSIVELY as a filtered SUBSET of that list --
+    coin-for-coin consistent with the frozen signal, in the signal
+    engine's own market-cap order -- capped to the top TOP_N_COINS that
+    still clear today's liquidity bar. No coin the signal never saw can
+    enter the portfolio/watchlist this way, and no coin the signal WAS
+    tested on can silently vanish just because an independent re-fetch
+    happened to rank it differently that day.
+
+    If `signal_universe` is not given (older signal-winner file, saved
+    before this field existed), falls back to the previous behaviour: an
+    independent CoinGecko top-N fetch, with a loud warning that coin-for-
+    coin consistency with the signal can't be guaranteed."""
     binance_usdt = _get_binance_usdt_symbols()
+
+    if signal_universe:
+        print(f"Building portfolio universe as a filtered subset of the signal "
+              f"engine's own {len(signal_universe)}-coin universe...")
+        try:
+            r = requests.get(COINGECKO_MARKETS_URL, params={
+                "vs_currency": "usd", "order": "market_cap_desc",
+                "per_page": 250, "page": 1, "sparkline": "false"
+            }, timeout=20)
+            r.raise_for_status()
+            vol_by_sym = {str(c.get("symbol", "")).upper(): (c.get("total_volume", 0) or 0)
+                          for c in r.json()}
+        except Exception as e:
+            print(f"CoinGecko volume lookup failed ({e}); liquidity filter will be "
+                  f"skipped for this run -- every signal-universe coin with a live "
+                  f"Binance USDT pair will be kept, up to TOP_N_COINS.")
+            vol_by_sym = None
+
+        tickers, excluded_log = [], []
+        for binance_sym in signal_universe:
+            sym = binance_sym[:-4] if binance_sym.endswith("USDT") else binance_sym
+            if binance_usdt is not None and binance_sym not in binance_usdt:
+                excluded_log.append(f"{sym} (no live Binance USDT pair anymore)")
+                continue
+            if vol_by_sym is not None:
+                vol = vol_by_sym.get(sym)
+                if vol is None:
+                    excluded_log.append(f"{sym} (dropped out of CoinGecko top-250, can't verify liquidity)")
+                    continue
+                if sym != "BTC" and vol < MIN_AVG_DAILY_VOLUME_USD:
+                    excluded_log.append(f"{sym} (low vol)")
+                    continue
+            tickers.append(binance_sym)
+            if len(tickers) >= TOP_N_COINS:
+                break
+
+        tickers = [t for t in tickers if t != "BTCUSDT"]
+        tickers = ["BTCUSDT"] + list(dict.fromkeys(tickers))
+        if len(tickers) < 10:
+            print("Filtered signal-universe subset came back too small; "
+                  "falling back to the raw signal universe unfiltered.")
+            tickers = ["BTCUSDT"] + [t for t in signal_universe if t != "BTCUSDT"]
+        print(f"Universe size: {len(tickers)} (excluded {len(excluded_log)} of "
+              f"{len(signal_universe)} signal-universe coins)")
+        assert tickers[0] == "BTCUSDT"
+        return tickers
+
+    print(f"!! WARNING: no pinned signal universe available -- fetching an "
+          f"INDEPENDENT top-{TOP_N_COINS}-by-market-cap universe from CoinGecko. "
+          f"This is NOT guaranteed to be the same coins the signal engine was "
+          f"optimized on. Re-run the signal engine to fix this permanently.")
     tickers, excluded_log = [], []
     try:
         r = requests.get(COINGECKO_MARKETS_URL, params={
@@ -779,6 +874,12 @@ def simulate_portfolio_fixed_signal(
     losing_trades = 0
     total_bars = 0
     trades = 0
+    # Per-trade PERCENT return accumulators (real analogue of the signal
+    # engine's avg_win_r/avg_loss_r) -- accumulated at the exact same FULL-
+    # close point where winning_trades/losing_trades increment, so the
+    # counts line up exactly. See Phase A2 below.
+    sum_win_pct = 0.0
+    sum_loss_pct = 0.0
 
     daily_port_val = np.zeros(n_days)
     daily_bench_val = np.zeros(n_days)
@@ -866,12 +967,15 @@ def simulate_portfolio_fixed_signal(
                     exit_val = shares_held[s] * fill * (1.0 - sell_cost_pct)
                     cost = shares_held[s] * entry_prices[s]
                     profit = exit_val - cost
+                    pct = (profit / cost) if cost > 0 else 0.0
                     if profit >= 0:
                         total_wins += profit
                         winning_trades += 1
+                        sum_win_pct += pct
                     else:
                         total_losses += -profit
                         losing_trades += 1
+                        sum_loss_pct += -pct   # stored as a positive magnitude
                     total_bars += d - entry_days[s]
                     trades += 1
                     cash_pool += exit_val
@@ -1074,6 +1178,54 @@ def simulate_portfolio_fixed_signal(
                         wl_active[s] = False
                 pending_entry[s] = False
 
+        # ---- Phase A3b: portfolio-level pyramiding (add capital to an
+        #      already-open winner when its entry signal fires again) --
+        #      previously allow_portfolio_pyramid was wired into Optuna's
+        #      search space and passed all the way into this function, but
+        #      never actually READ anywhere in the body, so every trial
+        #      behaved identically regardless of which value Optuna chose.
+        #      Deliberately kept SEPARATE from the entry-funding forks
+        #      above (cash-pool-only, always) rather than threaded into
+        #      that already-intricate rebalance math -- an add-on only
+        #      ever draws from idle cash, sized at HALF a normal slot's
+        #      ticket. Decreasing-size on purpose: an equal-weighted add
+        #      (same ticket as layer 1) drags the blended cost basis
+        #      toward the most recent, most extended fill too aggressively
+        #      -- half-size add-ons are the standard "let it prove itself
+        #      again before doubling down" pyramiding convention. --
+        if allow_portfolio_pyramid:
+            for s in range(1, n_stocks):
+                if not in_pos[s] or pending_entry[s] or pending_exit[s]:
+                    continue
+                if not eligible_mask[d, s] or not entry_signal[d, s]:
+                    continue
+                add_ticket = (cash_pool / max(1.0, denom_assumed)) * 0.5
+                add_ticket = min(add_ticket, cash_pool / (1.0 + buy_cost_pct))
+                if add_ticket < min_ticket * 0.25:
+                    continue
+                fill = opens[d, s]
+                if not (fill > 0):
+                    fill = closes[d - 1, s]
+                if fill <= 0:
+                    continue
+                cost = add_ticket * (1.0 + buy_cost_pct)
+                if cost > cash_pool:
+                    continue
+                add_shares = add_ticket / fill
+                new_shares = shares_held[s] + add_shares
+                # same share-weighted cost-basis blend used everywhere else
+                # in this file (Fork B top-ups, rebalance buys) -- correct
+                # regardless of how many layers or what size each one was
+                entry_prices[s] = (entry_prices[s] * shares_held[s] + fill * add_shares) / new_shares
+                shares_held[s] = new_shares
+                high_since_entry[s] = max(high_since_entry[s], fill)
+                cash_pool -= cost
+                # NOTE: n_open, trades, entry_days are all deliberately left
+                # untouched -- this is the SAME open trade getting bigger,
+                # not a new one. winning_trades/losing_trades/trades still
+                # only increment once, at the eventual full close in Phase
+                # A2, against the now-blended entry_prices[s].
+
         # ---- Update highs / evaluate real-position exits ----
         for s in range(n_stocks):
             if not in_pos[s]:
@@ -1244,6 +1396,7 @@ def simulate_portfolio_fixed_signal(
 
     # Simple risk stats from daily returns
     rets = daily_ret_p[start_day + 1:end_day]
+    bench_rets = daily_ret_b[start_day + 1:end_day]
     valid = rets[~np.isnan(rets)]
     if len(valid) > 5:
         mean_r = np.mean(valid)
@@ -1252,6 +1405,15 @@ def simulate_portfolio_fixed_signal(
         down_std = np.std(downside) if len(downside) > 1 else std_r
         sharpe = (mean_r / std_r) * math.sqrt(365.0) if std_r > 0 else 0.0
         sortino = (mean_r / down_std) * math.sqrt(365.0) if down_std > 0 else 0.0
+        # Information Ratio: annualized mean/std of the DAILY EXCESS return
+        # over the BTC benchmark (rets - bench_rets are the exact same
+        # cash-flow-adjusted series sharpe/sortino above already use, just
+        # paired against the benchmark instead of zero). Previously this
+        # was hardcoded to 0.0 in the Python layer even though these two
+        # arrays were already being computed right here every call.
+        excess = rets - bench_rets
+        excess_std = np.std(excess)
+        ir = (np.mean(excess) / excess_std) * math.sqrt(365.0) if excess_std > 0 else 0.0
         # max DD
         peak = daily_port_val[start_day]
         max_dd = 0.0
@@ -1264,7 +1426,7 @@ def simulate_portfolio_fixed_signal(
                 if dd > max_dd:
                     max_dd = dd
     else:
-        sharpe = sortino = max_dd = 0.0
+        sharpe = sortino = max_dd = ir = 0.0
         mean_r = 0.0
 
     avg_bars = (total_bars / trades) if trades > 0 else 0.0
@@ -1272,7 +1434,8 @@ def simulate_portfolio_fixed_signal(
     return (final_wealth, final_bench, total_invested,
             total_wins, total_losses, trades,
             winning_trades, losing_trades, avg_bars,
-            sharpe, sortino, max_dd,
+            sharpe, sortino, max_dd, ir,
+            sum_win_pct, sum_loss_pct,
             cf_days[:cf_cnt].copy(), cf_amounts[:cf_cnt].copy(),
             bench_cf_days[:bench_cf_cnt].copy(), bench_cf_amounts[:bench_cf_cnt].copy(),
             daily_port_val.copy(), daily_bench_val.copy(),
@@ -1612,7 +1775,8 @@ def evaluate_watchlist_params(wl_p, signal_p, opens, closes, atr, adx,
     )
 
     (f_wealth, f_bench, t_invested, wins, losses, trades,
-     wt, lt, avg_bars, sharpe, sortino, max_dd,
+     wt, lt, avg_bars, sharpe, sortino, max_dd, ir,
+     sum_win_pct, sum_loss_pct,
      cf_days, cf_amounts, bcf_days, bcf_amounts,
      daily_port, daily_bench, avg_n_open, max_n_open) = result
 
@@ -1629,6 +1793,13 @@ def evaluate_watchlist_params(wl_p, signal_p, opens, closes, atr, adx,
 
     pf = (wins / losses) if losses > 0 else (999.0 if wins > 0 else 0.0)
     wr = wt / (wt + lt) if (wt + lt) > 0 else 0.0
+    # Real per-trade percent win/loss size (parallels main.py's avg_win_r/
+    # avg_loss_r, just in %-of-entry-price terms instead of R-multiple
+    # terms since the portfolio sim has no fixed risk unit). avg_loss_pct
+    # is a positive magnitude, matching compute_score_portfolio's
+    # expectation (it does `abs(metrics.get("avg_loss", ...))`).
+    avg_win_pct = (sum_win_pct / wt) if wt > 0 else 0.0
+    avg_loss_pct = (sum_loss_pct / lt) if lt > 0 else 0.0
 
     # Rough yearly breakdown for concentration / consistency
     yearly = []
@@ -1657,12 +1828,13 @@ def evaluate_watchlist_params(wl_p, signal_p, opens, closes, atr, adx,
         "roi": roi, "bench_roi": bench_roi, "alpha": roi - bench_roi,
         "pf": pf, "wealth": f_wealth, "bench_wealth": f_bench,
         "trades": trades, "winning_trades": wt, "losing_trades": lt,
-        "sharpe": sharpe, "sortino": sortino, "ir": 0.0,  # simplified
+        "sharpe": sharpe, "sortino": sortino,
+        "ir": ir,  # real Information Ratio now -- see simulate_portfolio_fixed_signal
         "max_dd": max_dd, "avg_bars": avg_bars,
         "t_invested": t_invested, "starting_wealth": starting_wealth,
         "annual_return": ann, "bench_annual_return": bench_ann,
         "month_cnt": max(1, int((end_day - start_day) / 30)),
-        "avg_runup": 0.05, "avg_loss": 0.03,  # placeholders; full trade log would fill
+        "avg_runup": avg_win_pct, "avg_loss": avg_loss_pct,  # real per-trade % now
         "yearly": yearly,
         "avg_n_open": avg_n_open, "max_n_open": max_n_open,
     }
@@ -1761,6 +1933,32 @@ def _suggest_watchlist_params(trial):
     return p
 
 
+def load_previous_wl_winner(filename=BEST_PARAMS_FILE):
+    """Load a previously-saved watchlist/portfolio champion's PARAMS only --
+    never its stored oos_score/is_score. Those numbers were computed against
+    whatever data + engine code existed on some earlier run; they go stale
+    the moment new days of data arrive or the scoring logic changes, so
+    trusting them at face value risks either quietly demoting a still-good
+    champion or (worse) quietly promoting a trial that only looks better
+    because it's being compared against a stale number. The caller is
+    expected to re-run these params through evaluate_watchlist_params() on
+    the CURRENT data with the CURRENT engine before treating this as the
+    score to beat -- see the "CHAMPION RE-VALIDATION" block in
+    run_optimization()."""
+    if not os.path.exists(filename):
+        return None
+    try:
+        with open(filename, "r") as f:
+            raw = json.load(f)
+        wl_p = raw.get("watchlist_params")
+        if not wl_p:
+            return None
+        return wl_p
+    except Exception as e:
+        print(f"Could not load previous watchlist champion from {filename}: {e}")
+        return None
+
+
 def save_winner(oos_score, is_score, signal_p, wl_p, filename=BEST_PARAMS_FILE, tier="unrated"):
     data = {
         "engine_version": ENGINE_VERSION,
@@ -1781,13 +1979,79 @@ def save_winner(oos_score, is_score, signal_p, wl_p, filename=BEST_PARAMS_FILE, 
 
 
 # =============================================================================
+# 9b. NEIGHBORHOOD STABILITY (parity with main.py's passes_neighborhood_check
+#     -- this existed only as a dead "# neighbourhood check on a couple of
+#     key knobs" comment in the callback below, never actually implemented,
+#     so no portfolio/watchlist champion has ever been screened for being a
+#     brittle, lucky combination before being crowned.)
+# =============================================================================
+
+def passes_neighborhood_check_wl(wl_p, base_score, signal_p, opens, closes, atr, adx,
+                                  months, years_arr, eligible, master_dates, quote_vol,
+                                  sip_flag, start_day, end_day):
+    """Perturb a few of the watchlist knobs that matter most for THIS
+    trial's structure and re-evaluate on the same (train) window. If the
+    score collapses on any single small nudge, the trial is rejected as
+    champion -- it's too brittle to trust. Mirrors main.py's
+    passes_neighborhood_check() one-to-one in spirit."""
+    if base_score <= 0:
+        return True
+
+    perturbations = []
+
+    if wl_p["wl_remove_method"] == WL_REMOVE_RANK_DROP:
+        perturbations += [
+            {"wl_rank_drop_thresh": max(-1.0, min(1.0, wl_p["wl_rank_drop_thresh"] + 0.15))},
+            {"wl_rank_drop_thresh": max(-1.0, min(1.0, wl_p["wl_rank_drop_thresh"] - 0.15))},
+        ]
+    if wl_p["wl_remove_method"] == WL_REMOVE_AGE:
+        perturbations += [
+            {"wl_max_age_days": wl_p["wl_max_age_days"] + 10},
+            {"wl_max_age_days": max(5, wl_p["wl_max_age_days"] - 10)},
+        ]
+    if wl_p["wl_rank_method"] == WL_RANK_COMPOSITE:
+        # nudge the composite weights and renormalize back to a simplex
+        for k in ("w_mom", "w_adx", "w_vol"):
+            nudged = dict(w_mom=wl_p["w_mom"], w_adx=wl_p["w_adx"], w_vol=wl_p["w_vol"])
+            nudged[k] = min(1.0, nudged[k] + 0.15)
+            s = sum(nudged.values())
+            perturbations.append({kk: vv / s for kk, vv in nudged.items()})
+    if wl_p["wl_sizing_denom_method"] == 1:
+        perturbations += [
+            {"wl_concurrency_buffer": min(3.0, wl_p["wl_concurrency_buffer"] + 0.5)},
+            {"wl_concurrency_buffer": max(0.5, wl_p["wl_concurrency_buffer"] - 0.5)},
+        ]
+
+    # universal nudges regardless of which methods were picked
+    perturbations += [
+        {"max_concurrent_positions": min(12, wl_p["max_concurrent_positions"] + 2)},
+        {"max_concurrent_positions": max(3, wl_p["max_concurrent_positions"] - 2)},
+        {"min_ticket_mult": wl_p["min_ticket_mult"] * 0.85},
+        {"min_ticket_mult": wl_p["min_ticket_mult"] * 1.15},
+    ]
+
+    for delta in perturbations:
+        n_p = dict(wl_p)
+        n_p.update(delta)
+        if "min_ticket_mult" in delta:
+            n_p["min_ticket"] = MONTHLY_SIP * n_p["min_ticket_mult"]
+        n_score, _ = evaluate_watchlist_params(
+            n_p, signal_p, opens, closes, atr, adx,
+            months, years_arr, eligible, master_dates, quote_vol,
+            start_day, end_day, sip_flag, is_oos=False)
+        if n_score < base_score * NEIGHBOR_THRESHOLD:
+            return False
+    return True
+
+
+# =============================================================================
 # 10. MAIN OPTIMIZER
 # =============================================================================
 
 def run_optimization():
-    signal_p = load_signal_winner(SIGNAL_WINNER_FILE)
+    signal_p, signal_universe = load_signal_winner(SIGNAL_WINNER_FILE)
 
-    tickers = fetch_top_universe()
+    tickers = fetch_top_universe(signal_universe)
     (opens, closes, atr, adx, months, years_arr,
      stock_names, eligible, master_dates, quote_vol) = prepare_matrix_data(tickers)
 
@@ -1859,8 +2123,51 @@ def run_optimization():
         print("  can still starve most signals before they're ever promoted.")
     print("=" * 70 + "\n")
 
+    # ---- CHAMPION RE-VALIDATION -- never trust a saved champion's stored
+    #      score at face value. Data grows by however many days have passed
+    #      since it was last saved, the coin universe can shift (see the
+    #      pinned-universe fix above), and the scoring engine itself can
+    #      change between runs. So instead of reading last time's oos_score
+    #      out of the JSON and assuming it still holds, the previous
+    #      champion's PARAMS are re-run through today's evaluate_watchlist_
+    #      params(), on today's freshly-downloaded data, with whatever
+    #      engine code is running right now -- exactly the same train/val
+    #      dual-pass every new Optuna trial gets. Only that freshly-computed
+    #      number becomes the score a new trial has to beat. If the old
+    #      champion no longer clears the gates on current data (market
+    #      regime moved on, a coin got delisted, etc.), its stale score is
+    #      discarded rather than propping up a champion that quietly isn't
+    #      one anymore.
     best_is_score = -999999.0
     best_wl_params = None
+    prev_wl_champion = load_previous_wl_winner(BEST_PARAMS_FILE)
+    if prev_wl_champion is not None:
+        print("=" * 70)
+        print(f"RE-VALIDATING previous champion from {BEST_PARAMS_FILE} on today's data...")
+        ptrain_score, ptrain_m = evaluate_watchlist_params(
+            prev_wl_champion, signal_p, opens, closes, atr, adx,
+            months, years_arr, eligible, master_dates, quote_vol,
+            0, inner_split, sip_flag, is_oos=False)
+        if ptrain_score > -900:
+            pval_score, pval_m = evaluate_watchlist_params(
+                prev_wl_champion, signal_p, opens, closes, atr, adx,
+                months, years_arr, eligible, master_dates, quote_vol,
+                inner_split, is_end, sip_flag, is_oos=True)
+            benchmark_score = min(ptrain_score, pval_score) if pval_score > -900 else -999.0
+        else:
+            benchmark_score = -999.0
+        if benchmark_score > -900:
+            best_is_score = benchmark_score
+            best_wl_params = prev_wl_champion
+            print(f"Champion RE-VALIDATED: freshly-computed score to beat = {best_is_score:.4f} "
+                  f"(train={ptrain_score:.4f})")
+        else:
+            print("Previous champion no longer clears the gates on today's data/universe -- "
+                  f"its old saved score is stale and void. Reason: "
+                  f"{(ptrain_m or {}).get('gate_reason', '?')}. Starting this search from "
+                  f"scratch instead of protecting a champion that quietly isn't one anymore.")
+        print("=" * 70 + "\n")
+
     all_trial_scores = []
     gate_tally = {}
     gate_tally_lock = threading.Lock()
@@ -1952,6 +2259,14 @@ def run_optimization():
                     return
                 wl_p = _suggest_watchlist_params(trial)  # rebuild full dict
                 # neighbourhood check on a couple of key knobs
+                if not passes_neighborhood_check_wl(
+                        wl_p, max(trial.value, 0.01), signal_p, opens, closes, atr, adx,
+                        months, years_arr, eligible, master_dates, quote_vol,
+                        sip_flag, 0, inner_split):
+                    print(f"\n[trial {trial.number}] score {trial.value:.4f} beat the champion "
+                          f"but FAILED the neighborhood-stability check -- rejecting as too "
+                          f"brittle (a small nudge to its own knobs collapsed the score).")
+                    return
                 best_is_score = trial.value
                 best_wl_params = wl_p
                 print(f"\n[trial {trial.number}] dual-pass score {trial.value:.4f}")

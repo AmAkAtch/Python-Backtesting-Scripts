@@ -233,13 +233,38 @@ MA_CACHE_MAX_ENTRIES   = 40_000   # perf only, raise if you have RAM to spare
 MAX_PYRAMID_LAYERS_MIN = 1
 MAX_PYRAMID_LAYERS_MAX = 4
 
-# -- Recency weighting (v1.2): a calendar year's contribution to the
-#    scored consistency term ramps from RECENCY_WEIGHT_MIN (the OLDEST
-#    year in the window being scored) to RECENCY_WEIGHT_MAX (the most
-#    RECENT year). Widen the gap to lean harder toward "still working
-#    now" over "worked years ago and has been quiet since". --
+# -- Recency weighting (v1.2, reshaped v1.3): a calendar year's contribution
+#    to the scored consistency term decays from RECENCY_WEIGHT_MAX (the most
+#    RECENT year in the window being scored) down to RECENCY_WEIGHT_MIN (the
+#    OLDEST year), same bounded [MIN, MAX] range as before. Widen the gap to
+#    lean harder toward "still working now" over "worked years ago and has
+#    been quiet since".
+#    v1.3 changed the SHAPE of the ramp from linear to a half-life-style
+#    exponential decay (still normalized to hit exactly MIN at the window's
+#    oldest year and MAX at its newest -- a drop-in replacement, nothing
+#    downstream needs to change). Rationale: a straight line spreads the
+#    30%-wide MIN..MAX gap evenly across however many years are in the
+#    window, so a coin's best year sitting in the MIDDLE of a long window
+#    (e.g. the 2020/2021 bull run inside an 8-year window) gets docked
+#    almost as much as if it were the oldest year. A half-life decay instead
+#    concentrates most of the weight in the last ~RECENCY_HALF_LIFE_YEARS
+#    and lets everything older than that fall toward MIN together, which
+#    better matches "does this still work now" without needing to know
+#    exactly where in a halving cycle a given year sat (that's a harder,
+#    separate problem -- see the REGIME note below). --
 RECENCY_WEIGHT_MIN = 0.70
 RECENCY_WEIGHT_MAX = 1.00
+RECENCY_HALF_LIFE_YEARS = 2.0   # weight halves (within the MIN..MAX band)
+                                # every this-many years back from the
+                                # window's most recent year
+# NOTE ON CRYPTO'S ~4-YEAR HALVING CYCLE: neither the old linear ramp nor
+# this half-life version knows which phase of a halving cycle a given year
+# was in -- both are pure calendar-distance decays. A genuinely regime-aware
+# scheme would need bull/bear/accumulation years labeled explicitly (e.g. via
+# BTC's own drawdown/return) and weighted by regime-similarity-to-now instead
+# of by calendar distance. That's a real, separate improvement worth doing
+# later; this change only fixes the "evenly-spread-over-the-window" issue,
+# not the regime-blindness issue.
 
 # -- R-multiple winsorization (v1.1): caps how much one freak trade can
 #    dominate the AGGREGATE score (expectancy, SQN, yearly averages). The
@@ -309,12 +334,26 @@ EXIT_MA_XOVER_EXIT   = 5
 
 
 def _recency_weight(year, min_year, max_year):
-    """Linear ramp from RECENCY_WEIGHT_MIN (min_year) to RECENCY_WEIGHT_MAX
-    (max_year). If the window spans only one year, returns the max weight
+    """Half-life-style exponential decay from RECENCY_WEIGHT_MAX (max_year)
+    down to RECENCY_WEIGHT_MIN (min_year), normalized so the endpoints land
+    on EXACTLY the same two values the old linear ramp used -- only the
+    shape of the interior changed (concentrated near the recent end instead
+    of spread evenly), so every caller/consumer of this function is
+    unaffected. If the window spans only one year, returns the max weight
     (nothing to compare against)."""
     if max_year <= min_year:
         return RECENCY_WEIGHT_MAX
-    frac = (year - min_year) / (max_year - min_year)
+    years_back = max_year - year               # 0 at the newest year
+    span_years = max_year - min_year
+    raw = 0.5 ** (years_back / RECENCY_HALF_LIFE_YEARS)        # 1.0 at newest, decays going back
+    raw_floor = 0.5 ** (span_years / RECENCY_HALF_LIFE_YEARS)  # raw's value at the OLDEST year
+    denom = 1.0 - raw_floor
+    if denom <= 1e-12:
+        # half-life is so long relative to the window that raw barely moves
+        # across it -- fall back to the linear ramp rather than divide by ~0
+        frac = (year - min_year) / span_years
+    else:
+        frac = (raw - raw_floor) / denom
     return RECENCY_WEIGHT_MIN + (RECENCY_WEIGHT_MAX - RECENCY_WEIGHT_MIN) * frac
 
 
@@ -428,7 +467,7 @@ def load_previous_winner(filename=BEST_PARAMS_FILE):
 def save_winner(oos_score, is_score, params, filename=BEST_PARAMS_FILE, tier=None,
                  naive_dd_1pct=None, naive_dd_2pct=None,
                  max_consecutive_losses=None, streak_ratio=None,
-                 worst_day_loser_fraction=None):
+                 worst_day_loser_fraction=None, universe=None):
     clean_params = {}
     for k, v in params.items():
         if isinstance(v, (bool, np.bool_)):
@@ -448,6 +487,14 @@ def save_winner(oos_score, is_score, params, filename=BEST_PARAMS_FILE, tier=Non
         'max_consecutive_losses': int(max_consecutive_losses) if max_consecutive_losses is not None else None,
         'streak_ratio': float(streak_ratio) if streak_ratio is not None else None,
         'worst_day_loser_fraction': float(worst_day_loser_fraction) if worst_day_loser_fraction is not None else None,
+        # -- the EXACT ticker list (in the exact order) this run's data was
+        #    built from. Persisted so downstream tools -- most importantly
+        #    crypto_portfolio_optimizer.py -- can build their own universe
+        #    as a filtered SUBSET of the coins this signal was actually
+        #    optimized on, instead of independently re-querying CoinGecko
+        #    at a different time and silently drifting onto a different
+        #    coin set (market-cap rank changes daily). See fetch_top100_universe(). --
+        'universe': list(universe) if universe is not None else None,
         'params': clean_params
     }
     try:
@@ -2363,7 +2410,7 @@ def run_optimization():
         save_winner(oos_score, is_score, best_params, tier=tier,
                     naive_dd_1pct=naive_dd_1pct, naive_dd_2pct=naive_dd_2pct,
                     max_consecutive_losses=max_streak, streak_ratio=streak_ratio,
-                    worst_day_loser_fraction=worst_day_frac)
+                    worst_day_loser_fraction=worst_day_frac, universe=tickers)
         print(f"\n{'='*78}\nFINAL RESULT -- ROBUSTNESS TIER: {tier}\n{'='*78}")
         print_performance_report(oos_score if oos_score > -900 else is_score,
                                  oos_m if oos_score > -900 else is_m,

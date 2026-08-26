@@ -1,103 +1,164 @@
 """
-DIAMOND EXTRACTOR -- BACKTESTING ENGINE v5.0
-=============================================
-NSE equity trend-following strategy: unified cash pool funded by a fixed
-monthly SIP, MA-crossover entries with an optional trend/pullback filter,
-two-phase exits (signal at close, fill at next open), pyramiding into
-existing winners, separate exit logic for a disclosed dividend-stock
-watchlist, Bayesian (Optuna/TPE) hyperparameter search over IS data,
-walk-forward OOS validation, and overfitting diagnostics (DSR + a
-descriptive score-distribution check).
+CRYPTO SIGNAL RESEARCH ENGINE -- v1.0
+========================================================================
+Sibling to main.py (the portfolio-simulation engine), NOT a replacement --
+main.py is untouched. This file exists to answer a different, narrower
+question: "is this entry+exit logic a good trade generator", isolated
+from money management.
 
-HOW TO USE
-  1. (Optional, one-time) run fetch_and_build_point_in_time_universe() to
-     reduce survivorship bias, then set POINT_IN_TIME_UNIVERSE_FILE below.
-  2. Run this file directly: `python main.py`.
-  3. It searches BAYESIAN_TRIALS parameter combos on the IS window, then
-     walk-forward validates the best one on held-out OOS data. A strategy
-     is only saved to BEST_PARAMS_FILE if it clears both the OOS and the
-     temporal (random-SIP-day) robustness gates -- see SCORING below.
-  4. Re-running resumes from the last saved champion (BEST_PARAMS_FILE, or
-     the IS-only INTERMEDIATE_FILE if no fully-validated champion exists
-     yet) and keeps searching from there.
+WHY THIS FILE EXISTS (context for future you)
+  main.py fuses two separable questions into one score:
+    (A) Is this entry/exit signal logic +EV?
+    (B) If I ran it live with a real monthly budget and a single shared
+        cash pool, how would my wealth have compounded?
+  Optimizing signal parameters (MA lengths, exit family, RSI lengths...)
+  against a (B)-style score means two equally-good signals can score very
+  differently purely because of which coin happened to win the
+  cash-allocation race on a given day -- capital-timing luck, not signal
+  quality. This file removes ALL of (B): no shared cash pool, no monthly
+  SIP, no wealth curve, no IRR, no BTC-return benchmarking/alpha/IR. Every
+  eligible signal on every coin just takes a trade, independently, with a
+  fixed nominal risk unit -- coins never compete for capital because
+  there isn't a shared pot to compete for. Output is a TRADE LOG, not a
+  portfolio value curve. Once a signal is found here that's genuinely
+  good, main.py-style portfolio simulation is a separate, later exercise
+  ("how much money should I actually put behind this"), not something
+  that should shape which signal wins in the first place.
 
-SCORING
-  score = [Calmar*0.30 + Sortino(cap 4.0)*0.10 + IR*0.30 + EV_in_R*0.15
-           + WinRate_bonus*0.15] * stat_confidence * drawdown_penalty
-  Hard gates (any failure -> score = -999): min trades/months, max_dd <=
-  50%, profit factor >= 1.10, ROI > 0 and > 1.1x benchmark ROI, win rate
-  >= MIN_WIN_RATE_GATE. Deployable only if BOTH OOS robustness (OOS score /
-  IS score) and temporal robustness (score under 15 randomized-SIP-day
-  reruns / baseline) clear their thresholds (50% by default).
+WHAT'S TOGGLEABLE / OPTIMIZED (all decided per-trial by Optuna, nothing
+hardcoded except the fixed universe/date range)
+  ENTRY TYPE (categorical, one per trial, applies to the whole universe):
+    0 = MA Breakout        -- close crosses above its own entry_ma
+    1 = RSI Crossover       -- smoothed rsi_fast crosses above rsi_slow
+                               (matches the Pine script's calc_smoothed_rsi:
+                               raw ta.rsi() then an SMA smoothing pass)
+    2 = MA Crossover        -- short_ma crosses above long_ma (NEW)
 
-KEY LIMITATIONS (read before trusting any absolute number)
-  - Survivorship bias: universe defaults to TODAY's constituents applied
-    backward, unless POINT_IN_TIME_UNIVERSE_FILE is set (Nifty 50 only --
-    see fetch_and_build_point_in_time_universe()).
-  - One 70/30 IS/OOS split is a single, high-variance robustness estimate,
-    mitigated (not solved) by the sub-period breakdown, the two overfitting
-    diagnostics, and the temporal robustness check.
-  - Deflated Sharpe Ratio is computed on Sharpe, not on the composite score
-    Optuna actually optimizes (no published deflation theory exists for an
-    arbitrary composite score) -- treat it as one indicative angle.
-  - max_dd uses the raw (cash-inclusive) value series; Sharpe/Sortino/skew/
-    kurtosis use the cash-flow-adjusted series. Both are intentional, and
-    answer different questions -- see simulate_portfolio.
+  EXIT TYPE (categorical, one per trial, fully independent of entry type --
+  any entry can pair with any exit, per your explicit instruction):
+    0 = Hybrid ATR TP(50%) + breakeven + ATR trail (from the Pine script)
+    1 = %-trail from post-entry high
+    2 = ATR-trail from post-entry high
+    3 = MA Crossunder       -- close crosses under a separately-optimized
+                               exit_ma (NOT tied to the entry MA)
+    4 = RSI Crossunder      -- separately-optimized exit-side RSI pair
+    5 = MA Crossover exit   -- short_exit_ma crosses under long_exit_ma (NEW)
 
-CHANGELOG (v5.0 vs v4.2 -- full v1-v4.1 history trimmed from this header,
-still available in version control)
-  - Fixed Sharpe/Sortino/skew/kurtosis to exclude SIP deposits from the
-    daily return series (they were being counted as investment profit).
-  - Cash-flow/monthly-return arrays now sized off n_days instead of a
-    fixed cap, so they can no longer silently overwrite old data.
-  - Optuna now actually uses TPE + multivariate/group sampling and
-    actually passes n_jobs (both were previously claimed but not wired up).
-  - Added temporal (random-SIP-day) robustness check as a second save gate.
-  - OOS robustness ratio is now continuous instead of clipping any
-    non-positive OOS result to a flat 0%.
-  - Skew/kurtosis feeding the DSR diagnostic are now computed from the
-    champion's real returns instead of hardcoded placeholders.
-  - Added a best-effort point-in-time Nifty 50 universe fetcher.
-  - Fixed MIN_WIN_RATE_GATE (0.50 -> 0.45) to match its own documentation.
-  - Fixed a benchmark-ROI denominator mismatch that could hard-reject a
-    genuinely sound OOS result (see evaluate_params' bench_roi comment).
-  - Console output cleaned up: OOS/IS gate failures now print the actual
-    metrics and which gate(s) they missed, instead of just "-999".
-  - ROI-vs-benchmark hard gate set to 1.10x (was drifting between 1.0x and
-    1.2x across manual edits) -- a deliberate, modest-but-real outperformance
-    margin: enough to justify running an active strategy over a passive
-    index fund (costs, taxes, effort, model risk), not so strict that a
-    noisy ~3.4y OOS window gets rejected on sampling variance alone.
-    diagnose_hard_gates() now reads this from one constant so the printed
-    diagnostic can never drift out of sync with the actual gate again.
-  - Neighborhood stability check now perturbs every parameter that's
-    actually ACTIVE for the champion's specific entry/exit configuration
-    (sl_ma, div_exit_v, adx_thresh), not just s_ma/l_ma/n_trail_p/n_atr_m.
-    Previously, a champion using the crossunder exit (n_exit_m==0) would
-    have 4 of 7 perturbations silently test unused parameters and trivially
-    pass, understating how brittle the fit actually was.
+  TOGGLEABLE FILTERS (independent booleans, Optuna decides on/off):
+    - use_btc_entry_gate:   require BTC bullish (close > BTC's own MA) to
+                             take a NEW entry. Independent of...
+    - use_btc_exit_override: force a full close if BTC turns bearish,
+                             regardless of which exit family is active.
+    - use_rsi_trend_filter: for entry_type 1 (RSI Crossover) ONLY -- the
+                             Pine script's `close > trend_ma` condition,
+                             now optional instead of mandatory.
+  These three are searched independently, so Optuna can land anywhere
+  from "pure RSI crossover, zero filters" to "MA crossover + BTC gate +
+  BTC exit override + no trend filter" and anything between -- the data
+  decides which filters actually help instead of us assuming.
+
+  EVERY MA ANYWHERE (entry-MA, both legs of entry-crossover, exit-MA,
+  both legs of exit-crossover, RSI's optional trend filter) independently
+  optimizes:
+    - type:   0=SMA 1=EMA 2=DEMA 3=WMA 4=SMMA/RMA
+    - length: 20-300  (widened from main.py's 10-150, per your request)
+  For both crossover pairs (entry_type 2, exit_type 5), the short leg's
+  length is sampled first and the long leg is short + a positive gap, so
+  Optuna can never sample a backwards pair.
+
+POSITION SIZING / "MONEY" -- there isn't any, on purpose. Every trade's
+  P&L is expressed in two scale-free units instead of dollars:
+    - R-multiple: pnl_per_unit_price / (entry_atr * sl_mult). sl_mult
+      here is NOT a live hard stop for every exit family (e.g. exit_type
+      1's actual stop is the %-trail, not this ATR distance) -- it's used
+      ONLY as a consistent "nominal risk unit" so trades under different
+      exit families are still comparable in R. This mirrors how a trader
+      thinks about "how many R did this trade make", independent of
+      position size.
+    - pct_return: (exit_price - entry_price) / entry_price, for anyone
+      who wants a plain percentage view instead of R.
+  A trade's blended exit price accounts for the hybrid method's 50%
+  partial: exit_price = 0.5*partial_fill + 0.5*final_fill when a partial
+  occurred, else just the final fill.
+
+SCORING (trade-log based, no wealth curve)
+  score = [ SQN_capped*0.30 + Expectancy_R*0.30 + MedianYearlyR*0.30
+            + WinRateBonus*0.10 ] * stat_confidence * concentration_penalty
+  - SQN (System Quality Number, Van Tharp): mean(R)/std(R) * sqrt(min(n,100)),
+    capped at 6.0 for scoring stability. Trade-level analogue of Sharpe --
+    no annualization basis needed since there's no daily portfolio series.
+  - Expectancy_R: win_rate*avg_win_R - (1-win_rate)*avg_loss_R.
+  - MedianYearlyR (the metric you asked for instead of a concentration
+    gate): group ALL trades (across every coin) by calendar entry-year,
+    sum R per year, take the MEDIAN across years. Directly answers "what
+    does a typical year look like", and is naturally robust to one
+    outlier year without needing a hard cutoff rule.
+  - WinRateBonus: small, optional; a trend system is supposed to have a
+    sub-50% win rate, so this stays low-weight on purpose.
+  - concentration_penalty: SOFT, not a hard gate (previous 55% hard-reject
+    rule is gone -- it would have penalized a strategy for a legitimate
+    fat right tail, which is normal and expected for a trend system, not
+    a bug). Only kicks in at genuinely extreme levels (>80% of total R
+    from a single year OR a single coin): multiplies score by 0.7. Below
+    that threshold, no penalty at all. Reported either way as a
+    diagnostic even when it doesn't fire.
+
+  HARD GATES (all must pass or score = -999): trades >= MIN_TRADES_GATE,
+  distinct calendar years touched >= MIN_YEARS_GATE, profit_factor >=
+  1.10, win_rate >= MIN_WIN_RATE_GATE (kept at 0.35, same rationale as
+  main.py: a big reward:risk trend system is SUPPOSED to lose often),
+  expectancy_R > 0 (replaces main.py's `roi > 0` -- this is the
+  signal-level equivalent: is the AVERAGE trade profitable at all).
+
+  NOTE ON WHAT'S DELIBERATELY ABSENT vs main.py: no ROI, no bench_roi, no
+  alpha, no Information Ratio, no Calmar, no Sortino, no max-drawdown-of-
+  wealth, no cash-utilization diagnostics, no robustness-vs-starting-
+  wealth chaining between IS/OOS. All of those are properties of a WEALTH
+  CURVE, and there isn't one here by design.
+
+WHAT'S UNCHANGED IN SPIRIT FROM main.py (because it doesn't require a
+wealth curve to make sense): IS/OOS walk-forward split (day-index based,
+same as before -- a trade only counts if BOTH its entry and exit land
+inside the window), neighborhood-parameter-perturbation stability check,
+and the Deflated Sharpe Ratio overfitting diagnostic (here computed
+against the trade-level R-multiple distribution's mean/std instead of a
+daily portfolio Sharpe -- same Bailey & Lopez de Prado math, different
+input series).
+
+CHANGELOG
+  v1.0  Initial split from main.py -- trade-log based, no portfolio sim.
+  v1.1  Fixed two scoring bugs found by inspecting a real run: the yearly
+        consistency term was a SUM (rewarded trade volume, not quality)
+        instead of an average, and individual trade R wasn't winsorized
+        (a couple of freak long-hold trades could dominate the mean).
+  v1.2  Added PYRAMIDING (the same entry signal firing again while
+        already in a position adds a layer, up to max_pyramid_layers --
+        Optuna decides how many, 1 = off) and RECENCY WEIGHTING (the
+        yearly consistency term now weights recent years more than old
+        ones, so a strategy that made all its money early and has been
+        idle since scores worse than one still working now). Also added
+        a baseline-config loader (BASELINE_CONFIG_FILE) so a previous or
+        externally-sourced config can be evaluated and used to seed a new
+        search instead of starting from scratch, and consolidated every
+        manually-adjustable constant into one config block at the top of
+        the file (section 0).
 """
 
 import math
 import json
 import os
-import io
+import time
 import threading
 import warnings
 from collections import OrderedDict
 from statistics import NormalDist
+from datetime import datetime, timezone
 
 import numpy as np
 import pandas as pd
 import requests
 from numba import njit
 from tqdm import tqdm
-
-try:
-    import yfinance as yf
-except ImportError:
-    yf = None
-    print("yfinance not found. Install with: pip install yfinance")
 
 try:
     import optuna
@@ -110,168 +171,287 @@ except ImportError:
 warnings.filterwarnings('ignore')
 
 # ==========================================
-# 1. UNIVERSE DEFINITION
+# 0. USER CONFIGURATION -- every manually-adjustable parameter lives here,
+#    in one place. (Coin exclusion lists are DATA, not tuning knobs --
+#    they stay in section 1 below, right where they're easy to find.)
 # ==========================================
 
-DIVIDEND_KINGS_FALLBACK = {
-    'ITC.NS', 'COALINDIA.NS', 'ONGC.NS', 'POWERGRID.NS', 'NTPC.NS', 'PFC.NS',
-    'RECLTD.NS', 'VEDL.NS', 'GAIL.NS', 'BPCL.NS', 'IOC.NS', 'PETRONET.NS',
-    'SAIL.NS', 'NHPC.NS', 'NMDC.NS', 'HINDZINC.NS', 'CASTROLIND.NS'
+# -- Files --
+# Paste a config (in the same shape save_winner() writes -- see the
+# BASELINE CONFIG LOADER section below for the exact format and a legacy
+# translator for older schemas) into BASELINE_CONFIG_FILE and the engine
+# will evaluate it FIRST, print its performance, and seed Optuna's search
+# with it as trial #1 -- so a new run starts from your best known config
+# instead of from scratch.
+BASELINE_CONFIG_FILE = "baseline_config.json"
+BEST_PARAMS_FILE     = "best_params_crypto_signal_v1.json"   # engine writes ITS OWN winners here
+ENGINE_VERSION        = "signal-1.2.0"
+
+# -- Universe / data window --
+START_DATE       = "2017-01-01"
+MIN_HISTORY_DAYS = 300   # a coin needs at least this many days of history or it's dropped entirely
+
+# -- Search budget --
+BAYESIAN_TRIALS = 20_000
+WFO_IS_PCT  = 0.70   # fraction of history used for in-sample optimization
+WFO_OOS_PCT = 0.30   # remainder held out, never seen during search
+ROBUSTNESS_DEPLOY_THRESHOLD = 0.50   # OOS/IS score ratio required to auto-save a champion
+
+# -- Quality gates -- a trial failing ANY of these scores -999 --
+MIN_TRADES_GATE   = 50
+MIN_YEARS_GATE    = 3
+MIN_WIN_RATE_GATE = 0.35   # trend systems are SUPPOSED to have a sub-50% win rate --
+                            # this is deliberately lower than a 50% "default"
+
+# -- Robustness-aware search (v1.3): instead of optimizing on the full
+#    in-sample window and only checking true out-of-sample once at the
+#    very end, the IS window itself gets split into an inner TRAIN slice
+#    and an inner VALIDATION slice during the search, and every trial is
+#    scored on the WORSE of the two. A parameter set can no longer win by
+#    being lucky in one period -- it has to hold up in both. True OOS
+#    (the WFO_OOS_PCT slice below) stays completely untouched during the
+#    whole search either way, as the final honest check. --
+INNER_VAL_PCT = 0.30          # fraction of the IS window reserved as inner-validation
+MIN_YEARS_GATE_INNER = 2      # relaxed years-gate for the (shorter) inner-validation slice only
+                               # -- final IS/OOS reporting still uses the full MIN_YEARS_GATE
+ROBUST_FALLBACK_SCALE   = 0.05  # if a trial passes inner-train but fails inner-val, it still
+ROBUST_FALLBACK_PENALTY = 5.0   # gets a (heavily discounted) fallback score instead of a flat
+                                  # -999, so Optuna always has SOME gradient to search with even
+                                  # if true dual-pass candidates are rare. Fallback-scored trials
+                                  # are mathematically capped well below any real dual-pass trial
+                                  # (see run_optimization's optuna_objective for the exact math),
+                                  # so a genuinely robust candidate always outranks a lucky one.
+
+# -- MA parameter search ranges (applies to every MA anywhere: entry-MA,
+#    both legs of both crossover pairs, exit-MA, RSI's trend filter) --
+MA_LEN_MIN, MA_LEN_MAX = 20, 300
+MA_CACHE_MAX_ENTRIES   = 40_000   # perf only, raise if you have RAM to spare
+
+# -- Pyramiding (v1.2): Optuna picks max_pyramid_layers per trial, so it
+#    decides for itself whether adding to winners helps. 1 = pyramiding
+#    off (each coin gets at most one open position at a time, as before).
+MAX_PYRAMID_LAYERS_MIN = 1
+MAX_PYRAMID_LAYERS_MAX = 4
+
+# -- Recency weighting (v1.2, reshaped v1.3): a calendar year's contribution
+#    to the scored consistency term decays from RECENCY_WEIGHT_MAX (the most
+#    RECENT year in the window being scored) down to RECENCY_WEIGHT_MIN (the
+#    OLDEST year), same bounded [MIN, MAX] range as before. Widen the gap to
+#    lean harder toward "still working now" over "worked years ago and has
+#    been quiet since".
+#    v1.3 changed the SHAPE of the ramp from linear to a half-life-style
+#    exponential decay (still normalized to hit exactly MIN at the window's
+#    oldest year and MAX at its newest -- a drop-in replacement, nothing
+#    downstream needs to change). Rationale: a straight line spreads the
+#    30%-wide MIN..MAX gap evenly across however many years are in the
+#    window, so a coin's best year sitting in the MIDDLE of a long window
+#    (e.g. the 2020/2021 bull run inside an 8-year window) gets docked
+#    almost as much as if it were the oldest year. A half-life decay instead
+#    concentrates most of the weight in the last ~RECENCY_HALF_LIFE_YEARS
+#    and lets everything older than that fall toward MIN together, which
+#    better matches "does this still work now" without needing to know
+#    exactly where in a halving cycle a given year sat (that's a harder,
+#    separate problem -- see the REGIME note below). --
+RECENCY_WEIGHT_MIN = 0.70
+RECENCY_WEIGHT_MAX = 1.00
+RECENCY_HALF_LIFE_YEARS = 2.0   # weight halves (within the MIN..MAX band)
+                                # every this-many years back from the
+                                # window's most recent year
+# NOTE ON CRYPTO'S ~4-YEAR HALVING CYCLE: neither the old linear ramp nor
+# this half-life version knows which phase of a halving cycle a given year
+# was in -- both are pure calendar-distance decays. A genuinely regime-aware
+# scheme would need bull/bear/accumulation years labeled explicitly (e.g. via
+# BTC's own drawdown/return) and weighted by regime-similarity-to-now instead
+# of by calendar distance. That's a real, separate improvement worth doing
+# later; this change only fixes the "evenly-spread-over-the-window" issue,
+# not the regime-blindness issue.
+
+# -- R-multiple winsorization (v1.1): caps how much one freak trade can
+#    dominate the AGGREGATE score (expectancy, SQN, yearly averages). The
+#    raw/uncapped value is still stored and reported per-trade regardless
+#    -- capping only affects what SCORES, never what you can SEE. --
+R_WINSORIZE_CAP = 20.0
+
+# -- Concentration diagnostic -- SOFT score penalty only, never a hard
+#    reject (a fat right tail is normal/expected for a trend system) --
+CONCENTRATION_SOFT_THRESHOLD = 0.80
+CONCENTRATION_PENALTY_MULT   = 0.70
+
+# -- Naive portfolio-risk diagnostics -- SOFT score penalties only, same
+#    philosophy as concentration above. This engine deliberately has no
+#    real wealth curve (see evaluate_params_signal's docstring) since
+#    that's crypto_portfolio_optimizer.py's job -- but a signal whose
+#    trades are individually fine yet cluster together in time (many
+#    losers at once, a long unbroken losing streak, many coins crashing
+#    on the same days) will make ANY capital-allocation scheme downstream
+#    struggle, no matter how the portfolio optimizer's watchlist/funding
+#    logic is tuned. These are cheap, trade-log-only proxies for that risk,
+#    used to gently steer the search away from it -- not a real portfolio
+#    simulation and not a hard gate, since some clustering is unavoidable
+#    in a correlated asset class like crypto.
+NAIVE_RISK_PCT_PER_TRADE = 0.01   # fixed-fractional risk assumed for the scored naive equity curve
+NAIVE_DD_SOFT_THRESHOLD  = 0.50   # naive max drawdown above this triggers a penalty
+NAIVE_DD_PENALTY_MULT    = 0.75
+# losing streaks are compared to what's STATISTICALLY EXPECTED at this
+# trial's own win rate (a 35%-win-rate trend system naturally has long
+# losing streaks -- that's normal, not a red flag) rather than a fixed
+# absolute count, so this doesn't unfairly punish a healthy low-win-rate
+# system for behaving exactly as a low-win-rate system should.
+STREAK_RATIO_SOFT_THRESHOLD = 1.5   # observed streak vs statistically-expected streak
+STREAK_PENALTY_MULT         = 0.85
+# fraction of all concurrently-open trades that were eventual losers, at
+# the single worst (most-correlated) moment in the backtest
+CORRELATED_LOSS_FRACTION_THRESHOLD = 0.70
+CORRELATED_LOSS_MIN_COUNT          = 3     # ignore tiny-sample noise (e.g. 1-of-1 open = trivially 100%)
+CORRELATED_LOSS_PENALTY_MULT       = 0.80
+
+# -- Composite score weights -- must sum to 1.00 --
+W_SQN        = 0.30
+W_EXPECTANCY = 0.30
+W_RECENCY    = 0.30   # scores recency_weighted_avg_r (see section 7)
+W_WR_BONUS   = 0.10
+
+SQN_CAP = 6.0   # Van Tharp's own scale calls >6 "holy grail" -- capped so
+                # one freak trial can't dominate
+
+# -- Neighborhood-stability perturbation check (a real edge shouldn't
+#    collapse if you nudge a parameter slightly) --
+NEIGHBOR_THRESHOLD = 0.80
+
+# -- entry/exit signal type IDs (vocabulary, not really "tunable", but
+#    kept here since every gate/weight above refers to the same trade
+#    universe these define) --
+ENTRY_MA_BREAKOUT = 0
+ENTRY_RSI_XOVER   = 1
+ENTRY_MA_XOVER    = 2
+
+EXIT_HYBRID          = 0
+EXIT_PCT_TRAIL       = 1
+EXIT_ATR_TRAIL       = 2
+EXIT_MA_CROSSUNDER   = 3
+EXIT_RSI_CROSSUNDER  = 4
+EXIT_MA_XOVER_EXIT   = 5
+
+
+def _recency_weight(year, min_year, max_year):
+    """Half-life-style exponential decay from RECENCY_WEIGHT_MAX (max_year)
+    down to RECENCY_WEIGHT_MIN (min_year), normalized so the endpoints land
+    on EXACTLY the same two values the old linear ramp used -- only the
+    shape of the interior changed (concentrated near the recent end instead
+    of spread evenly), so every caller/consumer of this function is
+    unaffected. If the window spans only one year, returns the max weight
+    (nothing to compare against)."""
+    if max_year <= min_year:
+        return RECENCY_WEIGHT_MAX
+    years_back = max_year - year               # 0 at the newest year
+    span_years = max_year - min_year
+    raw = 0.5 ** (years_back / RECENCY_HALF_LIFE_YEARS)        # 1.0 at newest, decays going back
+    raw_floor = 0.5 ** (span_years / RECENCY_HALF_LIFE_YEARS)  # raw's value at the OLDEST year
+    denom = 1.0 - raw_floor
+    if denom <= 1e-12:
+        # half-life is so long relative to the window that raw barely moves
+        # across it -- fall back to the linear ramp rather than divide by ~0
+        frac = (year - min_year) / span_years
+    else:
+        frac = (raw - raw_floor) / denom
+    return RECENCY_WEIGHT_MIN + (RECENCY_WEIGHT_MAX - RECENCY_WEIGHT_MIN) * frac
+
+
+# ==========================================
+# 1. UNIVERSE DEFINITION (unchanged from main.py -- data infra, not
+#    portfolio-simulation, so it carries over as-is)
+# ==========================================
+
+STABLECOIN_SYMBOLS = {
+    'USDT', 'USDC', 'BUSD', 'DAI', 'TUSD', 'FDUSD', 'USDD', 'USDP', 'GUSD',
+    'PYUSD', 'USDE', 'FRAX', 'CRVUSD', 'LUSD', 'SUSD', 'EURT', 'EURS',
+    'USTC', 'UST', 'USDS'
 }
+WRAPPED_SYMBOLS = {
+    'WBTC', 'WETH', 'WSTETH', 'WEETH', 'WBETH', 'STETH', 'CBETH', 'RETH',
+    'WBNB', 'WAVAX', 'WMATIC'
+}
+LEVERAGED_OR_SYNTHETIC_PATTERNS = ('UP', 'DOWN', '3L', '3S', 'BULL', 'BEAR')
 
-# Point-in-time membership hook (survivorship-bias mitigation). Point this
-# at a JSON file shaped {"YYYY-MM-DD": ["RELIANCE.NS", ...]} to restrict new
-# watchlist entries to stocks actually in-index on that date. None = every
-# stock eligible every day (v3/v4 default, disclosed survivorship bias).
-POINT_IN_TIME_UNIVERSE_FILE = None
+MIN_HISTORY_DAYS = 400
+
+BINANCE_KLINES_URL    = "https://api.binance.com/api/v3/klines"
+BINANCE_EXINFO_URL    = "https://api.binance.com/api/v3/exchangeInfo"
+COINGECKO_MARKETS_URL = "https://api.coingecko.com/api/v3/coins/markets"
+
+FALLBACK_UNIVERSE = [
+    'BTCUSDT', 'ETHUSDT', 'BNBUSDT', 'SOLUSDT', 'XRPUSDT', 'DOGEUSDT',
+    'ADAUSDT', 'AVAXUSDT', 'LINKUSDT', 'XLMUSDT', 'LTCUSDT', 'TRXUSDT',
+    'DOTUSDT', 'MATICUSDT', 'SHIBUSDT', 'ATOMUSDT', 'UNIUSDT', 'ETCUSDT',
+    'NEARUSDT', 'FILUSDT'
+]
+
+def _is_excluded(symbol_upper):
+    if symbol_upper in STABLECOIN_SYMBOLS or symbol_upper in WRAPPED_SYMBOLS:
+        return True
+    for pat in LEVERAGED_OR_SYNTHETIC_PATTERNS:
+        if symbol_upper.endswith(pat):
+            return True
+    return False
 
 
-def fetch_dynamic_universe():
-    print("Fetching Nifty universe (50 / Next 50 / Midcap 150)...")
-    print("NOTE: uses TODAY's constituents applied back to", START_DATE, "-- survivorship-biased, see module docstring.")
-    
-    # Spoof a real browser to bypass NSE bot protection
-    headers = {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
-        'Accept-Language': 'en-US,en;q=0.5'
-    }
-    
-    # Use the more reliable niftyindices.com endpoints
-    urls = [
-        "https://niftyindices.com/IndexConstituent/ind_nifty50list.csv",
-        "https://niftyindices.com/IndexConstituent/ind_niftynext50list.csv",
-        "https://niftyindices.com/IndexConstituent/ind_niftymidcap150list.csv"
-    ]
-    
-    tickers = set()
-    for url in urls:
-        try:
-            req = requests.get(url, headers=headers, timeout=15)
-            if req.status_code == 200:
-                df = pd.read_csv(io.StringIO(req.text))
-                for symbol in df['Symbol']:
-                    # Filter out any weird spaces/NaNs just in case
-                    clean_symbol = str(symbol).strip()
-                    if clean_symbol and clean_symbol != 'nan':
-                        tickers.add(f"{clean_symbol}.NS")
-            else:
-                print(f"Failed to fetch {url} - Status Code: {req.status_code}")
-        except Exception as e:
-            print(f"Error fetching {url}: {e}")
+def _get_binance_usdt_symbols():
+    try:
+        r = requests.get(BINANCE_EXINFO_URL, timeout=15)
+        r.raise_for_status()
+        data = r.json()
+        return {s['symbol'] for s in data['symbols']
+                if s['quoteAsset'] == 'USDT' and s['status'] == 'TRADING'}
+    except Exception as e:
+        print(f"Could not fetch Binance exchangeInfo ({e}); will validate per-ticker on download instead.")
+        return None
 
-    if len(tickers) < 100:
-        print("Fallback to predefined list... (NSE likely blocked the request)")
-        tickers = set(['RELIANCE.NS', 'TCS.NS', 'HDFCBANK.NS', 'INFY.NS',
-                       'ICICIBANK.NS', 'ITC.NS'] + list(DIVIDEND_KINGS_FALLBACK))
-    
-    return list(tickers)
+
+def fetch_top100_universe():
+    print("Fetching top-100-by-market-cap universe from CoinGecko...")
+    binance_usdt = _get_binance_usdt_symbols()
+
+    tickers = []
+    excluded_log = []
+    try:
+        r = requests.get(COINGECKO_MARKETS_URL, params={
+            'vs_currency': 'usd', 'order': 'market_cap_desc',
+            'per_page': 100, 'page': 1, 'sparkline': 'false'
+        }, timeout=20)
+        r.raise_for_status()
+        coins = r.json()
+        for c in coins:
+            sym = str(c.get('symbol', '')).upper()
+            if not sym:
+                continue
+            if _is_excluded(sym):
+                excluded_log.append(sym)
+                continue
+            binance_sym = f"{sym}USDT"
+            if binance_usdt is not None and binance_sym not in binance_usdt:
+                excluded_log.append(f"{sym} (no Binance USDT pair)")
+                continue
+            tickers.append(binance_sym)
+    except Exception as e:
+        print(f"CoinGecko fetch failed ({e}); falling back to a static major-coin list.")
+        tickers = list(FALLBACK_UNIVERSE)
+
+    tickers = [t for t in tickers if t != 'BTCUSDT']
+    tickers = ['BTCUSDT'] + list(dict.fromkeys(tickers))
+
+    if len(tickers) < 20:
+        print("Universe too small after filtering; falling back to static major-coin list.")
+        tickers = list(FALLBACK_UNIVERSE)
+
+    print(f"Universe size after filtering: {len(tickers)} (excluded {len(excluded_log)})")
+    assert tickers[0] == 'BTCUSDT', "BTCUSDT must be at index 0."
+    return tickers
+
 
 # ==========================================
-# 2. CONFIGURATIONS & SAVE SYSTEM
+# 2. SAVE / LOAD -- the engine's own output file, plus the baseline-config
+#    loader for pasting in a config you want to test or seed a run with.
 # ==========================================
-
-START_DATE        = "2015-01-01"
-BEST_PARAMS_FILE  = "best_params_v4.json"          # fully OOS+temporal-validated champion
-INTERMEDIATE_FILE = "current_is_champion_v4.json"  # IS-only champion, saved mid-search
-
-ENGINE_VERSION = "5.0.0"   # stamped into save_winner() output
-
-WFO_IS_PCT   = 0.70
-WFO_OOS_PCT  = 0.30
-
-BAYESIAN_TRIALS      = 20_000
-NEIGHBOR_THRESHOLD   = 0.75
-MIN_TRADES_GATE      = 40
-MIN_MONTHS_GATE      = 24
-MIN_WIN_RATE_GATE    = 0.5
-MONTHLY_SIP          = 8_000
-MIN_TICKET_SIZE      = MONTHLY_SIP   # NEW (ported from the crypto engine's decision #16):
-                                      # floor under a now-VARIABLE ticket size (see
-                                      # decision #18 in the changelog) -- kept EXACTLY
-                                      # equal to the fixed Rs.8,000 SIP figure per explicit
-                                      # instruction, not loosened just because it's now variable.
-
-ROBUSTNESS_DEPLOY_THRESHOLD = 0.50   # OOS-score / IS-score gate, and printed banding
-
-# ROI must beat the benchmark's ROI by at least this multiple to pass the
-# hard gate (in compute_score_v4) -- see the CHANGELOG entry above for why
-# 1.10 was chosen. diagnose_hard_gates() reads this same constant so the
-# printed diagnostic can never drift out of sync with the real gate again.
-BENCH_OUTPERFORMANCE_MULT = 1.10
-
-HIGH_CASH_FRACTION_THRESHOLD = 0.30  # reporting-only threshold, doesn't affect simulation
-
-# ── NEW (ported from the crypto engine, decisions #18-20): recency-weighted
-# consistency/regime scoring + a profit-concentration hard gate, both aimed
-# at "don't reward a strategy that got lucky in one early bull year and
-# coasted on the compounding." Nifty plays the same dual role BTC plays in
-# the crypto engine: benchmark AND bull/bear-year classifier at once.
-RECENCY_WEIGHT_MIN        = 0.80
-RECENCY_WEIGHT_MAX        = 1.00
-BULL_YEAR_NIFTY_THRESHOLD = 0.10    # Nifty annual return above this => "bull year"
-BEAR_YEAR_NIFTY_THRESHOLD = -0.10   # Nifty annual return below this => "bear year"
-CONCENTRATION_GATE        = 0.55    # hard reject if one calendar year > 55% of total profit
-YEAR_FULL_COVERAGE_DAYS   = 252.0   # NSE trading days (vs the crypto engine's 365)
-MIN_YEAR_COVERAGE_FOR_SCORING = 0.75  # years below this coverage_frac are excluded from
-                                        # the CONSISTENCY/REGIME terms -- IRR annualized from
-                                        # too few days isn't trustworthy. The concentration
-                                        # gate is unaffected (raw nominal dollars, not a rate).
-
-# ── Composite score weights (sum to 1.00) -- rebalanced from v4.2's flat
-# Calmar 0.30/Sortino 0.10/IR 0.30/EV 0.15/WR 0.15 to make room for the two
-# new additive terms below, identical rebalancing to the crypto engine's.
-W_CALMAR      = 0.20
-W_SORTINO     = 0.10
-W_IR          = 0.20
-W_EV          = 0.10
-W_WR_BONUS    = 0.10
-W_CONSISTENCY = 0.20
-W_REGIME      = 0.10
-
-K_STD_PENALTY   = 1.00   # consistency term: penalty coefficient on recency-weighted std-dev
-K_WORST_PENALTY = 0.50   # consistency term: penalty coefficient on the single worst year
-W_BULL_CAPTURE  = 0.50   # regime term split
-W_BEAR_DEFENSE  = 0.50
-
-# ── NEW: optional watchlist-age weighting -- a candidate's rank (from
-# wl_rank_method) can optionally be boosted by how long it's been sitting
-# in the watchlist, so a strategy-favored-but-fresh candidate doesn't
-# perpetually starve an older one out of ever getting funded. Off by
-# default (use_wl_age_weight=False baseline); searched as a toggle so
-# Optuna keeps it only if it actually helps. WL_AGE_NORM_DAYS is the
-# saturation point for the age boost (age_frac caps at 1.0 once a
-# candidate has waited this many trading days) -- kept as a fixed
-# constant rather than another optimized dimension to keep the search
-# space from growing further; revisit if a champion's age weighting looks
-# artificially capped.
-WL_AGE_NORM_DAYS = 20.0
-
-OPTUNA_N_JOBS = max(1, (os.cpu_count() or 2) - 1)  # set to 1 for bit-exact reproducibility
-
-# Temporal (random-SIP-day) robustness check: reruns the chosen champion
-# with an independently-randomized SIP day each month, to catch a strategy
-# that's really just curve-fit to "SIP always lands on the 1st".
-TEMPORAL_ROBUSTNESS_RUNS      = 15
-TEMPORAL_ROBUSTNESS_THRESHOLD = 0.65
-
-MA_CACHE_MAX_ENTRIES = 20_000   # bounded LRU cache size for get_ma_cached()
-
-# Transaction costs -- NSE delivery trade, zero-brokerage discount broker,
-# statutory rates as of mid-2026. Re-verify against your own contract note.
-BUY_STATUTORY_PCT  = 0.00119   # STT + stamp duty + exchange + SEBI + GST
-SELL_STATUTORY_PCT = 0.00104   # STT + exchange + SEBI + GST
-SLIPPAGE_PCT       = 0.00100   # execution-slippage allowance
-DP_FLAT_FEE_RS     = 20.0      # flat depository charge, once per exit
-BUY_COST_PCT  = BUY_STATUTORY_PCT  + SLIPPAGE_PCT
-SELL_COST_PCT = SELL_STATUTORY_PCT + SLIPPAGE_PCT
-
-# Idle cash yield -- conservative proxy for liquid-fund returns. 0.0
-# reproduces the old zero-yield assumption exactly.
-ANNUAL_CASH_YIELD = 0.00
-
-TRADING_DAYS_PER_YEAR = 252.0   # basis for all annualization in this file
-
 
 def load_previous_winner(filename=BEST_PARAMS_FILE):
     if os.path.exists(filename):
@@ -284,18 +464,37 @@ def load_previous_winner(filename=BEST_PARAMS_FILE):
     return -999999, -999999, None
 
 
-def save_winner(oos_score, is_score, params, filename=BEST_PARAMS_FILE, robustness_ratio=None):
-    clean_params = {k: float(v) if isinstance(v, (float, np.floating)) else int(v)
-                    for k, v in params.items()}
-    # Callers that already computed the robustness ratio (post-WFO) pass it
-    # through so the saved JSON always matches what was printed/gated on.
-    if robustness_ratio is None:
-        robustness_ratio = float(oos_score / is_score) if is_score > 0 else 0.0
+def save_winner(oos_score, is_score, params, filename=BEST_PARAMS_FILE, tier=None,
+                 naive_dd_1pct=None, naive_dd_2pct=None,
+                 max_consecutive_losses=None, streak_ratio=None,
+                 worst_day_loser_fraction=None, universe=None):
+    clean_params = {}
+    for k, v in params.items():
+        if isinstance(v, (bool, np.bool_)):
+            clean_params[k] = bool(v)
+        elif isinstance(v, (float, np.floating)):
+            clean_params[k] = float(v)
+        else:
+            clean_params[k] = int(v)
     data = {
         'engine_version': ENGINE_VERSION,
         'oos_score': float(oos_score),
         'is_score':  float(is_score),
-        'robustness_ratio': float(robustness_ratio),
+        'robustness_ratio': float(oos_score / is_score) if is_score > 0 else 0.0,
+        'robustness_tier': tier if tier is not None else 'unrated',
+        'naive_dd_estimate_1pct_risk': float(naive_dd_1pct) if naive_dd_1pct is not None else None,
+        'naive_dd_estimate_2pct_risk': float(naive_dd_2pct) if naive_dd_2pct is not None else None,
+        'max_consecutive_losses': int(max_consecutive_losses) if max_consecutive_losses is not None else None,
+        'streak_ratio': float(streak_ratio) if streak_ratio is not None else None,
+        'worst_day_loser_fraction': float(worst_day_loser_fraction) if worst_day_loser_fraction is not None else None,
+        # -- the EXACT ticker list (in the exact order) this run's data was
+        #    built from. Persisted so downstream tools -- most importantly
+        #    crypto_portfolio_optimizer.py -- can build their own universe
+        #    as a filtered SUBSET of the coins this signal was actually
+        #    optimized on, instead of independently re-querying CoinGecko
+        #    at a different time and silently drifting onto a different
+        #    coin set (market-cap rank changes daily). See fetch_top100_universe(). --
+        'universe': list(universe) if universe is not None else None,
         'params': clean_params
     }
     try:
@@ -305,12 +504,181 @@ def save_winner(oos_score, is_score, params, filename=BEST_PARAMS_FILE, robustne
         print(f"Error saving {filename}: {e}")
 
 
+# -- BASELINE CONFIG LOADER --------------------------------------------
+# Paste a config into BASELINE_CONFIG_FILE (same folder as this script)
+# and a run will evaluate it FIRST, print its full performance report,
+# and seed Optuna's search with it as trial #1. Native format is exactly
+# what save_winner() writes:
+#   {"engine_version": ..., "oos_score": ..., "is_score": ...,
+#    "robustness_ratio": ..., "params": {<this engine's field names>}}
+# A bare {"entry_type": 0, ...} params dict (no wrapper) also works.
+#
+# LEGACY SCHEMA SUPPORT: if the pasted params dict looks like it came from
+# an older/different engine (keys like "signal_method", "use_trend_ma",
+# "use_btc_filter", "use_panic_exits", "rsi_fast_len", "wl_rank" instead
+# of this engine's "entry_type", "use_rsi_trend_filter", etc.), a
+# best-effort translation is attempted -- see _LEGACY_KEY_MAP below. This
+# is a GUESS at field correspondence, not a guarantee: it's printed in
+# full so you can check it, and the translated result is echoed back in
+# this engine's native format so you can paste THAT in going forward and
+# skip the guessing entirely.
+
+_LEGACY_KEY_MAP = {
+    'signal_method':   'entry_type',           # assumed same numbering: 0=MA breakout, 1=RSI crossover
+    'use_trend_ma':    'use_rsi_trend_filter',
+    'use_btc_filter':  'use_btc_entry_gate',
+    'use_panic_exits': 'use_btc_exit_override',
+    'exit_method':     'exit_type',            # assumed same numbering 0-3 (this engine adds 4,5 on top)
+    'rsi_fast_len':    'rsi_f_len',
+    'rsi_fast_smt':    'rsi_f_smt',
+    'rsi_slow_len':    'rsi_s_len',
+    'rsi_slow_smt':    'rsi_s_smt',
+    'trend_ma_len':    'rsi_trend_ma_len',
+    'trend_ma_type':   'rsi_trend_ma_type',
+    # unchanged names, listed for completeness / self-documentation:
+    'entry_ma_len': 'entry_ma_len', 'entry_ma_type': 'entry_ma_type',
+    'exit_ma_len': 'exit_ma_len', 'exit_ma_type': 'exit_ma_type',
+    'btc_ma_len': 'btc_ma_len', 'btc_ma_type': 'btc_ma_type',
+    'adx_thresh': 'adx_thresh', 'sl_mult': 'sl_mult', 'tp_mult': 'tp_mult',
+    'trail_mult': 'trail_mult', 'trail_pct': 'trail_pct', 'exit_atr_mult': 'exit_atr_mult',
+}
+_LEGACY_DROPPED_KEYS = {
+    'wl_rank': "portfolio watchlist-ranking concept -- doesn't exist in this "
+               "engine (no shared capital to rank candidates for)",
+}
+_NATIVE_KEY_SIGNATURE = {'entry_type', 'exit_type', 'use_btc_entry_gate',
+                          'use_btc_exit_override', 'use_rsi_trend_filter'}
+
+
+def _looks_legacy(params):
+    return bool(_NATIVE_KEY_SIGNATURE.isdisjoint(params.keys())) and \
+           any(k in params for k in _LEGACY_KEY_MAP)
+
+
+def translate_legacy_config(raw_params):
+    translated = {}
+    notes = []
+    for k, v in raw_params.items():
+        if k in _LEGACY_DROPPED_KEYS:
+            notes.append(f"  DROPPED '{k}' = {v}  ({_LEGACY_DROPPED_KEYS[k]})")
+            continue
+        new_key = _LEGACY_KEY_MAP.get(k, k)
+        if new_key != k:
+            notes.append(f"  MAPPED  '{k}' -> '{new_key}'  (value {v} unchanged)")
+        translated[new_key] = v
+    if 'max_pyramid_layers' not in translated:
+        translated['max_pyramid_layers'] = 1
+        notes.append("  DEFAULTED 'max_pyramid_layers' = 1 (not present in legacy config -> pyramiding off)")
+    return translated, notes
+
+
+def _validate_and_fill_params(p):
+    """Checks that every field the given entry_type/exit_type/toggle
+    combination actually needs is present, fills safe defaults for
+    fields that are always-suggested-but-conditionally-unused elsewhere
+    in this engine, and returns (ok, filled_params, issues)."""
+    p = dict(p)
+    issues = []
+    required_missing = []
+
+    def need(key):
+        if key not in p or p[key] is None:
+            required_missing.append(key)
+
+    et = p.get('entry_type')
+    xt = p.get('exit_type')
+    if et == ENTRY_MA_BREAKOUT:
+        need('entry_ma_len'); need('entry_ma_type')
+    elif et == ENTRY_RSI_XOVER:
+        for k in ('rsi_f_len', 'rsi_f_smt', 'rsi_s_len', 'rsi_s_smt'):
+            need(k)
+        if p.get('use_rsi_trend_filter'):
+            need('rsi_trend_ma_len'); need('rsi_trend_ma_type')
+    elif et == ENTRY_MA_XOVER:
+        for k in ('xover_short_len', 'xover_short_type', 'xover_long_len', 'xover_long_type'):
+            need(k)
+    else:
+        issues.append(f"Unrecognized or missing 'entry_type': {et!r}")
+
+    if xt == EXIT_MA_CROSSUNDER:
+        need('exit_ma_len'); need('exit_ma_type')
+    elif xt == EXIT_RSI_CROSSUNDER:
+        for k in ('exit_rsi_f_len', 'exit_rsi_f_smt', 'exit_rsi_s_len', 'exit_rsi_s_smt'):
+            need(k)
+    elif xt == EXIT_MA_XOVER_EXIT:
+        for k in ('exit_xover_short_len', 'exit_xover_short_type', 'exit_xover_long_len', 'exit_xover_long_type'):
+            need(k)
+    elif xt not in (EXIT_HYBRID, EXIT_PCT_TRAIL, EXIT_ATR_TRAIL):
+        issues.append(f"Unrecognized or missing 'exit_type': {xt!r}")
+
+    if p.get('use_btc_entry_gate') or p.get('use_btc_exit_override'):
+        need('btc_ma_len'); need('btc_ma_type')
+    else:
+        p.setdefault('btc_ma_len', 62); p.setdefault('btc_ma_type', 0)
+
+    for k, default in [('adx_thresh', 0.0), ('sl_mult', 4.0), ('tp_mult', 30.0),
+                        ('trail_mult', 6.0), ('trail_pct', 15.0), ('exit_atr_mult', 3.0),
+                        ('max_pyramid_layers', 1), ('use_btc_entry_gate', False),
+                        ('use_btc_exit_override', False), ('use_rsi_trend_filter', False)]:
+        if k not in p:
+            p[k] = default
+            issues.append(f"  (defaulted missing '{k}' = {default})")
+
+    if required_missing:
+        issues.insert(0, f"MISSING required fields for entry_type={et}/exit_type={xt}: {required_missing}")
+        return False, p, issues
+    return True, p, issues
+
+
+def load_baseline_config(filename=BASELINE_CONFIG_FILE):
+    if not os.path.exists(filename):
+        return None
+    try:
+        with open(filename, 'r') as f:
+            raw = json.load(f)
+    except Exception as e:
+        print(f"\n** Could not parse {filename}: {e}. Ignoring baseline, starting fresh. **")
+        return None
+
+    raw_params = raw.get('params', raw) if isinstance(raw, dict) else None
+    if not raw_params:
+        print(f"\n** {filename} exists but has no usable 'params'. Ignoring, starting fresh. **")
+        return None
+
+    print(f"\n{'='*60}\nLOADED BASELINE CONFIG from {filename}\n{'='*60}")
+
+    if _looks_legacy(raw_params):
+        print("This looks like it's from a different/older schema -- attempting")
+        print("a best-effort field translation (verify this against what you")
+        print("actually meant; the exact native-schema version is echoed below):")
+        params, notes = translate_legacy_config(raw_params)
+        for n in notes:
+            print(n)
+    else:
+        params = dict(raw_params)
+
+    ok, params, issues = _validate_and_fill_params(params)
+    for issue in issues:
+        print(f"  {issue}")
+
+    if not ok:
+        print(f"\n** Baseline config is missing required fields and can't be run as-is. "
+              f"Fix the JSON and rerun, or delete/rename {filename} to skip it. Starting fresh. **")
+        return None
+
+    print("\nNative-schema equivalent (paste this back into the file to skip translation next time):")
+    print(json.dumps(params, indent=2, default=str))
+    print("=" * 60)
+    return params
+
+
+
+
+
 # ==========================================
-# 3. FAST INDICATORS (numba, NaN-safe)
+# 3. INDICATORS -- MA (5 types) + RSI (Wilder + SMA smoothing, matching
+#    the Pine script's calc_smoothed_rsi)
 # ==========================================
-# fastmath is deliberately off -- it breaks np.isnan() checks this module
-# relies on for newly-listed stocks. nogil=True lets Optuna's n_jobs>1
-# threading actually parallelize these calls.
 
 @njit(nogil=True, cache=True)
 def calc_ma(prices, period, ma_type):
@@ -318,8 +686,6 @@ def calc_ma(prices, period, ma_type):
     res = np.empty(n)
     res[:] = np.nan
 
-    # Find first real (non-NaN) data point -- a stock listed after
-    # START_DATE has leading NaN that must not poison the MA's state.
     start = 0
     while start < n and np.isnan(prices[start]):
         start += 1
@@ -355,7 +721,80 @@ def calc_ma(prices, period, ma_type):
         w_sum = np.sum(weights)
         for i in range(start + period - 1, n):
             res[i] = np.sum(prices[i - period + 1:i + 1] * weights) / w_sum
+    elif ma_type == 4:  # SMMA / RMA (Wilder smoothing)
+        rma = np.mean(prices[start:start + period])
+        res[start + period - 1] = rma
+        for i in range(start + period, n):
+            rma = (rma * (period - 1) + prices[i]) / period
+            res[i] = rma
     return res
+
+
+@njit(nogil=True, cache=True)
+def calc_rsi_wilder(prices, period):
+    """Standard Wilder RSI, matching TradingView's ta.rsi() -- the RAW
+    RSI that the Pine script then smooths with an SMA pass (done
+    separately below via calc_ma, matching calc_smoothed_rsi in the
+    Pine source)."""
+    n = len(prices)
+    rsi = np.empty(n)
+    rsi[:] = np.nan
+    start = 0
+    while start < n and np.isnan(prices[start]):
+        start += 1
+    if n - start < period + 1:
+        return rsi
+
+    gains = np.zeros(n)
+    losses = np.zeros(n)
+    for i in range(start + 1, n):
+        diff = prices[i] - prices[i - 1]
+        if diff > 0:
+            gains[i] = diff
+        else:
+            losses[i] = -diff
+
+    avg_gain = np.mean(gains[start + 1:start + period + 1])
+    avg_loss = np.mean(losses[start + 1:start + period + 1])
+    idx0 = start + period
+    if avg_loss > 0:
+        rs = avg_gain / avg_loss
+        rsi[idx0] = 100.0 - 100.0 / (1.0 + rs)
+    else:
+        rsi[idx0] = 100.0
+
+    for i in range(idx0 + 1, n):
+        avg_gain = (avg_gain * (period - 1) + gains[i]) / period
+        avg_loss = (avg_loss * (period - 1) + losses[i]) / period
+        if avg_loss > 0:
+            rs = avg_gain / avg_loss
+            rsi[i] = 100.0 - 100.0 / (1.0 + rs)
+        else:
+            rsi[i] = 100.0
+    return rsi
+
+
+@njit(nogil=True, cache=True)
+def calc_atr_wilder(highs, lows, closes, period=14):
+    n = len(closes)
+    atr = np.empty(n)
+    atr[:] = np.nan
+    start = 0
+    while start < n and np.isnan(closes[start]):
+        start += 1
+    if n - start < period + 1:
+        return atr
+
+    tr = np.zeros(n)
+    for i in range(start + 1, n):
+        tr[i] = max(highs[i] - lows[i], abs(highs[i] - closes[i-1]), abs(lows[i] - closes[i-1]))
+
+    atr_s = np.sum(tr[start+1:start+period+1]) / period
+    atr[start + period] = atr_s
+    for i in range(start + period + 1, n):
+        atr_s = (atr_s * (period - 1) + tr[i]) / period
+        atr[i] = atr_s
+    return atr
 
 
 @njit(nogil=True, cache=True)
@@ -363,7 +802,6 @@ def calc_adx(highs, lows, closes, period=14):
     n = len(closes)
     adx = np.empty(n)
     adx[:] = np.nan
-
     start = 0
     while start < n and np.isnan(closes[start]):
         start += 1
@@ -404,40 +842,14 @@ def calc_adx(highs, lows, closes, period=14):
     return adx
 
 
-@njit(nogil=True, cache=True)
-def calc_atr_wilder(highs, lows, closes, period=14):
-    """Wilder-smoothed ATR, used consistently everywhere in this file."""
-    n = len(closes)
-    atr = np.empty(n)
-    atr[:] = np.nan
-    start = 0
-    while start < n and np.isnan(closes[start]):
-        start += 1
-    if n - start < period + 1:
-        return atr
-
-    tr = np.zeros(n)
-    for i in range(start + 1, n):
-        tr[i] = max(highs[i] - lows[i], abs(highs[i] - closes[i-1]), abs(lows[i] - closes[i-1]))
-
-    atr_s = np.sum(tr[start+1:start+period+1]) / period
-    atr[start + period] = atr_s
-    for i in range(start + period + 1, n):
-        atr_s = (atr_s * (period - 1) + tr[i]) / period
-        atr[i] = atr_s
-    return atr
-
-
 # ==========================================
-# 3b. BOUNDED, THREAD-SAFE MEMOIZATION FOR calc_ma
+# 3b. CACHES (MA + raw RSI) -- perf only, same bounded/thread-safe pattern
 # ==========================================
-# Pure speed optimization. Cache key is (stock_idx, period, ma_type) only --
-# safe because `closes` is built once per run_optimization() call and never
-# mutated. Always call clear_ma_cache() before reusing evaluate_params()
-# against a NEW dataset in the same process.
 
 _MA_CACHE = OrderedDict()
 _MA_CACHE_LOCK = threading.Lock()
+_RSI_CACHE = OrderedDict()
+_RSI_CACHE_LOCK = threading.Lock()
 
 
 def get_ma_cached(closes, stock_idx, period, ma_type):
@@ -447,9 +859,6 @@ def get_ma_cached(closes, stock_idx, period, ma_type):
         if cached is not None:
             _MA_CACHE.move_to_end(key)
             return cached
-    # Computed outside the lock so calc_ma's nogil parallelism isn't
-    # serialized; a rare cache-miss race just recomputes the same array
-    # twice, which is wasted work but never incorrect.
     result = calc_ma(closes[:, stock_idx], period, ma_type)
     with _MA_CACHE_LOCK:
         _MA_CACHE[key] = result
@@ -458,556 +867,254 @@ def get_ma_cached(closes, stock_idx, period, ma_type):
     return result
 
 
-def clear_ma_cache():
+def get_raw_rsi_cached(closes, stock_idx, period):
+    key = (stock_idx, int(period))
+    with _RSI_CACHE_LOCK:
+        cached = _RSI_CACHE.get(key)
+        if cached is not None:
+            _RSI_CACHE.move_to_end(key)
+            return cached
+    result = calc_rsi_wilder(closes[:, stock_idx], period)
+    with _RSI_CACHE_LOCK:
+        _RSI_CACHE[key] = result
+        while len(_RSI_CACHE) > MA_CACHE_MAX_ENTRIES:
+            _RSI_CACHE.popitem(last=False)
+    return result
+
+
+def get_smoothed_rsi(closes, stock_idx, rsi_len, smooth_len):
+    raw = get_raw_rsi_cached(closes, stock_idx, rsi_len)
+    return calc_ma(raw, smooth_len, 0)   # SMA smoothing, matches Pine's ta.sma(raw_rsi, smt_l)
+
+
+def clear_caches():
     with _MA_CACHE_LOCK:
         _MA_CACHE.clear()
+    with _RSI_CACHE_LOCK:
+        _RSI_CACHE.clear()
 
 
 # ==========================================
-# 4. PORTFOLIO SIMULATOR
+# 4. PER-COIN SIGNAL SIMULATOR
 # ==========================================
+# One coin at a time, fully independent of every other coin (no shared
+# capital, so no competition, so no reason to simulate the whole universe
+# in lockstep). Close-based signals, fill at next bar's open -- same
+# two-phase discipline as main.py. Outputs a trade log (arrays), not a
+# portfolio value curve.
 
-@njit(nogil=True)
-def simulate_portfolio(
-        opens, closes, atr, adx, sip_trigger, index_closes, is_div_stock,
-        short_ma, long_ma, super_ma, eligible_mask,
-        wl_rank_method, entry_filter, adx_threshold,
-        n_exit_method, n_trail_pct, n_atr_mult,
-        div_exit_method, div_exit_val,
-        start_day, end_day,
-        starting_wealth, bench_starting_wealth,
-        buy_cost_pct, sell_cost_pct, dp_flat_fee, annual_cash_yield,
-        nifty_ma, use_nifty_filter,
-        use_wl_age_weight, wl_age_weight):
+@njit(nogil=True, cache=True)
+def simulate_signal_trades(
+        opens, closes, atr, adx,
+        entry_ma, xover_short, xover_long,
+        rsi_fast, rsi_slow, rsi_trend_ma,
+        btc_close, btc_ma,
+        exit_ma, exit_xover_short, exit_xover_long,
+        exit_rsi_fast, exit_rsi_slow,
+        entry_type, exit_type,
+        use_btc_entry_gate, use_btc_exit_override, use_rsi_trend_filter,
+        adx_threshold,
+        sl_mult, tp_mult, trail_mult, trail_pct, exit_atr_mult,
+        max_pyramid_layers,
+        start_day, end_day):
+    """
+    PYRAMIDING (v1.2): if max_pyramid_layers > 1, the SAME entry signal
+    firing again while already in a position adds another layer instead
+    of being ignored, up to max_pyramid_layers total. This mirrors
+    main.py's approach: the position's cost basis becomes the (equally-
+    weighted) average of every layer's fill price, but the STOP/TP levels
+    and the R-multiple's risk denominator stay anchored to the FIRST
+    layer's entry (not re-anchored on each add) -- adding to a winner
+    doesn't retroactively pretend you had a tighter stop the whole time.
+    A pyramided position still exits as ONE trade (all layers close
+    together, same exit signal) and is logged as ONE row in the trade
+    log, with the layer count attached for reporting.
+    """
 
-    n_days, n_stocks = closes.shape
+    n_days = len(closes)
     if end_day < 0 or end_day >= n_days: end_day = n_days - 2
     if start_day < 1: start_day = 1
+    if max_pyramid_layers < 1: max_pyramid_layers = 1
 
-    daily_yield_mult = (1.0 + annual_cash_yield) ** (1.0 / TRADING_DAYS_PER_YEAR)
+    MAX_TRADES = 2000
+    t_entry_day   = np.zeros(MAX_TRADES, dtype=np.int32)
+    t_exit_day    = np.zeros(MAX_TRADES, dtype=np.int32)
+    t_entry_price = np.zeros(MAX_TRADES)
+    t_exit_price  = np.zeros(MAX_TRADES)
+    t_r_multiple  = np.zeros(MAX_TRADES)
+    t_pct_return  = np.zeros(MAX_TRADES)
+    t_bars_held   = np.zeros(MAX_TRADES, dtype=np.int32)
+    t_layers      = np.zeros(MAX_TRADES, dtype=np.int32)
+    t_cnt = 0
 
-    # ── UNIFIED CASH POOL ──────────────────────────────────────────────────
-    cash_pool              = starting_wealth
-    total_invested_capital = 0.0
+    in_pos              = False
+    n_layers             = 0
+    blended_entry_price  = 0.0
+    entry_day            = 0
+    entry_risk           = 0.0    # anchored to layer 1 only, never re-anchored
+    stop_loss_price      = 0.0    # anchored to layer 1 only, never re-anchored
+    tp_trigger_price     = 0.0    # anchored to layer 1 only, never re-anchored
+    half_sold            = False
+    partial_exit_price   = 0.0
+    high_since_entry     = 0.0
 
-    in_pos           = np.zeros(n_stocks, dtype=np.bool_)
-    entry_prices     = np.zeros(n_stocks)
-    entry_days       = np.zeros(n_stocks, dtype=np.int32)
-    shares_held      = np.zeros(n_stocks)
-    high_since_entry = np.zeros(n_stocks)
-    days_below_long  = np.zeros(n_stocks)
-    wl_days_below_long = np.zeros(n_stocks)   # NEW: watchlist-side mirror of days_below_long,
-                                               # needed for div_exit_method==2 parity (see
-                                               # WATCHLIST INVALIDATION below)
-
-    wl_active       = np.zeros(n_stocks, dtype=np.bool_)
-    wl_entry_prices = np.zeros(n_stocks)
-    wl_is_pyramid   = np.zeros(n_stocks, dtype=np.bool_)
-    wl_entry_day    = np.zeros(n_stocks, dtype=np.int32)   # NEW: feeds the optional
-                                                            # watchlist-age ranking boost
-
-    pending_exit = np.zeros(n_stocks, dtype=np.bool_)
-
-    total_wins     = 0.0
-    total_losses   = 0.0
-    winning_trades = 0
-    losing_trades  = 0
-    win_pct_sum    = 0.0
-    loss_pct_sum   = 0.0
-    total_bars_in_trades = 0
-
-    n_floor_clamps  = 0
-    cash_frac_sum   = 0.0
-    cash_frac_days  = 0
-    days_high_cash  = 0
-
-    daily_port_val  = np.zeros(n_days)
-    daily_bench_val = np.zeros(n_days)
-
-    # Per-day record of external cash injected (the monthly SIP) -- used to
-    # strip cash-flow noise out of the daily return series before it feeds
-    # Sharpe/Sortino/skew/kurtosis below.
-    daily_cash_injection = np.zeros(n_days)
-
-    # Cash-flow / monthly-return arrays sized off n_days (a provable upper
-    # bound: at most one SIP event and one month-boundary per trading day)
-    # instead of a fixed cap, so a long-running backtest can't silently
-    # overflow and corrupt IRR/IR. `+8` is slack for the start/terminal entries.
-    MAX_CF     = n_days + 8
-    MAX_MONTHS = n_days + 8
-    cf_days    = np.zeros(MAX_CF, dtype=np.int32)
-    cf_amounts = np.zeros(MAX_CF)
-    cf_cnt = 0
-    if starting_wealth > 0:
-        cf_days[0]    = start_day
-        cf_amounts[0] = -starting_wealth
-        cf_cnt = 1
-
-    port_monthly_returns  = np.zeros(MAX_MONTHS)
-    bench_monthly_returns = np.zeros(MAX_MONTHS)
-    month_cnt = 0
-
-    last_port_month_end  = 0.0
-    last_bench_month_end = 0.0
-    have_prior_month_end = False
-    # bench_starting_wealth mirrors starting_wealth for the benchmark side,
-    # so the OOS "beat benchmark" gate compares two numbers measured on the
-    # same footing (both carrying forward from the IS period).
-    bench_shares = bench_starting_wealth / index_closes[start_day] if index_closes[start_day] > 0 else 0.0
+    pending_entry   = False   # fresh open OR a pyramid add-on, settled next open
+    pending_exit    = False
+    pending_partial = False
 
     for d in range(start_day, end_day):
 
-        # ── IDLE CASH YIELD ──────────────────────────────────────────────
-        cash_pool *= daily_yield_mult
+        # ---- Phase A: settle yesterday's signal at today's open ----
+        if pending_partial and in_pos:
+            fill_price = opens[d]
+            if not (fill_price > 0):
+                fill_price = closes[d - 1]
+            partial_exit_price = fill_price
+            half_sold = True
+            if stop_loss_price < blended_entry_price:
+                stop_loss_price = blended_entry_price
+            pending_partial = False
 
-        # ── PHASE-A: SETTLE PENDING EXITS AT TODAY'S OPEN ─────────────────
-        for s in range(n_stocks):
-            if pending_exit[s] and in_pos[s]:
-                fill_price = opens[d, s]
-                if not (fill_price > 0):   # NaN-safe: NaN>0 is False too
-                    fill_price = closes[d - 1, s]
-                exit_val     = shares_held[s] * fill_price * (1.0 - sell_cost_pct)
-                exit_val     = max(0.0, exit_val - dp_flat_fee)
-                invested_val = shares_held[s] * entry_prices[s]
-                profit       = exit_val - invested_val
-                pct_change   = profit / invested_val if invested_val > 0 else 0.0
-
-                if profit > 0:
-                    total_wins     += profit
-                    win_pct_sum    += pct_change
-                    winning_trades += 1
-                else:
-                    total_losses   += abs(profit)
-                    loss_pct_sum   += abs(pct_change)
-                    losing_trades  += 1
-
-                total_bars_in_trades += (d - 1 - entry_days[s])
-                cash_pool        += exit_val
-                in_pos[s]         = False
-                shares_held[s]    = 0.0
-                pending_exit[s]   = False
-
-        # ── MONTHLY SIP INJECTION ──────────────────────────────────────────
-        if sip_trigger[d]:
-            p_current = daily_port_val[d - 1] if d > start_day else starting_wealth
-            b_current = bench_shares * index_closes[d - 1] if bench_shares > 0 else 0.0
-
-            if have_prior_month_end:
-                port_monthly_returns[month_cnt]  = (p_current - last_port_month_end) / last_port_month_end
-                bench_monthly_returns[month_cnt] = (b_current - last_bench_month_end) / last_bench_month_end if last_bench_month_end > 0 else 0.0
-                month_cnt = min(month_cnt + 1, MAX_MONTHS - 1)
-
-            last_port_month_end  = p_current + MONTHLY_SIP
-            last_bench_month_end = b_current + MONTHLY_SIP
-            have_prior_month_end = True
-
-            cash_pool               += MONTHLY_SIP
-            total_invested_capital  += MONTHLY_SIP
-            daily_cash_injection[d] += MONTHLY_SIP
-            if index_closes[d] > 0:
-                bench_shares += MONTHLY_SIP / index_closes[d]
-
-            if cf_cnt >= MAX_CF:
-                raise ValueError("cash-flow array overflow -- should be mathematically impossible")
-            cf_days[cf_cnt]    = d
-            cf_amounts[cf_cnt] = -MONTHLY_SIP
-            cf_cnt += 1
-
-        curr_closes = closes[d]
-        nifty_bullish = index_closes[d] > nifty_ma[d]   # NEW: Nifty-regime panic-exit signal
-
-        # ── WATCHLIST INVALIDATION (FIXED for shadow-position parity with
-        # PHASE-B below, ported from the crypto engine's decision #17: a
-        # watchlist candidate should be dropped by the SAME rule that would
-        # actually sell it once bought -- no more, no less. Previously the
-        # short/long MA crossunder applied to EVERY watchlist candidate
-        # unconditionally, including dividend candidates -- even though a
-        # real dividend POSITION is never exited by the growth crossunder,
-        # only by div_exit_method (see PHASE-B). That let a perfectly fine
-        # dividend candidate get dropped off the watchlist for a reason that
-        # would never have sold it as a real position. Also adds the
-        # previously-missing div_exit_method==2 (time-decay) watchlist
-        # check, and the new optional Nifty panic-exit override for growth
-        # (non-dividend) candidates only -- see module docstring.) ──
-        newly_invalidated = np.zeros(n_stocks, dtype=np.bool_)
-        for s in range(n_stocks):
-            if wl_active[s]:
-                if not wl_is_pyramid[s] and curr_closes[s] > 0:
-                    high_since_entry[s] = max(high_since_entry[s], curr_closes[s])
-
-                wl_invalid = False
-                if is_div_stock[s]:
-                    if div_exit_method == 0:
-                        if curr_closes[s] < high_since_entry[s] * (1.0 - div_exit_val / 100.0): wl_invalid = True
-                    elif div_exit_method == 1:
-                        if curr_closes[s] < super_ma[d, s] * (1.0 - div_exit_val / 100.0): wl_invalid = True
-                    elif div_exit_method == 2:
-                        if curr_closes[s] < long_ma[d, s]: wl_days_below_long[s] += 1
-                        else: wl_days_below_long[s] = 0
-                        if wl_days_below_long[s] > div_exit_val: wl_invalid = True
-                else:
-                    if n_exit_method == 0:
-                        if short_ma[d-1, s] >= long_ma[d-1, s] and short_ma[d, s] < long_ma[d, s]: wl_invalid = True
-                    elif n_exit_method == 1:
-                        if curr_closes[s] < high_since_entry[s] * (1.0 - n_trail_pct / 100.0): wl_invalid = True
-                    elif n_exit_method == 2:
-                        if curr_closes[s] < high_since_entry[s] - (n_atr_mult * atr[d, s]): wl_invalid = True
-                    if use_nifty_filter and not nifty_bullish:
-                        wl_invalid = True
-
-                if wl_invalid:
-                    wl_active[s]          = False
-                    wl_is_pyramid[s]      = False
-                    wl_days_below_long[s] = 0.0
-                    newly_invalidated[s]  = True
-
-        # ── PHASE-B: FLAG EXITS FOR NEXT-BAR SETTLEMENT ───────────────────
-        for s in range(n_stocks):
-            if in_pos[s] and not pending_exit[s]:
-                if curr_closes[s] > 0:
-                    high_since_entry[s] = max(high_since_entry[s], curr_closes[s])
-
-                should_exit = False
-                if is_div_stock[s]:
-                    if div_exit_method == 0:
-                        if curr_closes[s] < high_since_entry[s] * (1.0 - div_exit_val / 100.0): should_exit = True
-                    elif div_exit_method == 1:
-                        if curr_closes[s] < super_ma[d, s] * (1.0 - div_exit_val / 100.0): should_exit = True
-                    elif div_exit_method == 2:
-                        if curr_closes[s] < long_ma[d, s]: days_below_long[s] += 1
-                        else: days_below_long[s] = 0
-                        if days_below_long[s] > div_exit_val: should_exit = True
-                else:
-                    if n_exit_method == 0:
-                        if short_ma[d-1, s] >= long_ma[d-1, s] and short_ma[d, s] < long_ma[d, s]: should_exit = True
-                    elif n_exit_method == 1:
-                        if curr_closes[s] < high_since_entry[s] * (1.0 - n_trail_pct / 100.0): should_exit = True
-                    elif n_exit_method == 2:
-                        if curr_closes[s] < high_since_entry[s] - (n_atr_mult * atr[d, s]): should_exit = True
-                    # NEW: optional market-wide panic exit (Nifty regime turns
-                    # bearish) -- growth stocks only, see module docstring.
-                    if use_nifty_filter and not nifty_bullish:
-                        should_exit = True
-
-                if should_exit:
-                    pending_exit[s] = True
-
-        # ── WATCHLIST ADDITIONS ─────────────────────────────────────────
-        for s in range(n_stocks):
-            if not wl_active[s] and not newly_invalidated[s] and eligible_mask[d, s]:
-                if short_ma[d-1, s] <= long_ma[d-1, s] and short_ma[d, s] > long_ma[d, s]:
-                    valid_entry = True
-                    if entry_filter == 1 and curr_closes[s] <= super_ma[d, s]: valid_entry = False
-                    elif entry_filter == 2 and curr_closes[s] >= super_ma[d, s]: valid_entry = False
-                    if valid_entry and adx_threshold > 0.0 and adx[d, s] < adx_threshold: valid_entry = False
-                    # NEW: optional entry gate -- growth stocks only skip new
-                    # entries while Nifty itself is bearish. Dividend stocks
-                    # are deliberately exempt from this filter on both the
-                    # entry and exit side (see module docstring) -- they were
-                    # chosen specifically for a steadier, more defensive
-                    # profile, and force-applying a broad growth-market panic
-                    # rule to them would work against the reason they're a
-                    # separate sleeve of the portfolio in the first place.
-                    if valid_entry and use_nifty_filter and not is_div_stock[s] and not nifty_bullish:
-                        valid_entry = False
-                    if valid_entry:
-                        wl_active[s]        = True
-                        wl_entry_prices[s]  = curr_closes[s]   # FIXED (ported from the crypto
-                                                                # engine): was opens[d,s] -- the
-                                                                # crossover is confirmed using
-                                                                # day d's CLOSE, so the close is
-                                                                # the actual price at signal-
-                                                                # detection time; the open predates
-                                                                # the move that produced the signal.
-                        wl_is_pyramid[s]    = in_pos[s] and not pending_exit[s]
-                        wl_entry_day[s]     = d
-                        if not wl_is_pyramid[s]:
-                            high_since_entry[s] = opens[d, s]
-
-        # ── CAPITAL DEPLOYMENT (ported from the crypto engine's decision #16:
-        # equal-weight target instead of a fixed MONTHLY_SIP chunk per buy --
-        # adapts ticket size to how many genuine opportunities exist right
-        # now, instead of either starving a lone candidate to Rs.8,000
-        # forever or running out of cash mid-way through a pile of
-        # simultaneous signals. MIN_TICKET_SIZE is kept EQUAL to the fixed
-        # Rs.8,000 SIP figure by explicit instruction -- this is a floor
-        # under a now-variable ticket size, not a loosening of it.) ──
-        n_eligible = 0
-        for s in range(n_stocks):
-            if eligible_mask[d, s]:
-                n_eligible += 1
-        if n_eligible < 1:
-            n_eligible = 1
-
-        while cash_pool >= MIN_TICKET_SIZE:
-            best_rank  = -999999.0
-            best_s     = -1
-            for s in range(n_stocks):
-                if wl_active[s]:
-                    if wl_is_pyramid[s] and not in_pos[s]:
-                        wl_active[s]     = False
-                        wl_is_pyramid[s] = False
-                        continue
-
-                    rank = -999.0
-                    if wl_rank_method == 0 and wl_entry_prices[s] > 0:
-                        rank = (wl_entry_prices[s] - curr_closes[s]) / wl_entry_prices[s]
-                    elif wl_rank_method == 1 and curr_closes[s] > 0:
-                        rank = -abs(curr_closes[s] - long_ma[d, s]) / curr_closes[s]
-                    elif wl_rank_method == 2 and short_ma[d, s] > 0:
-                        rank = (curr_closes[s] - short_ma[d, s]) / short_ma[d, s]
-                    # NEW: optional watchlist-age boost -- additive, so it
-                    # nudges the existing rank toward older candidates
-                    # instead of replacing the strategy's own ranking logic.
-                    # age_frac saturates at 1.0 once a candidate has waited
-                    # WL_AGE_NORM_DAYS trading days, so an extremely stale
-                    # candidate doesn't get an unbounded advantage.
-                    if use_wl_age_weight and rank > -999.0:
-                        age_frac = (d - wl_entry_day[s]) / WL_AGE_NORM_DAYS
-                        if age_frac > 1.0: age_frac = 1.0
-                        elif age_frac < 0.0: age_frac = 0.0
-                        rank = rank + wl_age_weight * age_frac
-                    if rank > best_rank:
-                        best_rank = rank
-                        best_s    = s
-
-            if best_s == -1: break
-
-            buy_price = opens[d + 1, best_s] if d + 1 < n_days else curr_closes[best_s]
-            if not (buy_price > 0):
-                wl_active[best_s] = False
-                continue
-
-            # Equal-weight target size: (idle cash + cost-basis of everything
-            # already open) / n_eligible. Cost basis, NOT mark-to-market --
-            # an open position's unrealized paper gain must not inflate the
-            # size of the NEXT, unrelated trade. If the wallet can't cover a
-            # full target, it spends whatever's left instead of skipping the
-            # trade outright; MIN_TICKET_SIZE stops the loop chasing dust
-            # once cash_pool is nearly drained.
-            invested_cost = 0.0
-            for s2 in range(n_stocks):
-                if in_pos[s2]:
-                    invested_cost += shares_held[s2] * entry_prices[s2]
-            target_size = (cash_pool + invested_cost) / n_eligible
-            buy_amount  = target_size if target_size <= cash_pool else cash_pool
-            if buy_amount < MIN_TICKET_SIZE:
-                break
-
-            cash_pool  -= buy_amount
-            new_shares  = buy_amount / (buy_price * (1.0 + buy_cost_pct))
-
-            if wl_is_pyramid[best_s] and in_pos[best_s]:
-                old_cost = shares_held[best_s] * entry_prices[best_s]
-                new_cost = new_shares * buy_price
-                shares_held[best_s]  += new_shares
-                entry_prices[best_s]  = (old_cost + new_cost) / shares_held[best_s]
+        if pending_exit and in_pos:
+            fill_price = opens[d]
+            if not (fill_price > 0):
+                fill_price = closes[d - 1]
+            if half_sold:
+                blended_exit = 0.5 * partial_exit_price + 0.5 * fill_price
             else:
-                in_pos[best_s]           = True
-                entry_prices[best_s]     = buy_price
-                entry_days[best_s]       = d
-                shares_held[best_s]      = new_shares
-                high_since_entry[best_s] = buy_price
+                blended_exit = fill_price
+            pnl_per_unit = blended_exit - blended_entry_price
+            if t_cnt < MAX_TRADES:
+                t_entry_day[t_cnt]   = entry_day
+                t_exit_day[t_cnt]    = d
+                t_entry_price[t_cnt] = blended_entry_price
+                t_exit_price[t_cnt]  = blended_exit
+                t_r_multiple[t_cnt]  = pnl_per_unit / entry_risk if entry_risk > 0 else 0.0
+                t_pct_return[t_cnt]  = pnl_per_unit / blended_entry_price if blended_entry_price > 0 else 0.0
+                t_bars_held[t_cnt]   = d - entry_day
+                t_layers[t_cnt]      = n_layers
+                t_cnt += 1
+            in_pos = False
+            n_layers = 0
+            half_sold = False
+            pending_exit = False
 
-            wl_active[best_s]     = False
-            wl_is_pyramid[best_s] = False
+        if pending_entry:
+            fill_price = opens[d]
+            if not (fill_price > 0):
+                fill_price = closes[d - 1]
+            if fill_price > 0:
+                if not in_pos:
+                    # fresh position, layer 1
+                    in_pos = True
+                    n_layers = 1
+                    blended_entry_price = fill_price
+                    entry_day = d
+                    high_since_entry = fill_price
+                    half_sold = False
+                    e_atr = atr[d] if atr[d] > 0 else atr[d - 1]
+                    if not (e_atr > 0):
+                        e_atr = fill_price * 0.02
+                    entry_risk = e_atr * sl_mult
+                    stop_loss_price  = fill_price - e_atr * sl_mult
+                    tp_trigger_price = fill_price + e_atr * tp_mult
+                else:
+                    # pyramid add-on -- blend cost basis, everything else
+                    # (stop/tp/entry_risk) stays anchored to layer 1
+                    n_layers += 1
+                    blended_entry_price = (blended_entry_price * (n_layers - 1) + fill_price) / n_layers
+                    high_since_entry = max(high_since_entry, fill_price)
+            pending_entry = False
 
-        # ── DAILY PORTFOLIO VALUATION ──────────────────────────────────────
-        curr_val = cash_pool
-        for s in range(n_stocks):
-            if in_pos[s]:
-                curr_val += shares_held[s] * curr_closes[s]
+        curr_close = closes[d]
+        prev_close = closes[d - 1]
 
-        if d > start_day:
-            floor_val = daily_port_val[d - 1] * 0.001
-            if curr_val < floor_val:
-                # Should never fire on real NSE data (circuit limits alone
-                # rule out a >99.9% one-day move). If it fires, treat the
-                # run as suspect -- it means a NaN/zero-price leak upstream.
-                n_floor_clamps += 1
-            daily_port_val[d] = max(curr_val, floor_val)
-        else:
-            daily_port_val[d] = curr_val
-        daily_bench_val[d] = bench_shares * index_closes[d]
+        btc_bullish = True
+        if use_btc_entry_gate or use_btc_exit_override:
+            btc_bullish = btc_close[d] > btc_ma[d]
 
-        # ── CASH-UTILIZATION DIAGNOSTIC (reporting only) ──────────────────
-        if daily_port_val[d] > 0:
-            cash_frac = cash_pool / daily_port_val[d]
-            cash_frac_sum  += cash_frac
-            cash_frac_days += 1
-            if cash_frac > HIGH_CASH_FRACTION_THRESHOLD:
-                days_high_cash += 1
+        # ---- exit evaluation (close-based, flags for tomorrow's open) ----
+        if in_pos and not pending_exit:
+            if curr_close > 0:
+                high_since_entry = max(high_since_entry, curr_close)
 
-    # ── TERMINAL CASH FLOW ──────────────────────────────────────────────
-    final_wealth       = daily_port_val[end_day - 1]
-    final_bench_wealth = daily_bench_val[end_day - 1]
-    if cf_cnt >= MAX_CF:
-        raise ValueError("cash-flow array overflow at terminal entry -- should be impossible")
-    cf_days[cf_cnt]    = end_day - 1
-    cf_amounts[cf_cnt] = final_wealth
-    cf_cnt += 1
+            override_exit = use_btc_exit_override and (not btc_bullish)
 
-    # ── METRICS ────────────────────────────────────────────────────────────
-    trade_count        = winning_trades + losing_trades
+            should_exit_full    = False
+            should_exit_partial = False
 
-    avg_bars   = total_bars_in_trades / trade_count if trade_count > 0 else 0.0
-    avg_runup  = win_pct_sum  / winning_trades if winning_trades > 0 else 0.0
-    avg_loss_r = loss_pct_sum / losing_trades  if losing_trades  > 0 else 0.0
+            if exit_type == EXIT_HYBRID:
+                if not half_sold and curr_close >= tp_trigger_price:
+                    should_exit_partial = True
+                if half_sold:
+                    potential_new_sl = curr_close - atr[d] * trail_mult
+                    if potential_new_sl > stop_loss_price:
+                        stop_loss_price = potential_new_sl
+                if curr_close < stop_loss_price:
+                    should_exit_full = True
+            elif exit_type == EXIT_PCT_TRAIL:
+                if curr_close < high_since_entry * (1.0 - trail_pct / 100.0):
+                    should_exit_full = True
+            elif exit_type == EXIT_ATR_TRAIL:
+                if curr_close < high_since_entry - (exit_atr_mult * atr[d]):
+                    should_exit_full = True
+            elif exit_type == EXIT_MA_CROSSUNDER:
+                if prev_close >= exit_ma[d - 1] and curr_close < exit_ma[d]:
+                    should_exit_full = True
+            elif exit_type == EXIT_RSI_CROSSUNDER:
+                if exit_rsi_fast[d - 1] >= exit_rsi_slow[d - 1] and exit_rsi_fast[d] < exit_rsi_slow[d]:
+                    should_exit_full = True
+            elif exit_type == EXIT_MA_XOVER_EXIT:
+                if exit_xover_short[d - 1] >= exit_xover_long[d - 1] and exit_xover_short[d] < exit_xover_long[d]:
+                    should_exit_full = True
 
-    # max_dd deliberately walks the RAW daily_port_val (cash included, not
-    # SIP-adjusted) -- "how far did my total account balance fall from its
-    # peak" is a different, both-valid question from "how well did the
-    # money that was actually invested perform" (the adjusted series below).
-    max_dd      = 0.0
-    peak        = daily_port_val[start_day]
-    curr_dd_dur = 0
-    max_dd_dur  = 0
-    returns_sum      = 0.0
-    returns_sq_sum   = 0.0
-    returns_cube_sum = 0.0
-    returns_quad_sum = 0.0
-    downside_sq      = 0.0
-    valid_days       = 0
-    down_days        = 0
+            if override_exit:
+                should_exit_full    = True
+                should_exit_partial = False
 
-    for d in range(start_day + 1, end_day):
-        v = daily_port_val[d]
-        if v > peak:
-            peak        = v
-            curr_dd_dur = 0
-        else:
-            if peak > 0:
-                dd = (v - peak) / peak
-                if dd < max_dd: max_dd = dd
-            curr_dd_dur += 1
-            if curr_dd_dur > max_dd_dur: max_dd_dur = curr_dd_dur
+            if should_exit_full:
+                pending_exit = True
+            elif should_exit_partial:
+                pending_partial = True
 
-        prev = daily_port_val[d - 1]
-        if prev > 0:
-            # Subtract today's SIP injection before computing the return --
-            # otherwise every SIP date reads as a fabricated one-day gain
-            # (scoring deposit speed, not investment performance).
-            ret = (v - daily_cash_injection[d] - prev) / prev
-            returns_sum      += ret
-            returns_sq_sum   += ret * ret
-            returns_cube_sum += ret * ret * ret
-            returns_quad_sum += ret * ret * ret * ret
-            valid_days       += 1
-            if ret < 0:
-                downside_sq += ret * ret
-                down_days   += 1
+        # ---- entry evaluation -- same signal fires whether opening fresh
+        #      or adding a pyramid layer to an existing winner ----
+        can_add = (not in_pos) or (n_layers < max_pyramid_layers)
+        if can_add and (not pending_entry) and (not pending_exit):
+            entry_signal = False
+            if entry_type == ENTRY_MA_BREAKOUT:
+                if prev_close <= entry_ma[d - 1] and curr_close > entry_ma[d]:
+                    entry_signal = True
+            elif entry_type == ENTRY_RSI_XOVER:
+                if rsi_fast[d - 1] <= rsi_slow[d - 1] and rsi_fast[d] > rsi_slow[d]:
+                    entry_signal = True
+                    if use_rsi_trend_filter and not (curr_close > rsi_trend_ma[d]):
+                        entry_signal = False
+            elif entry_type == ENTRY_MA_XOVER:
+                if xover_short[d - 1] <= xover_long[d - 1] and xover_short[d] > xover_long[d]:
+                    entry_signal = True
 
-    sharpe  = 0.0
-    sortino = 0.0
-    skew    = 0.0
-    kurt    = 0.0
-    if valid_days > 1:
-        mean_ret = returns_sum / valid_days
-        var_ret  = (returns_sq_sum / valid_days) - (mean_ret ** 2)
-        if var_ret > 0:
-            std_ret = math.sqrt(var_ret)
-            if std_ret > 0: sharpe = (mean_ret / std_ret) * math.sqrt(TRADING_DAYS_PER_YEAR)
-        # Sortino divides by ALL valid days, not just down days (matches
-        # the textbook definition).
-        std_down = math.sqrt(downside_sq / valid_days)
-        if std_down > 0: sortino = (mean_ret / std_down) * math.sqrt(TRADING_DAYS_PER_YEAR)
+            if entry_signal and use_btc_entry_gate and not btc_bullish:
+                entry_signal = False
+            if entry_signal and adx_threshold > 0.0 and adx[d] < adx_threshold:
+                entry_signal = False
 
-        # Real sample skew / (non-excess) kurtosis of this same
-        # cash-flow-adjusted return series, via raw-to-central-moment
-        # conversion. Left at 0.0 (handled by the caller) if var_ret is 0.
-        if var_ret > 0:
-            e_x  = mean_ret
-            e_x2 = returns_sq_sum   / valid_days
-            e_x3 = returns_cube_sum / valid_days
-            e_x4 = returns_quad_sum / valid_days
-            m2 = var_ret
-            m3 = e_x3 - 3.0 * e_x * e_x2 + 2.0 * e_x ** 3
-            m4 = e_x4 - 4.0 * e_x * e_x3 + 6.0 * e_x ** 2 * e_x2 - 3.0 * e_x ** 4
-            skew = m3 / (m2 ** 1.5)
-            kurt = m4 / (m2 ** 2)
+            if entry_signal:
+                pending_entry = True
 
-    info_ratio = 0.0
-    if month_cnt > MIN_MONTHS_GATE:
-        mean_excess = 0.0
-        sq_excess   = 0.0
-        for i in range(month_cnt):
-            ex = port_monthly_returns[i] - bench_monthly_returns[i]
-            mean_excess += ex
-            sq_excess   += ex * ex
-        mean_excess /= month_cnt
-        var_excess   = sq_excess / month_cnt - mean_excess ** 2
-        if var_excess > 0:
-            info_ratio = (mean_excess / math.sqrt(var_excess)) * math.sqrt(12)
-
-    return (final_wealth, final_bench_wealth, total_invested_capital,
-            total_wins, total_losses, trade_count,
-            winning_trades, losing_trades,
-            avg_bars, avg_runup, avg_loss_r,
-            max_dd, max_dd_dur,
-            sharpe, sortino, info_ratio,
-            month_cnt,
-            cf_days, cf_amounts, cf_cnt,
-            n_floor_clamps,
-            cash_frac_sum, cash_frac_days, days_high_cash,
-            daily_port_val, daily_bench_val,
-            skew, kurt, valid_days)
+    return (t_entry_day[:t_cnt], t_exit_day[:t_cnt], t_entry_price[:t_cnt],
+            t_exit_price[:t_cnt], t_r_multiple[:t_cnt], t_pct_return[:t_cnt],
+            t_bars_held[:t_cnt], t_layers[:t_cnt])
 
 
 # ==========================================
-# 4b. MONEY-WEIGHTED RETURN SOLVER
+# 4b. MONEY-WEIGHTED MATH REMOVED -- no cash flows to solve an IRR over.
 # ==========================================
 
-def money_weighted_annual_return(cf_days, cf_amounts, day_basis=TRADING_DAYS_PER_YEAR,
-                                  r_lo=-0.999, r_hi=10.0, tol=1e-9, max_iter=200):
-    """
-    Solve for the annualized money-weighted rate of return (XIRR-style)
-    given a dated cash-flow stream, via bisection on NPV(r)=0.
-
-    Cash flows are always "a run of outflows then one terminal inflow" --
-    exactly one sign change -- so by Descartes' rule of signs there is at
-    most one real root for r > -1, guaranteeing a sign-changing bracket
-    finds a UNIQUE root rather than converging to the wrong one of several.
-
-    Returns (r, converged). converged=False if no bracket exists (e.g. a
-    strategy that lost essentially all capital).
-    """
-    if len(cf_amounts) < 2:
-        return 0.0, False
-    t0 = cf_days[0]
-    times = [(d - t0) / day_basis for d in cf_days]
-
-    def npv(r):
-        total = 0.0
-        for t, amt in zip(times, cf_amounts):
-            try:
-                total += amt / ((1.0 + r) ** t)
-            except (OverflowError, ZeroDivisionError):
-                return float('nan')
-        return total
-
-    f_lo, f_hi = npv(r_lo), npv(r_hi)
-    if not (math.isfinite(f_lo) and math.isfinite(f_hi)):
-        return 0.0, False
-    if (f_lo > 0) == (f_hi > 0):
-        return 0.0, False
-
-    for _ in range(max_iter):
-        r_mid = 0.5 * (r_lo + r_hi)
-        f_mid = npv(r_mid)
-        if not math.isfinite(f_mid):
-            return 0.0, False
-        if abs(f_mid) < tol or (r_hi - r_lo) < 1e-10:
-            return r_mid, True
-        if (f_mid > 0) == (f_lo > 0):
-            r_lo, f_lo = r_mid, f_mid
-        else:
-            r_hi, f_hi = r_mid, f_mid
-    return 0.5 * (r_lo + r_hi), True
-
-
 # ==========================================
-# 4c. OVERFITTING DIAGNOSTIC -- Deflated / Probabilistic Sharpe Ratio
-# (Bailey & Lopez de Prado, 2014)
+# 4c. OVERFITTING DIAGNOSTIC -- DSR (Bailey & Lopez de Prado, 2014)
+# Same math as main.py, applied to the trade-level R-multiple distribution
+# (mean/std of R across all trades) instead of a daily portfolio series.
 # ==========================================
 
 _EULER_GAMMA = 0.5772156649015329
@@ -1015,8 +1122,6 @@ _NORM = NormalDist()
 
 
 def expected_max_sharpe(sr_std, n_trials):
-    """Expected max Sharpe you'd see across n_trials independent
-    zero-skill strategies, given the observed cross-sectional Sharpe std."""
     if n_trials <= 1 or sr_std <= 0:
         return 0.0
     z1 = _NORM.inv_cdf(1.0 - 1.0 / n_trials)
@@ -1025,655 +1130,630 @@ def expected_max_sharpe(sr_std, n_trials):
 
 
 def probabilistic_sharpe_ratio(sr_hat, sr_benchmark, T, skew, kurt):
-    """P(true Sharpe > sr_benchmark), given observed per-period sr_hat over
-    T observations, adjusted for skew/kurtosis. sr_hat/sr_benchmark must be
-    in the same (non-annualized) units."""
     denom = math.sqrt(max(1e-12, 1 - skew * sr_hat + ((kurt - 1) / 4.0) * sr_hat ** 2))
     z = (sr_hat - sr_benchmark) * math.sqrt(max(T - 1, 1)) / denom
     return _NORM.cdf(z)
 
 
-def deflated_sharpe_ratio(sr_hat_daily, all_trial_sharpes_daily, T, skew, kurt):
-    """Returns (DSR, threshold_SR0_daily, n_trials_used)."""
-    n_trials = len(all_trial_sharpes_daily)
+def deflated_sharpe_ratio(sr_hat, all_trial_srs, T, skew, kurt):
+    n_trials = len(all_trial_srs)
     if n_trials < 2:
-        return probabilistic_sharpe_ratio(sr_hat_daily, 0.0, T, skew, kurt), 0.0, n_trials
-    mean_sr = sum(all_trial_sharpes_daily) / n_trials
-    var_sr  = sum((s - mean_sr) ** 2 for s in all_trial_sharpes_daily) / n_trials
+        return probabilistic_sharpe_ratio(sr_hat, 0.0, T, skew, kurt), 0.0, n_trials
+    mean_sr = sum(all_trial_srs) / n_trials
+    var_sr  = sum((s - mean_sr) ** 2 for s in all_trial_srs) / n_trials
     sr_std  = math.sqrt(var_sr)
     sr0 = expected_max_sharpe(sr_std, n_trials)
-    dsr = probabilistic_sharpe_ratio(sr_hat_daily, sr0, T, skew, kurt)
+    dsr = probabilistic_sharpe_ratio(sr_hat, sr0, T, skew, kurt)
     return dsr, sr0, n_trials
 
 
 # ==========================================
-# 4d. POINT-IN-TIME UNIVERSE -- BEST-EFFORT FETCHER
+# 5. DATA PREPARATION (unchanged data-infra from main.py)
 # ==========================================
-# Reconstructs point-in-time NIFTY 50 (ONLY -- not Next 50/Midcap 150, no
-# free officially-maintained archive found for those) membership from NSE's
-# own inclusion/exclusion history file, rolling backward from today's live
-# list. Written against public docs of that file, NOT verified against a
-# live download -- run it, read the coverage report, and spot-check known
-# historical changes (e.g. HDFC merging into HDFC Bank in 2023) before
-# trusting it for real capital.
-#
-# Usage:
-#   >>> from main import fetch_and_build_point_in_time_universe
-#   >>> fetch_and_build_point_in_time_universe("nifty50_pit.json")
-# then set POINT_IN_TIME_UNIVERSE_FILE = "nifty50_pit.json" above.
 
-NSE_INDEX_INCL_EXCL_URL = "https://archives.nseindia.com/content/indices/IndexInclExcl.xls"
-NSE_NIFTY50_ALIASES = {"NIFTY 50", "NIFTY50", "CNX NIFTY", "S&P CNX NIFTY", "S&P CNX NIFTY 50"}
+def build_eligibility_mask(n_days, n_stocks):
+    return np.ones((n_days, n_stocks), dtype=np.bool_)
 
 
-def fetch_and_build_point_in_time_universe(output_file="nifty50_point_in_time.json"):
-    """Best-effort NIFTY 50 (ONLY) point-in-time membership reconstruction.
-    See section comment above for exact scope."""
-    print("Point-in-time universe fetcher (NIFTY 50 only)...")
+def _binance_download_klines(symbol, start_date_str, interval='1d'):
+    start_ts = int(datetime.strptime(start_date_str, "%Y-%m-%d")
+                   .replace(tzinfo=timezone.utc).timestamp() * 1000)
+    end_ts = int(datetime.now(timezone.utc).timestamp() * 1000)
 
-    headers = {'User-Agent': 'Mozilla/5.0'}
-    try:
-        resp = requests.get(NSE_INDEX_INCL_EXCL_URL, headers=headers, timeout=20)
-        resp.raise_for_status()
-    except Exception as e:
-        print(f"Could not download {NSE_INDEX_INCL_EXCL_URL}: {e}")
-        print("NSE occasionally moves this file -- search 'niftyindices.com IndexInclExcl' for the current location.")
-        return None
-
-    raw = io.BytesIO(resp.content)
-    df = None
-    for engine in ('xlrd', 'openpyxl', None):
+    rows = []
+    cursor = start_ts
+    while cursor < end_ts:
+        params = {'symbol': symbol, 'interval': interval, 'startTime': cursor, 'limit': 1000}
         try:
-            raw.seek(0)
-            df = pd.read_excel(raw, engine=engine) if engine else pd.read_excel(raw)
+            r = requests.get(BINANCE_KLINES_URL, params=params, timeout=20)
+            if r.status_code != 200:
+                break
+            batch = r.json()
+        except Exception:
             break
-        except Exception:
-            continue
-    if df is None:
-        print("Downloaded but could not parse as .xls/.xlsx -- NSE may have changed format.")
+        if not batch:
+            break
+        rows.extend(batch)
+        cursor = batch[-1][0] + 1
+        if len(batch) < 1000:
+            break
+        time.sleep(0.15)
+
+    if not rows:
         return None
 
-    cols = {c: str(c).strip().lower() for c in df.columns}
-    def find_col(*keywords):
-        for c, low in cols.items():
-            if all(k in low for k in keywords):
-                return c
-        return None
-
-    col_index  = find_col("index")
-    col_symbol = find_col("symbol") or find_col("ticker")
-    col_date   = find_col("date")
-    col_action = find_col("action") or find_col("remark") or find_col("event") or find_col("effect")
-
-    print(f"Columns: {list(df.columns)}")
-    print(f"Detected -> index: {col_index!r}  symbol: {col_symbol!r}  date: {col_date!r}  action: {col_action!r}")
-    if not all([col_symbol, col_date, col_action]):
-        print("Could not identify symbol/date/action columns -- inspect the file manually.")
-        return None
-
-    events = []   # (date_str, symbol, 'IN'|'OUT')
-    unmatched_index_names = set()
-    for _, row in df.iterrows():
-        try:
-            if col_index is not None:
-                idx_name = str(row[col_index]).strip().upper()
-                if idx_name not in NSE_NIFTY50_ALIASES:
-                    if idx_name and idx_name != 'NAN':
-                        unmatched_index_names.add(idx_name)
-                    continue
-            action_raw = str(row[col_action]).strip().upper()
-            if 'IN' in action_raw and 'OUT' not in action_raw:
-                action = 'IN'
-            elif 'OUT' in action_raw or 'EXCL' in action_raw or 'REMOV' in action_raw or 'DEL' in action_raw:
-                action = 'OUT'
-            elif 'INCL' in action_raw or 'ADD' in action_raw:
-                action = 'IN'
-            else:
-                continue
-            dt = pd.to_datetime(row[col_date], errors='coerce')
-            if pd.isna(dt):
-                continue
-            symbol = str(row[col_symbol]).strip().upper()
-            if not symbol or symbol == 'NAN':
-                continue
-            events.append((dt.strftime('%Y-%m-%d'), f"{symbol}.NS", action))
-        except Exception:
-            continue
-
-    if not events:
-        print("Parsed the file but extracted zero usable NIFTY 50 events.")
-        if unmatched_index_names:
-            print(f"Unmatched index names seen: {sorted(unmatched_index_names)[:20]}")
-            print("Add the correct spelling to NSE_NIFTY50_ALIASES and rerun.")
-        return None
-
-    events.sort(key=lambda e: e[0])
-    earliest, latest = events[0][0], events[-1][0]
-    print(f"Parsed {len(events)} events, spanning {earliest} to {latest}.")
-
-    months_stale = (pd.Timestamp.now() - pd.Timestamp(latest)).days / 30.44
-    if months_stale > 8:
-        print(f"WARNING: latest event is ~{months_stale:.0f} months old -- archive may be stale "
-              f"(Nifty 50 rebalances ~every 6 months). Cross-check against today's live list.")
-    if earliest > START_DATE:
-        print(f"WARNING: earliest event ({earliest}) is after START_DATE ({START_DATE}) -- membership "
-              f"before {earliest} is extrapolated backward, unverified.")
-
-    try:
-        req = requests.get("https://archives.nseindia.com/content/indices/ind_nifty50list.csv",
-                           headers=headers, timeout=10)
-        req.raise_for_status()
-        today_df = pd.read_csv(io.StringIO(req.text))
-        today_set = {f"{s}.NS" for s in today_df['Symbol']}
-    except Exception as e:
-        print(f"Could not fetch today's live list to anchor the reconstruction ({e}). Aborting.")
-        return None
-    print(f"Anchored to today's live list: {len(today_set)} symbols.")
-
-    # Roll backward from today, undoing one event at a time.
-    working_set = set(today_set)
-    pit = {}
-    today_str = pd.Timestamp.now().strftime('%Y-%m-%d')
-    pit[today_str] = sorted(working_set)
-    for date_str, symbol, action in reversed(events):
-        pit[date_str] = sorted(working_set)
-        if action == 'IN':
-            working_set.discard(symbol)
-        else:
-            working_set.add(symbol)
-    pit[START_DATE] = sorted(working_set)
-
-    with open(output_file, 'w') as f:
-        json.dump(pit, f, indent=2)
-    print(f"Wrote {len(pit)} membership snapshots to {output_file}.")
-    print("Next 50 / Midcap 150 still default to 'always eligible'. Spot-check before real use.")
-    return output_file
+    df = pd.DataFrame(rows, columns=[
+        'OpenTime', 'Open', 'High', 'Low', 'Close', 'Volume', 'CloseTime',
+        'QuoteVol', 'Trades', 'TakerBaseVol', 'TakerQuoteVol', 'Ignore'
+    ])
+    df['Date'] = pd.to_datetime(df['OpenTime'], unit='ms').dt.normalize()
+    for col in ['Open', 'High', 'Low', 'Close']:
+        df[col] = df[col].astype(float)
+    df = df[['Date', 'Open', 'High', 'Low', 'Close']].drop_duplicates('Date').set_index('Date')
+    return df
 
 
-# ==========================================
-# 5. DATA PREPARATION
-# ==========================================
+def prepare_matrix_data(tickers, data_dir="data_crypto"):
+    if not os.path.exists(data_dir):
+        os.makedirs(data_dir)
 
-def build_eligibility_mask(master_dates, stock_names, n_days, n_stocks):
-    """Returns (n_days, n_stocks) bool array: True if a stock may be a NEW
-    entry on that date. Defaults to all-True unless POINT_IN_TIME_UNIVERSE_FILE
-    points at a real reconstructed-membership file (existing positions are
-    never force-closed on removal)."""
-    mask = np.ones((n_days, n_stocks), dtype=np.bool_)
-    if not POINT_IN_TIME_UNIVERSE_FILE or not os.path.exists(POINT_IN_TIME_UNIVERSE_FILE):
-        return mask
-    try:
-        with open(POINT_IN_TIME_UNIVERSE_FILE, 'r') as f:
-            pit = json.load(f)
-    except Exception as e:
-        print(f"Could not load point-in-time universe file ({e}); using all-eligible default.")
-        return mask
-
-    sorted_dates = sorted(pit.keys())
-    name_to_idx = {name: i for i, name in enumerate(stock_names)}
-    cursor = 0
-    current_set = set()
-    for d_idx, dt in enumerate(master_dates):
-        dt_str = dt.strftime('%Y-%m-%d')
-        while cursor < len(sorted_dates) and sorted_dates[cursor] <= dt_str:
-            current_set = set(pit[sorted_dates[cursor]])
-            cursor += 1
-        if not current_set:
-            continue
-        mask[d_idx, :] = False
-        for tkr in current_set:
-            if tkr in name_to_idx:
-                mask[d_idx, name_to_idx[tkr]] = True
-    return mask
-
-
-def prepare_matrix_data(tickers):
-    if not os.path.exists("data"): os.makedirs("data")
     raw_dfs      = {}
     master_dates = set()
 
-    for ticker in tqdm(tickers, desc="Downloading Data"):
-        file_path = f"data/{ticker}.csv"
+    for ticker in tqdm(tickers, desc="Downloading Binance klines"):
+        file_path = f"{data_dir}/{ticker}.csv"
         if os.path.exists(file_path):
             df = pd.read_csv(file_path, parse_dates=['Date'], index_col='Date')
         else:
-            try:
-                df = yf.download(ticker, start=START_DATE, progress=False, multi_level_index=False)
-                if len(df) > 200: df.to_csv(file_path)
-            except Exception: continue
-        # A currently-listed stock with <500 trading days of history is
-        # dropped entirely here -- a second, distinct exclusion on top of
-        # the disclosed survivorship bias above (nothing to backfill it with).
-        if df is not None and len(df) > 500:
+            df = _binance_download_klines(ticker, START_DATE)
+            if df is not None and len(df) > 200:
+                df.to_csv(file_path)
+        if df is not None and len(df) >= MIN_HISTORY_DAYS:
             raw_dfs[ticker] = df
             master_dates.update(df.index)
-
-    nifty_path = "data/NIFTY_BENCHMARK.csv"
-    if os.path.exists(nifty_path):
-        nifty_df = pd.read_csv(nifty_path, parse_dates=['Date'], index_col='Date')
-    else:
-        nifty_df = yf.download("^NSEI", start=START_DATE, progress=False, multi_level_index=False)
-        nifty_df.to_csv(nifty_path)
+        elif ticker == 'BTCUSDT':
+            raise RuntimeError("Could not download BTCUSDT history.")
 
     master_dates = sorted(list(master_dates))
     master_df    = pd.DataFrame(index=master_dates)
-    master_df['Month'] = master_df.index.month
-    master_df['Year']  = master_df.index.year
-
-    nifty_reindexed = nifty_df.reindex(master_dates).ffill()
-    index_closes    = nifty_reindexed['Close'].values.flatten().astype(np.float64)
+    master_df['Year'] = master_df.index.year
 
     n_days   = len(master_dates)
-    n_stocks = len(raw_dfs)
+    stock_names = ['BTCUSDT'] + [t for t in raw_dfs.keys() if t != 'BTCUSDT']
+    n_stocks = len(stock_names)
 
-    opens        = np.zeros((n_days, n_stocks))
-    highs        = np.zeros((n_days, n_stocks))
-    lows         = np.zeros((n_days, n_stocks))
-    closes       = np.zeros((n_days, n_stocks))
-    atr_matrix   = np.zeros((n_days, n_stocks))
-    adx_matrix   = np.zeros((n_days, n_stocks))
-    is_div_stock = np.zeros(n_stocks, dtype=np.bool_)
-    stock_names  = list(raw_dfs.keys())
+    opens      = np.zeros((n_days, n_stocks))
+    highs      = np.zeros((n_days, n_stocks))
+    lows       = np.zeros((n_days, n_stocks))
+    closes     = np.zeros((n_days, n_stocks))
+    atr_matrix = np.zeros((n_days, n_stocks))
+    adx_matrix = np.zeros((n_days, n_stocks))
 
-    for i, ticker in enumerate(tqdm(stock_names, desc="Building Matrix")):
+    for i, ticker in enumerate(tqdm(stock_names, desc="Building matrix")):
         df = raw_dfs[ticker].reindex(master_dates)
-        # yfinance's default (auto_adjust=True) already returns
-        # split/dividend-adjusted OHLC and omits 'Adj Close' -- this
-        # handles both the new and old yfinance default.
-        close_col = df['Adj Close'] if 'Adj Close' in df.columns else df['Close']
-        # ffill only fills gaps within a stock's own trading history
-        # (holidays etc.) -- genuine pre-listing rows stay NaN, which
-        # calc_ma/calc_adx handle correctly via their NaN-scan.
         opens[:,  i] = df['Open'].ffill().values
         highs[:,  i] = df['High'].ffill().values
         lows[:,   i] = df['Low'].ffill().values
-        closes[:, i] = close_col.ffill().values
+        closes[:, i] = df['Close'].ffill().values
         atr_matrix[:, i] = calc_atr_wilder(highs[:, i], lows[:, i], closes[:, i], period=14)
         adx_matrix[:, i] = calc_adx(highs[:, i], lows[:, i], closes[:, i], period=14)
-        if ticker in DIVIDEND_KINGS_FALLBACK:
-            is_div_stock[i] = True
 
-    eligible_mask = build_eligibility_mask(master_dates, stock_names, n_days, n_stocks)
+    assert stock_names[0] == 'BTCUSDT'
+
+    eligible_mask = build_eligibility_mask(n_days, n_stocks)
     years_arr = master_df['Year'].values.astype(np.int32)
 
-    return (opens, closes, atr_matrix, adx_matrix,
-            master_df['Month'].values, index_closes,
-            is_div_stock, stock_names, eligible_mask, years_arr)
+    return (opens, closes, atr_matrix, adx_matrix, years_arr,
+            stock_names, eligible_mask, master_dates)
 
 
 # ==========================================
-# 5b. YEARLY BREAKDOWN (ported from the crypto engine -- feeds recency
-# weighting, the consistency term, the regime term, AND the profit-
-# concentration hard gate). Unlike the crypto engine, this reuses a SINGLE
-# cash-flow ledger for both the strategy and Nifty instead of two separate
-# ones -- stock has no SIP-withholding mechanic, so strategy and benchmark
-# cash flows land on identical days/amounts by construction, and a second
-# ledger would just be unused complexity. If a withhold-style mechanic is
-# ever added here, this needs the same benchmark-ledger split the crypto
-# engine has -- see the CHANGELOG note on this exact question.
+# 6. EVALUATE PARAMS -- runs every coin independently, aggregates the
+#    trade log, scores it.
 # ==========================================
 
-def compute_yearly_breakdown(daily_port_val, daily_bench_val, years_arr,
-                              cf_days, cf_amounts, cf_cnt,
-                              start_day, end_day):
-    """For every calendar year touched by [start_day, end_day), compute the
-    strategy's and Nifty's money-weighted IRR for that year alone (bookend
-    the year's start/end value as synthetic cash flows, plus whatever real
-    SIP cash flows landed inside that year), nominal $ profit (for the
-    concentration gate), and coverage_frac (a partial first/last year
-    counts less, both for recency weighting and the concentration gate's
-    denominator)."""
-    day_years = years_arr[start_day:end_day]
-    if len(day_years) == 0:
-        return []
-    unique_years = sorted(set(int(y) for y in day_years))
+_ZERO_CACHE = {}
 
-    cf_days_arr = np.array(cf_days[:cf_cnt])
-    cf_amts_arr = np.array(cf_amounts[:cf_cnt])
+def _zeros_like(n_days):
+    if n_days not in _ZERO_CACHE:
+        _ZERO_CACHE[n_days] = np.zeros(n_days)
+    return _ZERO_CACHE[n_days]
 
-    out = []
-    for yr in unique_years:
-        yr_day_idxs = np.where(day_years == yr)[0] + start_day
-        if len(yr_day_idxs) < 5:
+
+def evaluate_params_signal(p, opens, closes, atr, adx, years_arr,
+                            n_stocks, start_day=0, end_day=-1, is_oos=False,
+                            min_years_required=None):
+    n_days = closes.shape[0]
+    if end_day < 0: end_day = n_days - 1
+
+    entry_type = p['entry_type']
+    exit_type  = p['exit_type']
+    use_btc_entry_gate  = p['use_btc_entry_gate']
+    use_btc_exit_override = p['use_btc_exit_override']
+    use_rsi_trend_filter  = p['use_rsi_trend_filter']
+
+    zeros = _zeros_like(n_days)
+
+    # -- entry-side indicator arrays, computed only if needed --
+    entry_ma_all    = None
+    xover_short_all = None
+    xover_long_all  = None
+    rsi_fast_all    = None
+    rsi_slow_all    = None
+    rsi_trend_all   = None
+
+    if entry_type == ENTRY_MA_BREAKOUT:
+        entry_ma_all = np.zeros((n_days, n_stocks))
+        for s in range(n_stocks):
+            entry_ma_all[:, s] = get_ma_cached(closes, s, p['entry_ma_len'], p['entry_ma_type'])
+    elif entry_type == ENTRY_RSI_XOVER:
+        rsi_fast_all = np.zeros((n_days, n_stocks))
+        rsi_slow_all = np.zeros((n_days, n_stocks))
+        for s in range(n_stocks):
+            rsi_fast_all[:, s] = get_smoothed_rsi(closes, s, p['rsi_f_len'], p['rsi_f_smt'])
+            rsi_slow_all[:, s] = get_smoothed_rsi(closes, s, p['rsi_s_len'], p['rsi_s_smt'])
+        if use_rsi_trend_filter:
+            rsi_trend_all = np.zeros((n_days, n_stocks))
+            for s in range(n_stocks):
+                rsi_trend_all[:, s] = get_ma_cached(closes, s, p['rsi_trend_ma_len'], p['rsi_trend_ma_type'])
+    elif entry_type == ENTRY_MA_XOVER:
+        xover_short_all = np.zeros((n_days, n_stocks))
+        xover_long_all  = np.zeros((n_days, n_stocks))
+        for s in range(n_stocks):
+            xover_short_all[:, s] = get_ma_cached(closes, s, p['xover_short_len'], p['xover_short_type'])
+            xover_long_all[:, s]  = get_ma_cached(closes, s, p['xover_long_len'], p['xover_long_type'])
+
+    # -- exit-side indicator arrays --
+    exit_ma_all         = None
+    exit_xover_short_all = None
+    exit_xover_long_all  = None
+    exit_rsi_fast_all    = None
+    exit_rsi_slow_all    = None
+
+    if exit_type == EXIT_MA_CROSSUNDER:
+        exit_ma_all = np.zeros((n_days, n_stocks))
+        for s in range(n_stocks):
+            exit_ma_all[:, s] = get_ma_cached(closes, s, p['exit_ma_len'], p['exit_ma_type'])
+    elif exit_type == EXIT_RSI_CROSSUNDER:
+        exit_rsi_fast_all = np.zeros((n_days, n_stocks))
+        exit_rsi_slow_all = np.zeros((n_days, n_stocks))
+        for s in range(n_stocks):
+            exit_rsi_fast_all[:, s] = get_smoothed_rsi(closes, s, p['exit_rsi_f_len'], p['exit_rsi_f_smt'])
+            exit_rsi_slow_all[:, s] = get_smoothed_rsi(closes, s, p['exit_rsi_s_len'], p['exit_rsi_s_smt'])
+    elif exit_type == EXIT_MA_XOVER_EXIT:
+        exit_xover_short_all = np.zeros((n_days, n_stocks))
+        exit_xover_long_all  = np.zeros((n_days, n_stocks))
+        for s in range(n_stocks):
+            exit_xover_short_all[:, s] = get_ma_cached(closes, s, p['exit_xover_short_len'], p['exit_xover_short_type'])
+            exit_xover_long_all[:, s]  = get_ma_cached(closes, s, p['exit_xover_long_len'], p['exit_xover_long_type'])
+
+    # -- BTC regime arrays (only if either toggle uses them) --
+    if use_btc_entry_gate or use_btc_exit_override:
+        btc_ma_all = get_ma_cached(closes, 0, p['btc_ma_len'], p['btc_ma_type'])
+    else:
+        btc_ma_all = zeros
+    btc_close_col = closes[:, 0]
+
+    all_entry_day, all_exit_day, all_entry_price, all_exit_price = [], [], [], []
+    all_r, all_pct, all_bars, all_stock_idx, all_layers = [], [], [], [], []
+    max_pyramid_layers = int(p.get('max_pyramid_layers', 1))
+
+    for s in range(n_stocks):
+        entry_ma    = entry_ma_all[:, s]    if entry_ma_all    is not None else zeros
+        xover_short = xover_short_all[:, s] if xover_short_all is not None else zeros
+        xover_long  = xover_long_all[:, s]  if xover_long_all  is not None else zeros
+        rsi_fast    = rsi_fast_all[:, s]    if rsi_fast_all    is not None else zeros
+        rsi_slow    = rsi_slow_all[:, s]    if rsi_slow_all    is not None else zeros
+        rsi_trend   = rsi_trend_all[:, s]   if rsi_trend_all   is not None else zeros
+        exit_ma          = exit_ma_all[:, s]          if exit_ma_all          is not None else zeros
+        exit_xover_short = exit_xover_short_all[:, s] if exit_xover_short_all is not None else zeros
+        exit_xover_long  = exit_xover_long_all[:, s]  if exit_xover_long_all  is not None else zeros
+        exit_rsi_fast    = exit_rsi_fast_all[:, s]    if exit_rsi_fast_all    is not None else zeros
+        exit_rsi_slow    = exit_rsi_slow_all[:, s]    if exit_rsi_slow_all    is not None else zeros
+
+        result = simulate_signal_trades(
+            opens[:, s], closes[:, s], atr[:, s], adx[:, s],
+            entry_ma, xover_short, xover_long,
+            rsi_fast, rsi_slow, rsi_trend,
+            btc_close_col, btc_ma_all,
+            exit_ma, exit_xover_short, exit_xover_long,
+            exit_rsi_fast, exit_rsi_slow,
+            entry_type, exit_type,
+            use_btc_entry_gate, use_btc_exit_override, use_rsi_trend_filter,
+            p.get('adx_thresh', 0.0),
+            p['sl_mult'], p['tp_mult'], p['trail_mult'], p['trail_pct'], p['exit_atr_mult'],
+            max_pyramid_layers,
+            int(start_day), int(end_day)
+        )
+        (e_day, x_day, e_price, x_price, r_mult, pct_ret, bars, layers) = result
+        if len(e_day) == 0:
             continue
-        y_start, y_end = int(yr_day_idxs[0]), int(yr_day_idxs[-1])
+        # only keep trades whose entry AND exit both land inside the window
+        mask = (e_day >= start_day) & (x_day < end_day)
+        if not mask.any():
+            continue
+        all_entry_day.append(e_day[mask])
+        all_exit_day.append(x_day[mask])
+        all_entry_price.append(e_price[mask])
+        all_exit_price.append(x_price[mask])
+        all_r.append(r_mult[mask])
+        all_pct.append(pct_ret[mask])
+        all_bars.append(bars[mask])
+        all_layers.append(layers[mask])
+        all_stock_idx.append(np.full(mask.sum(), s, dtype=np.int32))
 
-        port_start_val  = daily_port_val[max(y_start - 1, start_day)]
-        port_end_val    = daily_port_val[y_end]
-        bench_start_val = daily_bench_val[max(y_start - 1, start_day)]
-        bench_end_val   = daily_bench_val[y_end]
+    if not all_r:
+        return -999.0, {}
 
-        mask = (cf_days_arr >= y_start) & (cf_days_arr <= y_end)
-        year_cf_days    = list(cf_days_arr[mask])
-        year_cf_amounts = list(cf_amts_arr[mask])
-        port_cf_days     = [y_start] + year_cf_days + [y_end]
-        port_cf_amounts  = [-port_start_val] + year_cf_amounts + [port_end_val]
-        bench_cf_days    = [y_start] + year_cf_days + [y_end]
-        bench_cf_amounts = [-bench_start_val] + year_cf_amounts + [bench_end_val]
+    entry_days   = np.concatenate(all_entry_day)
+    exit_days    = np.concatenate(all_exit_day)
+    entry_prices = np.concatenate(all_entry_price)
+    exit_prices  = np.concatenate(all_exit_price)
+    r_multiple   = np.concatenate(all_r)
+    pct_return   = np.concatenate(all_pct)
+    bars_held    = np.concatenate(all_bars)
+    layers_used  = np.concatenate(all_layers)
+    stock_idx    = np.concatenate(all_stock_idx)
+    entry_years  = years_arr[entry_days]
 
-        port_irr, port_ok   = money_weighted_annual_return(port_cf_days, port_cf_amounts)
-        bench_irr, bench_ok = money_weighted_annual_return(bench_cf_days, bench_cf_amounts)
+    # window's own year span, for recency weighting -- deliberately based
+    # on every DAY in [start_day, end_day), not just years the strategy
+    # happened to trade in. A strategy that only ever entered once, early,
+    # and never traded again should NOT get treated as "perfectly recent"
+    # just because it has a single data point -- recency is measured
+    # against the actual calendar span being evaluated.
+    window_years = years_arr[start_day:end_day]
+    global_min_year = int(window_years.min())
+    global_max_year = int(window_years.max())
 
-        nominal_contrib = sum(-a for a in year_cf_amounts if a < 0)
-        nominal_profit  = (port_end_val - port_start_val) - nominal_contrib
-        coverage_frac   = min(1.0, len(yr_day_idxs) / YEAR_FULL_COVERAGE_DAYS)
-
-        out.append({
-            'year': yr,
-            'port_irr': port_irr if port_ok else 0.0,
-            'bench_irr': bench_irr if bench_ok else 0.0,
-            'nominal_profit': nominal_profit,
-            'coverage_frac': coverage_frac,
-            'days': len(yr_day_idxs),
-        })
-    return out
-
-
-def _recency_weight(year, min_year, max_year):
-    if max_year <= min_year:
-        return RECENCY_WEIGHT_MAX
-    frac = (year - min_year) / (max_year - min_year)
-    return RECENCY_WEIGHT_MIN + (RECENCY_WEIGHT_MAX - RECENCY_WEIGHT_MIN) * frac
+    return compute_score_signal(r_multiple, pct_return, bars_held, entry_years,
+                                 stock_idx, entry_days, exit_days,
+                                 entry_prices, exit_prices, layers_used,
+                                 global_min_year, global_max_year, is_oos=is_oos,
+                                 min_years_required=min_years_required)
 
 
 # ==========================================
-# 6. SCORING FUNCTION
+# 7. SCORING (trade-log based)
 # ==========================================
-# score = Calmar*0.30 + Sortino(cap4)*0.10 + IR*0.30 + EV_in_R*0.15
-#         + WinRate_bonus*0.15, scaled by stat_confidence * drawdown_penalty.
-# Calmar uses the money-weighted IRR, not lump-sum CAGR.
 
-def compute_score_v4(metrics, yearly, is_oos=False):
+def compute_naive_risk_metrics(entry_days, exit_days, r_multiple,
+                                risk_per_trade_pct=NAIVE_RISK_PCT_PER_TRADE):
     """
-    score = [ Calmar*0.20 + Sortino(cap4)*0.10 + IR*0.20 + EV_in_R*0.10
-              + WinRate_bonus*0.10 + Consistency*0.20 + Regime*0.10 ]
-            * stat_confidence * drawdown_penalty
+    Advisory, trade-log-only proxies for portfolio-level risk -- NOT a real
+    portfolio simulation (that's crypto_portfolio_optimizer.py's job; this
+    has no position sizing, concurrency limits, or capital constraints).
+    Exists because trade-level stats (SQN, expectancy, profit factor) are
+    computed on an unordered bag of R-multiples and can look perfectly
+    healthy even when losses cluster together in calendar time -- which a
+    real, capital-constrained portfolio would feel as a brutal, correlated
+    drawdown. Cheap enough to run on every scored trial.
 
-    CONSISTENCY and REGIME are ported from the crypto engine unchanged in
-    formula (see that file's compute_score_crypto docstring for the full
-    derivation) -- recency-weighted per-calendar-year IRR consistency, and
-    a bull/bear split scored against Nifty's own annual return that year.
-
-    HARD GATES: same as before, PLUS a new profit-concentration gate -- if
-    any single calendar year accounts for more than CONCENTRATION_GATE
-    (55%) of total nominal profit, the trial is rejected outright,
-    independent of everything else. The recency weighting softens the
-    SCORE; this gate refuses to deploy the extreme cases at all.
+    Returns a dict with:
+      naive_max_dd, naive_ulcer_index, naive_total_return -- from a naive
+        fixed-fractional-risk equity curve, trades applied in EXIT-day
+        order (ignores real concurrency, so this is a LOWER bound on real
+        drawdown if trades genuinely overlap -- see estimate_naive_drawdown
+        note in run_optimization for the same caveat).
+      max_consecutive_losses -- longest run of consecutive losing trades
+        in exit-day order.
+      max_concurrent_open, max_concurrent_losers, worst_day_loser_fraction
+        -- a sweep over calendar days (using entry_day..exit_day as each
+        trade's "open" window) to find the single most-correlated moment:
+        how many trades were open at once, how many of those were eventual
+        losers, and what fraction that represents.
     """
-    roi            = metrics['roi']
-    bench_roi      = metrics['bench_roi']
-    sortino        = metrics['sortino']
-    ir             = metrics['ir']
-    max_dd         = abs(metrics['max_dd'])
-    trades         = metrics['trades']
-    avg_runup      = metrics['avg_runup']
-    avg_loss       = abs(metrics['avg_loss'])
-    month_cnt      = metrics['month_cnt']
-    winning_trades = metrics['winning_trades']
-    losing_trades  = metrics['losing_trades']
-    annual_return  = metrics['annual_return']
+    n = len(r_multiple)
+    empty = {
+        'naive_max_dd': 0.0, 'naive_ulcer_index': 0.0, 'naive_total_return': 0.0,
+        'max_consecutive_losses': 0, 'expected_streak': 0.0, 'streak_ratio': 0.0,
+        'max_concurrent_open': 0, 'max_concurrent_losers': 0,
+        'worst_day_loser_fraction': 0.0,
+    }
+    if n == 0:
+        return empty
+    entry_days = np.asarray(entry_days)
+    exit_days = np.asarray(exit_days)
+    r = np.asarray(r_multiple, dtype=np.float64)
 
-    target_trades = max(15, MIN_TRADES_GATE * (WFO_OOS_PCT / WFO_IS_PCT)) if is_oos else MIN_TRADES_GATE
-    target_months = max(12, MIN_MONTHS_GATE * (WFO_OOS_PCT / WFO_IS_PCT)) if is_oos else MIN_MONTHS_GATE
+    # -- naive fixed-fractional equity curve: max drawdown + Ulcer Index --
+    order = np.argsort(exit_days)
+    r_sorted = r[order]
+    equity = 1.0
+    peak = 1.0
+    max_dd = 0.0
+    dd_sq_sum = 0.0
+    for rr in r_sorted:
+        equity *= (1.0 + rr * risk_per_trade_pct)
+        equity = max(equity, 1e-6)
+        if equity > peak:
+            peak = equity
+        dd = (peak - equity) / peak
+        if dd > max_dd:
+            max_dd = dd
+        dd_sq_sum += dd * dd
+    ulcer_index = math.sqrt(dd_sq_sum / n)
+    naive_total_return = equity - 1.0
 
-    if trades    < target_trades: return -999.0
-    if month_cnt < target_months: return -999.0
-    if max_dd    > 0.50:          return -999.0
-    if metrics['pf'] < 1.10:     return -999.0
-    if roi       <= 0:            return -999.0
-    if roi       < bench_roi * BENCH_OUTPERFORMANCE_MULT: return -999.0
-    if avg_loss  <= 0:            return -999.0
-    if not math.isfinite(annual_return): return -999.0
+    # -- longest consecutive losing streak, compared to what's statistically
+    #    expected at this trial's own loss rate (Erdos-Renyi longest-run
+    #    approximation) so a healthy low-win-rate trend system doesn't get
+    #    unfairly flagged for behaving exactly as it should --
+    max_streak = 0
+    cur_streak = 0
+    for rr in r_sorted:
+        if rr < 0:
+            cur_streak += 1
+            if cur_streak > max_streak:
+                max_streak = cur_streak
+        else:
+            cur_streak = 0
+    loss_rate = float((r < 0).mean())
+    if 0.0 < loss_rate < 1.0 and n > 5:
+        expected_streak = math.log(n) / math.log(1.0 / loss_rate)
+    else:
+        expected_streak = 0.0
+    streak_ratio = (max_streak / expected_streak) if expected_streak > 0 else 0.0
 
-    total_trades_counted = winning_trades + losing_trades
-    actual_wr = winning_trades / total_trades_counted if total_trades_counted > 0 else 0.0
-    if actual_wr < MIN_WIN_RATE_GATE: return -999.0
+    # -- concurrent / correlated loss exposure: sweep-line over calendar
+    #    days using each trade's [entry_day, exit_day] as its open window --
+    day0 = int(entry_days.min())
+    day1 = int(exit_days.max()) + 2
+    span = day1 - day0 + 1
+    open_delta = np.zeros(span)
+    loser_delta = np.zeros(span)
+    losers_mask = r < 0
+    for i in range(n):
+        s = int(entry_days[i]) - day0
+        e = int(exit_days[i]) - day0 + 1
+        open_delta[s] += 1
+        open_delta[e] -= 1
+        if losers_mask[i]:
+            loser_delta[s] += 1
+            loser_delta[e] -= 1
+    open_curve = np.cumsum(open_delta)
+    loser_curve = np.cumsum(loser_delta)
+    peak_day = int(np.argmax(loser_curve))
+    max_concurrent_losers = int(loser_curve[peak_day])
+    worst_day_total_open = int(open_curve[peak_day])
+    max_concurrent_open = int(open_curve.max())
+    worst_day_loser_fraction = (max_concurrent_losers / worst_day_total_open
+                                 if worst_day_total_open > 0 else 0.0)
 
-    # NEW hard gate: profit concentration (ported from the crypto engine)
-    if yearly:
-        total_profit = sum(y['nominal_profit'] for y in yearly)
-        if total_profit > 0:
-            max_share = max(y['nominal_profit'] / total_profit for y in yearly)
-            if max_share > CONCENTRATION_GATE:
-                return -999.0
+    return {
+        'naive_max_dd': max_dd, 'naive_ulcer_index': ulcer_index,
+        'naive_total_return': naive_total_return,
+        'max_consecutive_losses': max_streak, 'expected_streak': expected_streak,
+        'streak_ratio': streak_ratio,
+        'max_concurrent_open': max_concurrent_open,
+        'max_concurrent_losers': max_concurrent_losers,
+        'worst_day_loser_fraction': worst_day_loser_fraction,
+    }
 
-    if max_dd < 0.001: max_dd = 0.001
-    calmar = annual_return / max_dd
 
-    ev      = actual_wr * avg_runup - (1.0 - actual_wr) * avg_loss
-    ev_in_r = ev / avg_loss
+def compute_score_signal(r_multiple, pct_return, bars_held, entry_years,
+                          stock_idx, entry_days, exit_days,
+                          entry_prices, exit_prices, layers_used,
+                          global_min_year, global_max_year, is_oos=False,
+                          min_years_required=None):
+    req_years = min_years_required if min_years_required is not None else MIN_YEARS_GATE
+    """
+    v1.2 SCORING -- adds recency weighting (v1.1 fixed the sum-vs-average
+    and outlier-domination bugs; see CHANGELOG at top of file).
 
-    wr_bonus = max(0.0, actual_wr - 0.50) * 4.0
+    RECENCY WEIGHTING: the consistency term is no longer a flat median
+    across years -- each year's average trade quality is weighted by how
+    RECENT that year is within the window being scored (weight ramps from
+    RECENCY_WEIGHT_MIN for the oldest year in the window to
+    RECENCY_WEIGHT_MAX for the most recent), then combined into a
+    weighted mean. A strategy whose profit came entirely from years 1-2 of
+    an 8-year window and did nothing since now scores WORSE on this term
+    than one with the same total edge spread evenly, or concentrated
+    recently -- directly targeting "made money early and then sat idle"
+    per your instruction. Critically, the year range used for the weights
+    is the WINDOW's actual span (global_min_year/global_max_year, passed
+    in from every day in [start_day,end_day), not just the years the
+    strategy happened to trade in) -- so a strategy with only one distant
+    trading year doesn't accidentally get treated as "perfectly recent"
+    just because it has no other data point to compare against.
+    median_yearly_avg_r is still computed and reported alongside as a
+    non-scored diagnostic, so you can see what the number would have been
+    without the recency tilt.
+    """
+    n_trades = len(r_multiple)
+    target_trades = max(15, int(MIN_TRADES_GATE * (WFO_OOS_PCT / WFO_IS_PCT))) if is_oos else MIN_TRADES_GATE
 
-    sortino_capped = min(sortino, 4.0)
+    r_capped = np.clip(r_multiple, -R_WINSORIZE_CAP, R_WINSORIZE_CAP)
 
-    ir_scaled = max(0.0, ir) * math.sqrt(max(1.0, month_cnt) / 12.0)
-    stat_conf = min(1.0, math.sqrt(trades / target_trades))
+    metrics = {
+        'trades': int(n_trades),
+        'r_multiple': r_capped,        # capped -- used for every stat below
+        'r_multiple_raw': r_multiple,  # UNCAPPED -- for diagnostics/reporting only
+        'pct_return': pct_return,
+        'bars_held': bars_held,
+        'entry_years': entry_years,
+        'stock_idx': stock_idx,
+        'entry_days': entry_days, 'exit_days': exit_days,
+        'entry_prices': entry_prices, 'exit_prices': exit_prices,
+        'layers_used': layers_used,
+    }
 
-    if max_dd <= 0.20:   dd_penalty = 1.0
-    elif max_dd <= 0.35: dd_penalty = 1.0 - (max_dd - 0.20) * 2.0
-    else:                dd_penalty = 0.70 * math.exp(-2.0 * (max_dd - 0.35))
+    if n_trades < target_trades:
+        return -999.0, metrics
 
-    # NEW: drop years whose coverage_frac is too low to trust an
-    # IRR-annualized figure from (ported from the crypto engine's decision
-    # #11). Only affects CONSISTENCY/REGIME below -- the concentration gate
-    # above uses raw nominal dollars and isn't subject to this distortion.
-    scoring_years = [y for y in yearly if y['coverage_frac'] >= MIN_YEAR_COVERAGE_FOR_SCORING]
+    distinct_years = sorted(set(int(y) for y in entry_years))
+    if len(distinct_years) < req_years:
+        return -999.0, metrics
 
-    # ── CONSISTENCY term ────────────────────────────────────────────────
-    consistency = 0.0
-    if scoring_years:
-        yrs = [y['year'] for y in scoring_years]
-        min_year, max_year = min(yrs), max(yrs)
-        w_list = [_recency_weight(y['year'], min_year, max_year) * y['coverage_frac'] for y in scoring_years]
-        r_list = [y['port_irr'] for y in scoring_years]
-        w_sum = sum(w_list)
-        if w_sum > 0:
-            mean_r = sum(w * r for w, r in zip(w_list, r_list)) / w_sum
-            var_r  = sum(w * (r - mean_r) ** 2 for w, r in zip(w_list, r_list)) / w_sum
-            std_r  = math.sqrt(max(0.0, var_r))
-            worst_r = min(r_list)
-            consistency = (mean_r - K_STD_PENALTY * std_r
-                           - K_WORST_PENALTY * max(0.0, -worst_r)) / max_dd
+    wins_mask = r_capped > 0
+    win_rate = float(wins_mask.mean())
+    if win_rate < MIN_WIN_RATE_GATE:
+        return -999.0, metrics
 
-    # ── REGIME term (bull/bear split by Nifty's OWN annual return) ───────
-    regime = 0.0
-    if scoring_years:
-        bull_ratios, bull_weights = [], []
-        bear_diffs,  bear_weights = [], []
-        sy_min_year = min(yr['year'] for yr in scoring_years)
-        sy_max_year = max(yr['year'] for yr in scoring_years)
-        for y in scoring_years:
-            w = _recency_weight(y['year'], sy_min_year, sy_max_year) * y['coverage_frac']
-            if y['bench_irr'] > BULL_YEAR_NIFTY_THRESHOLD:
-                ratio = y['port_irr'] / y['bench_irr'] if y['bench_irr'] != 0 else 0.0
-                bull_ratios.append(max(-1.0, min(3.0, ratio)))
-                bull_weights.append(w)
-            elif y['bench_irr'] < BEAR_YEAR_NIFTY_THRESHOLD:
-                diff = (y['port_irr'] - y['bench_irr']) / max_dd
-                bear_diffs.append(max(-2.0, min(2.0, diff)))
-                bear_weights.append(w)
-        bull_capture = (sum(r * w for r, w in zip(bull_ratios, bull_weights)) / sum(bull_weights)) if bull_weights else 0.0
-        bear_defense = (sum(d * w for d, w in zip(bear_diffs, bear_weights)) / sum(bear_weights)) if bear_weights else 0.0
-        regime = W_BULL_CAPTURE * bull_capture + W_BEAR_DEFENSE * bear_defense
+    gross_win  = float(r_capped[wins_mask].sum()) if wins_mask.any() else 0.0
+    gross_loss = float(-r_capped[~wins_mask].sum()) if (~wins_mask).any() else 0.0
+    profit_factor = (gross_win / gross_loss) if gross_loss > 0 else (999.0 if gross_win > 0 else 0.0)
+    if profit_factor < 1.10:
+        return -999.0, metrics
+
+    avg_win_r  = float(r_capped[wins_mask].mean()) if wins_mask.any() else 0.0
+    avg_loss_r = float(-r_capped[~wins_mask].mean()) if (~wins_mask).any() else 0.0
+    expectancy_r = win_rate * avg_win_r - (1.0 - win_rate) * avg_loss_r
+    if expectancy_r <= 0:
+        return -999.0, metrics
+
+    mean_r   = float(r_capped.mean())
+    median_r = float(np.median(r_capped))
+    std_r    = float(r_capped.std())
+    sqn = (mean_r / std_r) * math.sqrt(min(n_trades, 100)) if std_r > 0 else 0.0
+    sqn_capped = min(sqn, SQN_CAP)
+
+    # -- per-year average R (equal-weight scale, not a sum -- v1.1 fix) --
+    year_r_avg = {}
+    year_r_sum_raw = {}   # kept (uncapped) for the concentration diagnostic below
+    for yr in distinct_years:
+        yr_mask = entry_years == yr
+        year_r_avg[yr] = float(r_capped[yr_mask].mean())
+        year_r_sum_raw[yr] = float(r_multiple[yr_mask].sum())
+    median_yearly_avg_r = float(np.median(list(year_r_avg.values())))   # reported only, not scored
+
+    # -- recency-weighted average R (v1.2 -- THIS is what's scored) --
+    weights = [_recency_weight(yr, global_min_year, global_max_year) for yr in distinct_years]
+    w_sum = sum(weights)
+    recency_weighted_avg_r = (sum(w * year_r_avg[yr] for w, yr in zip(weights, distinct_years)) / w_sum
+                               if w_sum > 0 else median_yearly_avg_r)
+
+    # -- concentration diagnostics (SOFT penalty only, not a hard gate;
+    #    computed on RAW R since this is specifically about "did one crazy
+    #    trade/year/coin account for an outsized share of nominal profit",
+    #    which is exactly the thing capping would hide) --
+    total_r_raw = float(r_multiple.sum())
+    max_year_share = 0.0
+    max_coin_share = 0.0
+    if total_r_raw > 0:
+        max_year_share = max(v / total_r_raw for v in year_r_sum_raw.values())
+        coin_r_sums = {}
+        for c in np.unique(stock_idx):
+            coin_r_sums[int(c)] = float(r_multiple[stock_idx == c].sum())
+        max_coin_share = max(v / total_r_raw for v in coin_r_sums.values())
+
+    concentration_penalty = 1.0
+    if max_year_share > CONCENTRATION_SOFT_THRESHOLD or max_coin_share > CONCENTRATION_SOFT_THRESHOLD:
+        concentration_penalty = CONCENTRATION_PENALTY_MULT
+
+    # -- naive portfolio-risk penalties (see compute_naive_risk_metrics'
+    #    docstring): three independent, mild soft penalties, so a trial
+    #    that trips more than one gets a meaningfully lower score without
+    #    any single dimension being able to zero it out entirely --
+    risk_m = compute_naive_risk_metrics(entry_days, exit_days, r_multiple)
+    risk_penalty = 1.0
+    if risk_m['naive_max_dd'] > NAIVE_DD_SOFT_THRESHOLD:
+        risk_penalty *= NAIVE_DD_PENALTY_MULT
+    if risk_m['streak_ratio'] > STREAK_RATIO_SOFT_THRESHOLD:
+        risk_penalty *= STREAK_PENALTY_MULT
+    if (risk_m['max_concurrent_losers'] >= CORRELATED_LOSS_MIN_COUNT
+            and risk_m['worst_day_loser_fraction'] > CORRELATED_LOSS_FRACTION_THRESHOLD):
+        risk_penalty *= CORRELATED_LOSS_PENALTY_MULT
+
+    wr_bonus = max(0.0, win_rate - 0.50) * 4.0
+    stat_conf = min(1.0, math.sqrt(n_trades / target_trades))
 
     score = (
-        calmar         * W_CALMAR +
-        sortino_capped * W_SORTINO +
-        ir_scaled      * W_IR +
-        ev_in_r        * W_EV +
-        wr_bonus       * W_WR_BONUS +
-        consistency    * W_CONSISTENCY +
-        regime         * W_REGIME
-    ) * stat_conf * dd_penalty
+        sqn_capped              * W_SQN +
+        expectancy_r            * W_EXPECTANCY +
+        recency_weighted_avg_r  * W_RECENCY +
+        wr_bonus                * W_WR_BONUS
+    ) * stat_conf * concentration_penalty * risk_penalty
 
-    return score
+    # -- entry-date clustering diagnostic (separate from R-based concentration
+    #    above): what fraction of TRADE COUNT entered in the single busiest
+    #    calendar year, regardless of profitability. High avg_bars_held +
+    #    high entry clustering together are the signature of "found one
+    #    historical regime and rode it across several coins" rather than a
+    #    repeatable, frequently-firing signal. --
+    entry_year_counts = {}
+    for yr in distinct_years:
+        entry_year_counts[yr] = int((entry_years == yr).sum())
+    max_entry_year_concentration = max(entry_year_counts.values()) / n_trades if n_trades > 0 else 0.0
+
+    mean_pct = float(pct_return.mean()) if pct_return is not None else 0.0
+    median_pct = float(np.median(pct_return)) if pct_return is not None else 0.0
+    avg_layers = float(layers_used.mean()) if layers_used is not None and len(layers_used) > 0 else 1.0
+    pct_pyramided = float((layers_used > 1).mean()) if layers_used is not None and len(layers_used) > 0 else 0.0
+
+    metrics.update({
+        'win_rate': win_rate, 'profit_factor': profit_factor,
+        'avg_win_r': avg_win_r, 'avg_loss_r': avg_loss_r,
+        'expectancy_r': expectancy_r,
+        'mean_r': mean_r, 'median_r': median_r, 'std_r': std_r,
+        'mean_r_raw': float(r_multiple.mean()), 'median_r_raw': float(np.median(r_multiple)),
+        'mean_pct': mean_pct, 'median_pct': median_pct,
+        'max_single_trade_r': float(r_multiple.max()), 'min_single_trade_r': float(r_multiple.min()),
+        'sqn': sqn, 'sqn_capped': sqn_capped,
+        'median_yearly_avg_r': median_yearly_avg_r,          # reported diagnostic only
+        'recency_weighted_avg_r': recency_weighted_avg_r,    # this is what's scored
+        'year_r_avg': year_r_avg, 'year_r_sum_raw': year_r_sum_raw,
+        'year_weights': dict(zip(distinct_years, weights)),
+        'global_min_year': global_min_year, 'global_max_year': global_max_year,
+        'max_year_share': max_year_share, 'max_coin_share': max_coin_share,
+        'concentration_penalty': concentration_penalty,
+        'distinct_years': distinct_years,
+        'distinct_coins': int(len(np.unique(stock_idx))),
+        'avg_bars_held': float(bars_held.mean()) if n_trades > 0 else 0.0,
+        'entry_year_counts': entry_year_counts,
+        'max_entry_year_concentration': max_entry_year_concentration,
+        'avg_pyramid_layers': avg_layers, 'pct_trades_pyramided': pct_pyramided,
+        'risk_penalty': risk_penalty,
+        'naive_max_dd': risk_m['naive_max_dd'],
+        'naive_ulcer_index': risk_m['naive_ulcer_index'],
+        'max_consecutive_losses': risk_m['max_consecutive_losses'],
+        'streak_ratio': risk_m['streak_ratio'],
+        'max_concurrent_open': risk_m['max_concurrent_open'],
+        'max_concurrent_losers': risk_m['max_concurrent_losers'],
+        'worst_day_loser_fraction': risk_m['worst_day_loser_fraction'],
+    })
+    return score, metrics
 
 
-def diagnose_hard_gates(metrics, yearly, is_oos=False):
-    """Returns a list of (gate_name, value_str, threshold_str, passed:bool)
-    so a -999 rejection can be explained instead of just printed as -999."""
-    trades         = metrics['trades']
-    month_cnt      = metrics['month_cnt']
-    max_dd         = abs(metrics['max_dd'])
-    pf             = metrics['pf']
-    roi            = metrics['roi']
-    bench_roi      = metrics['bench_roi']
-    avg_loss       = abs(metrics['avg_loss'])
-    winning_trades = metrics['winning_trades']
-    losing_trades  = metrics['losing_trades']
-    total = winning_trades + losing_trades
-    actual_wr = winning_trades / total if total > 0 else 0.0
-
-    target_trades = max(15, MIN_TRADES_GATE * (WFO_OOS_PCT / WFO_IS_PCT)) if is_oos else MIN_TRADES_GATE
-    target_months = max(12, MIN_MONTHS_GATE * (WFO_OOS_PCT / WFO_IS_PCT)) if is_oos else MIN_MONTHS_GATE
-
-    pf_str = "inf" if math.isinf(pf) else f"{pf:.2f}"
-
-    rows = [
-        ("Trades",     f"{trades}",           f">= {target_trades:.0f}",      trades >= target_trades),
-        ("Months",     f"{month_cnt}",         f">= {target_months:.0f}",      month_cnt >= target_months),
-        ("Max DD",     f"{max_dd*100:.1f}%",   "<= 50.0%",                    max_dd <= 0.50),
-        ("Profit Factor", pf_str,              ">= 1.10",                     pf >= 1.10),
-        ("ROI",        f"{roi*100:.1f}%",      "> 0%",                        roi > 0),
-        ("ROI vs Bench", f"{roi*100:.1f}%",
-         f"> {bench_roi*BENCH_OUTPERFORMANCE_MULT*100:.1f}% ({BENCH_OUTPERFORMANCE_MULT:.2f}x bench)",
-         roi >= bench_roi * BENCH_OUTPERFORMANCE_MULT),
-        ("Avg Loss",   f"{avg_loss*100:.1f}%", "> 0%",                        avg_loss > 0),
-        ("Win Rate",   f"{actual_wr*100:.1f}%", f">= {MIN_WIN_RATE_GATE*100:.0f}%", actual_wr >= MIN_WIN_RATE_GATE),
-    ]
-
-    if yearly:
-        total_profit = sum(y['nominal_profit'] for y in yearly)
-        if total_profit > 0:
-            max_share = max(y['nominal_profit'] / total_profit for y in yearly)
-            rows.append((f'Profit Concentration', f'{max_share*100:.1f}%',
-                         f'<= {CONCENTRATION_GATE*100:.0f}%', max_share <= CONCENTRATION_GATE))
-        else:
-            rows.append(('Profit Concentration', 'n/a (total profit <= 0)',
-                         f'<= {CONCENTRATION_GATE*100:.0f}%', True))
-
+def diagnose_gates_signal(r_multiple, pct_return, bars_held, entry_years,
+                           stock_idx, is_oos=False):
+    """Same-order gate breakdown as compute_score_signal, for debugging a
+    -999 the way main.py's diagnose_gates does."""
+    n_trades = len(r_multiple)
+    target_trades = max(15, int(MIN_TRADES_GATE * (WFO_OOS_PCT / WFO_IS_PCT))) if is_oos else MIN_TRADES_GATE
+    rows = [('trades >= target', n_trades >= target_trades, n_trades, f'>= {target_trades}')]
+    if n_trades == 0:
+        return rows
+    distinct_years = sorted(set(int(y) for y in entry_years))
+    rows.append(('distinct years >= gate', len(distinct_years) >= MIN_YEARS_GATE,
+                 len(distinct_years), f'>= {MIN_YEARS_GATE}'))
+    wins_mask = r_multiple > 0
+    win_rate = float(wins_mask.mean())
+    rows.append(('win_rate >= floor', win_rate >= MIN_WIN_RATE_GATE,
+                 f'{win_rate*100:.1f}%', f'>= {MIN_WIN_RATE_GATE*100:.0f}%'))
+    gross_win  = float(r_multiple[wins_mask].sum()) if wins_mask.any() else 0.0
+    gross_loss = float(-r_multiple[~wins_mask].sum()) if (~wins_mask).any() else 0.0
+    profit_factor = (gross_win / gross_loss) if gross_loss > 0 else (999.0 if gross_win > 0 else 0.0)
+    rows.append(('profit_factor >= 1.10', profit_factor >= 1.10, f'{profit_factor:.2f}', '>= 1.10'))
+    avg_win_r  = float(r_multiple[wins_mask].mean()) if wins_mask.any() else 0.0
+    avg_loss_r = float(-r_multiple[~wins_mask].mean()) if (~wins_mask).any() else 0.0
+    expectancy_r = win_rate * avg_win_r - (1.0 - win_rate) * avg_loss_r
+    rows.append(('expectancy_R > 0', expectancy_r > 0, f'{expectancy_r:.3f}R', '> 0'))
     return rows
 
 
-def print_gate_diagnosis(metrics, yearly, is_oos=False, indent="  "):
-    """Prints which hard gate(s) a -999 rejection actually tripped."""
-    gates = diagnose_hard_gates(metrics, yearly, is_oos=is_oos)
-    failed = [g for g in gates if not g[3]]
-    print(f"{indent}Gate check (failures marked with *):")
-    for name, val, thresh, passed in gates:
-        mark = " " if passed else "*"
-        print(f"{indent}{mark} {name:<14} {val:>10}   need {thresh}")
-    if not failed:
-        print(f"{indent}(All gates technically passed -- rejection likely came from a "
-              f"non-finite annual_return, see irr_converged.)")
-
-
-# ==========================================
-# 7. EVALUATE PARAMS
-# ==========================================
-
-def evaluate_params(p, opens, closes, atr, adx, sip_trigger, index_closes, is_div_stock,
-                    eligible_mask, years_arr, start_day=0, end_day=-1, is_oos=False,
-                    starting_wealth=0.0, bench_starting_wealth=0.0):
-
-    if p['s_ma'] >= p['l_ma']: return -999.0, {}
-
-    n_days, n_stocks = closes.shape
-    if end_day < 0: end_day = n_days - 1
-
-    short_ma = np.zeros((n_days, n_stocks))
-    long_ma  = np.zeros((n_days, n_stocks))
-    super_ma = np.zeros((n_days, n_stocks))
-
-    for s in range(n_stocks):
-        short_ma[:, s] = get_ma_cached(closes, s, p['s_ma'],  p['t_s'])
-        long_ma[:,  s] = get_ma_cached(closes, s, p['l_ma'],  p['t_l'])
-        super_ma[:, s] = get_ma_cached(closes, s, p['sl_ma'], p['t_sl'])
-
-    # NEW: optional Nifty-regime panic-exit/entry filter (ported from the
-    # crypto engine's BTC filter, adapted so it only applies to growth
-    # stocks -- see module docstring). A single 1D MA over index_closes,
-    # cheap enough to not need its own cache the way per-stock MAs do.
-    use_nifty_filter = bool(p.get('use_nifty_filter', False))
-    nifty_ma = calc_ma(index_closes, int(p.get('nifty_ma_len', 50)), int(p.get('nifty_ma_type', 0)))
-
-    # NEW: optional watchlist-age ranking boost -- see module constants.
-    use_wl_age_weight = bool(p.get('use_wl_age_weight', False))
-    wl_age_weight     = float(p.get('wl_age_weight', 0.0))
-
-    result = simulate_portfolio(
-        opens, closes, atr, adx, sip_trigger, index_closes, is_div_stock,
-        short_ma, long_ma, super_ma, eligible_mask,
-        p['wl_rank'], p['entry_f'], p.get('adx_thresh', 0.0),
-        p['n_exit_m'], p['n_trail_p'], p['n_atr_m'],
-        p['div_exit_m'], p['div_exit_v'],
-        int(start_day), int(end_day),
-        float(starting_wealth), float(bench_starting_wealth),
-        BUY_COST_PCT, SELL_COST_PCT, DP_FLAT_FEE_RS, ANNUAL_CASH_YIELD,
-        nifty_ma, use_nifty_filter,
-        use_wl_age_weight, wl_age_weight
-    )
-
-    (f_wealth, f_bench, t_invested, wins, losses, trades,
-     winning_trades, losing_trades, avg_bars, avg_runup, avg_loss,
-     max_dd, max_dd_dur, sharpe, sortino, ir, month_cnt,
-     cf_days, cf_amounts, cf_cnt,
-     n_floor_clamps, cash_frac_sum, cash_frac_days, days_high_cash,
-     daily_port_val, daily_bench_val,
-     skew, kurt, valid_days) = result
-
-    if t_invested <= 0: return -999.0, {}
-
-    roi = (f_wealth - (starting_wealth + t_invested)) / (starting_wealth + t_invested) if (starting_wealth + t_invested) > 0 else 0.0
-    # bench_roi mirrors roi's own denominator (starting wealth + this
-    # window's contributions) so the "beat benchmark by 20%" gate compares
-    # like with like, instead of measuring the benchmark from zero on an
-    # OOS call where the strategy side carries forward IS-period capital.
-    # SAFE as a shared denominator here specifically because stock has no
-    # SIP-withholding mechanic -- Nifty and the strategy always receive the
-    # identical MONTHLY_SIP on the identical days, so t_invested IS what
-    # Nifty received too. See the section-5b comment for what would need to
-    # change if that ever stops being true.
-    bench_denom = bench_starting_wealth + t_invested
-    bench_roi   = (f_bench - bench_denom) / bench_denom if bench_denom > 0 else 0.0
-    pf          = wins / losses if losses > 0 else float('inf')
-
-    cf_days_list    = list(cf_days[:cf_cnt])
-    cf_amounts_list = list(cf_amounts[:cf_cnt])
-    annual_return, irr_converged = money_weighted_annual_return(cf_days_list, cf_amounts_list)
-    if not irr_converged:
-        capital_base = starting_wealth + t_invested
-        years = max(1.0, t_invested / (MONTHLY_SIP * 12))
-        annual_return = (f_wealth / capital_base) ** (1.0 / years) - 1.0 if capital_base > 0 else -1.0
-
-    avg_cash_frac      = (cash_frac_sum / cash_frac_days) if cash_frac_days > 0 else 0.0
-    pct_days_high_cash = (days_high_cash / cash_frac_days * 100.0) if cash_frac_days > 0 else 0.0
-
-    yearly = compute_yearly_breakdown(daily_port_val, daily_bench_val, years_arr,
-                                       cf_days, cf_amounts, cf_cnt,
-                                       int(start_day), int(end_day))
-
-    metrics = {
-        'roi': roi, 'bench_roi': bench_roi, 'alpha': roi - bench_roi,
-        'pf': pf, 'wealth': f_wealth, 'bench_wealth': f_bench,
-        'trades': trades, 'winning_trades': winning_trades, 'losing_trades': losing_trades,
-        'sharpe': sharpe, 'sortino': sortino, 'ir': ir,
-        'max_dd': max_dd, 'max_dd_dur': max_dd_dur,
-        'avg_bars': avg_bars, 'avg_runup': avg_runup, 'avg_loss': avg_loss,
-        't_invested': t_invested, 'month_cnt': month_cnt,
-        'starting_wealth': starting_wealth, 'bench_starting_wealth': bench_starting_wealth,
-        'annual_return': annual_return, 'irr_converged': irr_converged,
-        'cf_days': cf_days_list, 'cf_amounts': cf_amounts_list,
-        'n_floor_clamps': int(n_floor_clamps),
-        'avg_cash_frac': avg_cash_frac,
-        'pct_days_high_cash': pct_days_high_cash,
-        'yearly': yearly,
-        'skew': skew, 'kurtosis': kurt, 'valid_days': int(valid_days),
-    }
-
-    score = compute_score_v4(metrics, yearly, is_oos=is_oos)
-    return score, metrics
+def print_gate_diagnosis_signal(r_multiple, pct_return, bars_held, entry_years,
+                                 stock_idx, is_oos=False, label="GATE DIAGNOSIS"):
+    rows = diagnose_gates_signal(r_multiple, pct_return, bars_held, entry_years, stock_idx, is_oos)
+    print(f"\n{'-'*60}\n{label}\n{'-'*60}")
+    first_fail = False
+    for name, passed, actual, threshold in rows:
+        marker = "PASS" if passed else "FAIL"
+        print(f"  [{marker}] {name:<26} actual={actual!s:<10} needed {threshold}")
+        if not passed and not first_fail:
+            print("       ^-- this is the gate that produced the -999 score")
+            first_fail = True
+    print("-" * 60)
 
 
 # ==========================================
@@ -1681,97 +1761,31 @@ def evaluate_params(p, opens, closes, atr, adx, sip_trigger, index_closes, is_di
 # ==========================================
 
 def passes_neighborhood_check(p, base_score, opens, closes, atr, adx,
-                               sip_trigger, index_closes, is_div_stock, eligible_mask,
-                               years_arr, start_day, end_day):
-    """
-    Perturbs every parameter that's actually ACTIVE for this champion's
-    specific entry/exit configuration, not just s_ma/l_ma/n_trail_p/n_atr_m,
-    and requires the score to hold up within NEIGHBOR_THRESHOLD at each one.
+                               years_arr, n_stocks, start_day, end_day):
+    if base_score <= 0:
+        return True
 
-    Perturbations are built CONDITIONALLY on which mode is in use -- e.g.
-    n_trail_p is only perturbed if n_exit_m==1 actually reads it. Testing an
-    inactive parameter would trivially pass (the score can't change) and
-    silently understate how brittle the fit really is.
-    """
-    if base_score <= 0: return True
+    perturbations = []
+    if p['entry_type'] == ENTRY_MA_BREAKOUT:
+        perturbations += [{'entry_ma_len': p['entry_ma_len'] + 10},
+                           {'entry_ma_len': max(MA_LEN_MIN, p['entry_ma_len'] - 10)}]
+    elif p['entry_type'] == ENTRY_RSI_XOVER:
+        perturbations += [{'rsi_f_len': p['rsi_f_len'] + 5},
+                           {'rsi_s_len': p['rsi_s_len'] + 5}]
+    elif p['entry_type'] == ENTRY_MA_XOVER:
+        perturbations += [{'xover_short_len': p['xover_short_len'] + 10},
+                           {'xover_long_len': p['xover_long_len'] + 10}]
 
-    perturbations = [
-        {'s_ma': p['s_ma'] + 2, 'l_ma': p['l_ma'] + 2},
-        {'s_ma': p['s_ma'] - 2, 'l_ma': p['l_ma'] - 2},
-        {'s_ma': p['s_ma'] + 3, 'l_ma': p['l_ma'] - 3},
-    ]
-
-    # Super MA only matters for entry_f in {1,2} (momentum/pullback filter)
-    # or div_exit_m==1 (Super MA violation exit for dividend stocks).
-    if p['entry_f'] in (1, 2) or p['div_exit_m'] == 1:
-        perturbations += [
-            {'sl_ma': max(50, int(p['sl_ma'] * 0.95))},
-            {'sl_ma': int(p['sl_ma'] * 1.05)},
-        ]
-
-    # Growth-stock exit params only matter for the exit method actually active.
-    if p['n_exit_m'] == 1:
-        perturbations += [
-            {'n_trail_p': p['n_trail_p'] * 0.85},
-            {'n_trail_p': p['n_trail_p'] * 1.15},
-        ]
-    elif p['n_exit_m'] == 2:
-        perturbations += [
-            {'n_atr_m': p['n_atr_m'] * 0.80},
-            {'n_atr_m': p['n_atr_m'] * 1.20},
-        ]
-
-    # Dividend-stock exit value, scaled to whichever exit mode is active
-    # (peak-drawdown % and super-MA-violation % behave the same way;
-    # time-decay is a day count, so it's nudged additively instead).
-    if p['div_exit_m'] in (0, 1):
-        perturbations += [
-            {'div_exit_v': p['div_exit_v'] * 0.85},
-            {'div_exit_v': p['div_exit_v'] * 1.15},
-        ]
-    else:
-        perturbations += [
-            {'div_exit_v': max(1.0, p['div_exit_v'] - 10)},
-            {'div_exit_v': p['div_exit_v'] + 10},
-        ]
-
-    # ADX filter, nudged to a neighboring allowed value -- only if it's on.
-    if p.get('adx_thresh', 0.0) > 0.0:
-        adx_ladder = [15.0, 20.0, 25.0]
-        idx = adx_ladder.index(p['adx_thresh']) if p['adx_thresh'] in adx_ladder else 1
-        for neighbor_idx in (idx - 1, idx + 1):
-            if 0 <= neighbor_idx < len(adx_ladder):
-                perturbations.append({'adx_thresh': adx_ladder[neighbor_idx]})
-
-    # NEW: Nifty-regime filter, only perturbed if it's actually active --
-    # ported from the same conditional-perturbation principle as the ADX
-    # ladder above and the crypto engine's own use_btc_filter perturbation.
-    if p.get('use_nifty_filter', False):
-        perturbations += [
-            {'nifty_ma_len': max(10, int(p.get('nifty_ma_len', 50) * 0.90))},
-            {'nifty_ma_len': int(p.get('nifty_ma_len', 50) * 1.10)},
-        ]
-
-    # NEW: watchlist-age weight, only perturbed if it's actually active.
-    if p.get('use_wl_age_weight', False):
-        perturbations += [
-            {'wl_age_weight': max(0.0, p.get('wl_age_weight', 0.0) * 0.80)},
-            {'wl_age_weight': p.get('wl_age_weight', 0.0) * 1.20},
-        ]
+    perturbations += [{'sl_mult': p['sl_mult'] * 0.85}, {'sl_mult': p['sl_mult'] * 1.15}]
 
     for delta in perturbations:
         n_p = p.copy()
         n_p.update(delta)
-
-        if n_p['s_ma'] >= n_p['l_ma']: continue
-        if n_p['s_ma'] < 3:            continue
-        if n_p['l_ma'] > 200:          continue
-        if n_p.get('n_trail_p', 15) < 3: continue
-
-        n_score, _ = evaluate_params(n_p, opens, closes, atr, adx,
-                                     sip_trigger, index_closes, is_div_stock, eligible_mask,
-                                     years_arr, start_day, end_day, is_oos=False)
-        if n_score < base_score * NEIGHBOR_THRESHOLD: return False
+        n_score, _ = evaluate_params_signal(n_p, opens, closes, atr, adx,
+                                            years_arr, n_stocks,
+                                            start_day, end_day, is_oos=False)
+        if n_score < base_score * NEIGHBOR_THRESHOLD:
+            return False
     return True
 
 
@@ -1779,646 +1793,688 @@ def passes_neighborhood_check(p, base_score, opens, closes, atr, adx,
 # 9. WALK-FORWARD VALIDATION
 # ==========================================
 
-def run_wfo_validation(best_params, opens, closes, atr, adx,
-                       sip_trigger, index_closes, is_div_stock, eligible_mask, years_arr):
-    n_days    = closes.shape[0]
-    is_end    = int(n_days * WFO_IS_PCT)
+def run_wfo_validation(best_params, opens, closes, atr, adx, years_arr, n_stocks):
+    n_days = closes.shape[0]
+    is_end = int(n_days * WFO_IS_PCT)
     oos_start = is_end
 
     print("\n" + "=" * 60)
     print("WALK-FORWARD VALIDATION")
-    print(f"  In-Sample:     days 0-{is_end}      (~{is_end/252:.1f}y)")
-    print(f"  Out-of-Sample: days {oos_start}-{n_days}   (~{(n_days - oos_start)/252:.1f}y, never seen during search)")
+    print(f"   In-Sample days:     0 -> {is_end}")
+    print(f"   Out-of-Sample days: {oos_start} -> {n_days}")
     print("=" * 60)
 
-    is_score, is_m = evaluate_params(
-        best_params, opens, closes, atr, adx,
-        sip_trigger, index_closes, is_div_stock, eligible_mask, years_arr,
-        start_day=0, end_day=is_end, is_oos=False,
-        starting_wealth=0.0
-    )
+    is_score, is_m = evaluate_params_signal(best_params, opens, closes, atr, adx,
+                                             years_arr, n_stocks,
+                                             start_day=0, end_day=is_end, is_oos=False)
+    oos_score, oos_m = evaluate_params_signal(best_params, opens, closes, atr, adx,
+                                               years_arr, n_stocks,
+                                               start_day=oos_start, end_day=n_days - 1, is_oos=True)
 
-    is_end_wealth       = is_m.get('wealth', 0.0)      if is_score > -900 else 0.0
-    is_end_bench_wealth = is_m.get('bench_wealth', 0.0) if is_score > -900 else 0.0
-
-    oos_score, oos_m = evaluate_params(
-        best_params, opens, closes, atr, adx,
-        sip_trigger, index_closes, is_div_stock, eligible_mask, years_arr,
-        start_day=oos_start, end_day=n_days - 1, is_oos=True,
-        starting_wealth=is_end_wealth, bench_starting_wealth=is_end_bench_wealth
-    )
-
-    if oos_score <= -900:
-        robustness = -1.0   # categorical "hard gate failure" marker, not a ratio
-    elif is_score > 0:
-        robustness = oos_score / abs(is_score)
-    else:
-        robustness = 0.0
+    robustness = max(0.0, oos_score / is_score) if is_score > 0 and oos_score > 0 else 0.0
 
     if is_score > 0:
-        wt, lt = is_m.get('winning_trades', 0), is_m.get('losing_trades', 0)
-        wr = wt / (wt + lt) * 100 if (wt + lt) > 0 else 0.0
-        print(f"\nIn-Sample  Score: {is_score:.4f} | ROI: {is_m.get('roi', 0)*100:.1f}% | "
-              f"IRR: {is_m.get('annual_return', 0)*100:.1f}% | Sharpe: {is_m.get('sharpe', 0):.2f} | WinRate: {wr:.1f}%")
+        print(f"\nIn-Sample  Score: {is_score:.4f} | Trades: {is_m.get('trades',0)} | "
+              f"WinRate: {is_m.get('win_rate',0)*100:.1f}% | PF: {is_m.get('profit_factor',0):.2f} | "
+              f"ExpectancyR: {is_m.get('expectancy_r',0):.3f} | SQN: {is_m.get('sqn_capped',0):.2f} | "
+              f"MedianYearlyAvgR: {is_m.get('median_yearly_avg_r',0):.2f} | "
+              f"MeanR(raw): {is_m.get('mean_r_raw',0):.2f} | MedianR(raw): {is_m.get('median_r_raw',0):.2f}")
     else:
-        print(f"\nIn-Sample  Score: {is_score:.4f} (below gate)")
-        print_gate_diagnosis(is_m, is_m.get('yearly', []), is_oos=False)
+        r = is_m.get('r_multiple', np.array([]))
+        print_gate_diagnosis_signal(r, is_m.get('pct_return', np.array([])),
+                                    is_m.get('bars_held', np.array([])),
+                                    is_m.get('entry_years', np.array([])),
+                                    is_m.get('stock_idx', np.array([])),
+                                    is_oos=False, label="IN-SAMPLE GATE DIAGNOSIS")
 
-    if oos_score > 0:
-        wt, lt = oos_m.get('winning_trades', 0), oos_m.get('losing_trades', 0)
-        wr = wt / (wt + lt) * 100 if (wt + lt) > 0 else 0.0
-        print(f"Out-of-Sample Score: {oos_score:.4f} | ROI: {oos_m.get('roi', 0)*100:.1f}% | "
-              f"IRR: {oos_m.get('annual_return', 0)*100:.1f}% | Sharpe: {oos_m.get('sharpe', 0):.2f} | WinRate: {wr:.1f}%")
-        if oos_m.get('avg_cash_frac', 0) > 0.15:
-            print(f"  (NOTE: {oos_m['avg_cash_frac']*100:.0f}% of OOS portfolio value sat in cash on average, "
-                  f"{oos_m.get('pct_days_high_cash',0):.0f}% of days above {HIGH_CASH_FRACTION_THRESHOLD*100:.0f}% cash.)")
+    if oos_score > -900:
+        print(f"Out-of-Sample Score: {oos_score:.4f} | Trades: {oos_m.get('trades',0)} | "
+              f"WinRate: {oos_m.get('win_rate',0)*100:.1f}% | PF: {oos_m.get('profit_factor',0):.2f} | "
+              f"ExpectancyR: {oos_m.get('expectancy_r',0):.3f} | SQN: {oos_m.get('sqn_capped',0):.2f} | "
+              f"MedianYearlyAvgR: {oos_m.get('median_yearly_avg_r',0):.2f} | "
+              f"MeanR(raw): {oos_m.get('mean_r_raw',0):.2f} | MedianR(raw): {oos_m.get('median_r_raw',0):.2f}")
     else:
-        print(f"Out-of-Sample Score: {oos_score:.4f} (failed OOS hard gates)")
-        # This is the key fix: show WHICH gate(s) actually failed instead
-        # of leaving the reader to guess between 6+ possible causes.
-        if oos_m:
-            print_gate_diagnosis(oos_m, oos_m.get('yearly', []), is_oos=True)
-        else:
-            print("  (No metrics available -- likely s_ma >= l_ma or zero invested capital.)")
+        print(f"Out-of-Sample Score: {oos_score:.4f} (strategy failed on OOS data)")
+        r = oos_m.get('r_multiple', np.array([]))
+        print_gate_diagnosis_signal(r, oos_m.get('pct_return', np.array([])),
+                                    oos_m.get('bars_held', np.array([])),
+                                    oos_m.get('entry_years', np.array([])),
+                                    oos_m.get('stock_idx', np.array([])),
+                                    is_oos=True, label="OUT-OF-SAMPLE GATE DIAGNOSIS")
 
-    if robustness <= -1.0:
-        print("\nRobustness Ratio: N/A -- OOS failed a hard gate outright. REJECT.")
+    print(f"\nRobustness Ratio: {robustness:.1%}  ", end="")
+    if robustness >= 0.70:
+        print("EXCELLENT (>70%)")
+    elif robustness >= 0.50:
+        print("ACCEPTABLE (50-70%)")
+    elif robustness >= 0.30:
+        print("POOR (30-50%) -- likely overfit")
     else:
-        print(f"\nRobustness Ratio: {robustness:.1%}  ", end="")
-        if robustness >= 0.70:
-            print("EXCELLENT (>70%) -- deploy with confidence")
-        elif robustness >= ROBUSTNESS_DEPLOY_THRESHOLD:
-            print(f"ACCEPTABLE ({ROBUSTNESS_DEPLOY_THRESHOLD:.0%}-70%) -- deploy cautiously  <- meets save threshold")
-        elif robustness >= 0.30:
-            print(f"POOR (30%-{ROBUSTNESS_DEPLOY_THRESHOLD:.0%}) -- likely overfit, do not deploy  <- below save threshold")
-        else:
-            print("REJECT (<30%) -- heavily overfit, discard")
+        print("REJECT (<30%) -- heavily overfit")
 
-    return is_score, oos_score, oos_m, robustness, is_end_wealth
+    return is_score, oos_score, is_m, oos_m, robustness
 
 
-def report_subperiod_breakdown(best_params, opens, closes, atr, adx,
-                               sip_trigger, index_closes, is_div_stock, eligible_mask, years_arr,
-                               n_blocks=5):
-    """Re-evaluates the already-found champion on n_blocks contiguous
-    sub-windows of the full history (no re-optimization) -- checks whether
-    it's consistent across regimes or just lived/died in one lucky stretch."""
-    n_days = closes.shape[0]
-    edges = np.linspace(1, n_days - 1, n_blocks + 1).astype(int)
+def report_yearly_table(metrics, label="YEAR-BY-YEAR BREAKDOWN"):
+    year_r_avg = metrics.get('year_r_avg', {})
+    year_r_sum_raw = metrics.get('year_r_sum_raw', {})
+    entry_year_counts = metrics.get('entry_year_counts', {})
+    year_weights = metrics.get('year_weights', {})
+    if not year_r_avg:
+        print("\n(No yearly breakdown available.)")
+        return
+    print("\n" + "=" * 78)
+    print(label)
+    print("=" * 78)
+    print("(Note: a trade's full result is counted in the year it was ENTERED, even if")
+    print(" it was held for years -- a long-held trade can make one year look outsized.")
+    print(" 'Recency Wt' is how much that year counts toward the score -- higher for")
+    print(" more recent years, so profit from long ago counts for less.)")
+    print(f"{'Year':<8}{'# Trades':>10}{'Avg R/trade':>14}{'Recency Wt':>12}{'Total R (real)':>16}{'Share':>10}")
+    total_r_raw = sum(year_r_sum_raw.values())
+    for yr in sorted(year_r_avg):
+        share = (year_r_sum_raw[yr] / total_r_raw * 100.0) if total_r_raw > 0 else 0.0
+        print(f"{yr:<8}{entry_year_counts.get(yr,0):>10}{year_r_avg[yr]:>14.2f}"
+              f"{year_weights.get(yr,1.0):>12.2f}{year_r_sum_raw[yr]:>16.2f}{share:>9.1f}%")
+    print(f"\nRecency-weighted avg-R/trade (THE scored consistency term): "
+          f"{metrics.get('recency_weighted_avg_r', 0):.2f}")
+    print(f"  (For comparison, plain median across years with no recency tilt: "
+          f"{metrics.get('median_yearly_avg_r', 0):.2f} -- reported only, not scored)")
+    print(f"Max single-year share of total profit: {metrics.get('max_year_share',0)*100:.1f}%  "
+          f"(soft score penalty above {CONCENTRATION_SOFT_THRESHOLD*100:.0f}%)")
+    print(f"Max single-coin share of total profit: {metrics.get('max_coin_share',0)*100:.1f}%  "
+          f"(soft score penalty above {CONCENTRATION_SOFT_THRESHOLD*100:.0f}%)")
+    print(f"Distinct coins traded: {metrics.get('distinct_coins', 0)}")
 
-    print("\n" + "=" * 60)
-    print(f"SUB-PERIOD CONSISTENCY CHECK ({n_blocks} blocks, same champion params)")
-    print("=" * 60)
-    rows = []
-    for i in range(n_blocks):
-        s_day, e_day = int(edges[i]), int(edges[i + 1])
-        score, m = evaluate_params(
-            best_params, opens, closes, atr, adx,
-            sip_trigger, index_closes, is_div_stock, eligible_mask, years_arr,
-            start_day=s_day, end_day=e_day, is_oos=False, starting_wealth=0.0
-        )
-        rows.append((s_day, e_day, score, m))
-        if score > -900:
-            wt, lt = m.get('winning_trades', 0), m.get('losing_trades', 0)
-            wr = wt / (wt + lt) * 100 if (wt + lt) > 0 else 0.0
-            print(f"  Block {i+1} (days {s_day:5d}-{e_day:5d}, ~{(e_day-s_day)/252:.1f}y): "
-                  f"Score {score:7.3f} | IRR {m.get('annual_return',0)*100:6.1f}% | "
-                  f"Sharpe {m.get('sharpe',0):5.2f} | MaxDD {abs(m.get('max_dd',0))*100:5.1f}% | "
-                  f"WinRate {wr:5.1f}% | Trades {m.get('trades',0)}")
-        else:
-            print(f"  Block {i+1} (days {s_day:5d}-{e_day:5d}): below minimum-trades/months gate "
-                  f"for a block this short -- inconclusive, not a failure.")
-    return rows
+    avg_layers = metrics.get('avg_pyramid_layers', 1.0)
+    pct_pyr = metrics.get('pct_trades_pyramided', 0.0)
+    if avg_layers > 1.01 or pct_pyr > 0:
+        print(f"Pyramiding: avg {avg_layers:.2f} layers/trade, {pct_pyr*100:.0f}% of trades added at least one layer")
+
+    mean_pct, med_pct = metrics.get('mean_pct', 0)*100, metrics.get('median_pct', 0)*100
+    mean_raw, med_raw = metrics.get('mean_r_raw', 0), metrics.get('median_r_raw', 0)
+    gap_flag = "  <-- a handful of outsized trades are pulling the average up" \
+               if mean_raw > med_raw * 2 and med_raw > 0 else ""
+    print(f"\nTypical trade: entry to exit, price moved on average {mean_pct:+.1f}%, "
+          f"but the MIDDLE trade only moved {med_pct:+.1f}%{gap_flag}")
+
+    avg_days = metrics.get('avg_bars_held', 0)
+    max_entry_conc = metrics.get('max_entry_year_concentration', 0)
+    if avg_days > 180 or max_entry_conc > 0.40:
+        print(f"\n** REGIME-CONCENTRATION CHECK **")
+        print(f"   Average holding period: {avg_days:.0f} days ({avg_days/365:.1f} years).")
+        print(f"   {max_entry_conc*100:.0f}% of all trades entered within a single calendar year.")
+        print("   Long average holds combined with entries clustered in one window is the")
+        print("   signature of a strategy that found ONE historical trend and rode it across")
+        print("   several coins -- not necessarily a repeatable, frequently-firing signal.")
+        print("   Weigh the out-of-sample result heavily before trusting this one.")
 
 
-def run_overfitting_diagnostic(all_trial_sharpes_annualized, champion_metrics, T):
-    """Deflated Sharpe Ratio (Bailey & Lopez de Prado, 2014), using every
-    completed Optuna trial's Sharpe plus the champion's own skew/kurtosis."""
-    if len(all_trial_sharpes_annualized) < 30:
-        print("\n(Skipping DSR diagnostic -- need >=30 completed trials with valid Sharpe.)")
+def print_top_trades(metrics, stock_names=None, master_dates=None, n=5):
+    """Prints the biggest winners and losers by ACTUAL price move (%),
+    with real coin names and dates -- the direct answer to 'what trades
+    are actually driving these numbers', for a non-trader to eyeball.
+    R-multiple is shown too, in parentheses, for anyone who wants it --
+    but % is the number that means something without any trading
+    background: it's just how much the coin's price moved between entry
+    and exit."""
+    pct = metrics.get('pct_return')
+    r_raw = metrics.get('r_multiple_raw')
+    if pct is None or len(pct) == 0:
+        return
+    stock_idx = metrics.get('stock_idx')
+    entry_days = metrics.get('entry_days')
+    exit_days = metrics.get('exit_days')
+    bars_held = metrics.get('bars_held')
+
+    order = np.argsort(pct)
+    winners = order[::-1][:n]
+    losers = order[:n]
+
+    def _fmt_date(day_idx):
+        if master_dates is not None and 0 <= day_idx < len(master_dates):
+            d = master_dates[day_idx]
+            return str(d.date()) if hasattr(d, 'date') else str(d)
+        return f"day#{day_idx}"
+
+    def _fmt_coin(s_idx):
+        if stock_names is not None and 0 <= s_idx < len(stock_names):
+            return stock_names[s_idx]
+        return f"coin#{s_idx}"
+
+    def _print_rows(idxs, title):
+        print(f"\n{title}")
+        print(f"  {'Coin':<12}{'Entry Date':>12}{'Exit Date':>12}{'Days Held':>10}{'% Move':>10}{'R':>9}")
+        for i in idxs:
+            print(f"  {_fmt_coin(int(stock_idx[i])):<12}{_fmt_date(int(entry_days[i])):>12}"
+                  f"{_fmt_date(int(exit_days[i])):>12}{int(bars_held[i]):>10}"
+                  f"{pct[i]*100:>+9.1f}%{'('+format(r_raw[i], '+.1f')+'R)':>9}")
+
+    print("\n" + "-" * 74)
+    print("TOP TRADES -- what actually happened, in plain terms (% = real price move)")
+    print("-" * 74)
+    _print_rows(winners, "Biggest winners (coin price moved up the most while held):")
+    _print_rows(losers, "Biggest losers (coin price moved down the most while held):")
+    print("-" * 74)
+
+
+def run_overfitting_diagnostic(all_trial_srs, champion_metrics):
+    if len(all_trial_srs) < 30:
+        print("\n(Skipping DSR diagnostic -- need at least ~30 completed trials.)")
         return None
+    r = champion_metrics.get('r_multiple', np.array([]))
+    if len(r) < 3:
+        return None
+    skew = float(pd.Series(r).skew()) if len(r) > 2 else -0.3
+    kurt = float(pd.Series(r).kurtosis() + 3) if len(r) > 3 else 5.0
+    sr_hat = champion_metrics.get('mean_r', 0.0) / champion_metrics.get('std_r', 1.0) if champion_metrics.get('std_r', 0) > 0 else 0.0
+    T = champion_metrics.get('trades', 0)
 
-    # Kurtosis is bounded below by skew^2+1 for any real distribution, so
-    # a value <=0 signals "couldn't be computed" (too few valid days or
-    # zero return variance) -- fall back to a generic estimate only then.
-    kurt_computed = champion_metrics.get('kurtosis', 0.0)
-    if kurt_computed > 0:
-        skew = champion_metrics.get('skew', -0.3)
-        kurt = kurt_computed
-        moment_source = "champion's own daily returns"
-    else:
-        skew = -0.3
-        kurt = 5.0
-        moment_source = "generic placeholder -- too few/uniform daily returns to compute the champion's own"
-
-    sr_hat_annual = champion_metrics.get('sharpe', 0.0)
-    sr_hat_daily  = sr_hat_annual / math.sqrt(TRADING_DAYS_PER_YEAR)
-    trial_sharpes_daily = [s / math.sqrt(TRADING_DAYS_PER_YEAR) for s in all_trial_sharpes_annualized]
-
-    dsr, sr0_daily, n_trials = deflated_sharpe_ratio(sr_hat_daily, trial_sharpes_daily, T, skew, kurt)
-    sr0_annual = sr0_daily * math.sqrt(TRADING_DAYS_PER_YEAR)
-
+    dsr, sr0, n_trials = deflated_sharpe_ratio(sr_hat, all_trial_srs, T, skew, kurt)
     print("\n" + "=" * 60)
-    print("OVERFITTING DIAGNOSTIC 1/2 -- Deflated Sharpe Ratio")
+    print("OVERFITTING DIAGNOSTIC -- Deflated Sharpe Ratio (trade-level)")
     print("=" * 60)
-    print(f"  Trials used: {n_trials}   Sample size (T): {T}   Skew/Kurt: {skew:.3f} / {kurt:.3f}  ({moment_source})")
-    print(f"  Champion Sharpe (annualized): {sr_hat_annual:.3f}   Expected max noise Sharpe: {sr0_annual:.3f}")
-    print(f"  Deflated Sharpe Ratio (probability): {dsr:.3f}  ", end="")
+    print(f"  Completed trials used:        {n_trials}")
+    print(f"  Champion's trade-level Sharpe (mean_R/std_R): {sr_hat:.3f}")
+    print(f"  Expected max from {n_trials} noise trials:    {sr0:.3f}")
+    print(f"  Deflated Sharpe Ratio (probability):          {dsr:.3f}")
     if dsr > 0.95:
-        print("-> clears the noise threshold with high confidence")
+        print("  -> Clears the noise threshold with high confidence.")
     elif dsr > 0.70:
-        print("-> plausibly real edge, not overwhelming -- treat cautiously")
+        print("  -> Plausibly real edge, not overwhelming. Weigh OOS heavily.")
     else:
-        print("-> can't statistically distinguish from the best of thousands of noise trials -- high overfit risk")
-    print("  CAVEAT: computed on Sharpe (has known sampling theory), not the composite score actually")
-    print("  optimized. Read as one indicative angle, not an exact p-value -- weigh the OOS result more.")
+        print("  -> Cannot statistically distinguish from noise.")
     return dsr
-
-
-def report_score_distribution_diagnostic(champion_score, all_trial_scores):
-    """Purely descriptive: where does the champion's score sit among every
-    OTHER trial that already passed every hard gate? Not a new statistical
-    test -- read alongside the DSR figure and the OOS result, not instead."""
-    if len(all_trial_scores) < 10:
-        print("\n(Skipping score-distribution diagnostic -- fewer than 10 other gate-passing trials.)")
-        return None
-
-    arr = np.array(all_trial_scores, dtype=np.float64)
-    mean_s, std_s = float(arr.mean()), float(arr.std())
-    pct_below = float((arr < champion_score).mean() * 100.0)
-    z = (champion_score - mean_s) / std_s if std_s > 0 else float('inf')
-
-    print("\n" + "=" * 60)
-    print("OVERFITTING DIAGNOSTIC 2/2 -- Score-Distribution Sanity Check")
-    print("=" * 60)
-    print(f"  Other gate-passing trials: {len(arr)}   Champion score: {champion_score:.4f}")
-    print(f"  Mean/std of others: {mean_s:.4f} / {std_s:.4f}   Champion beats {pct_below:.1f}% of them ({z:.2f} std above mean)")
-    if pct_below > 99.0:
-        print("  -> A clear outlier even among gate-passing trials. Still just the best of ~12,000 attempts --")
-        print("     weigh alongside DSR and the OOS result, not instead of them.")
-    else:
-        print("  -> Several other trials scored comparably -- the OOS walk-forward result matters more than this.")
-    return {'mean': mean_s, 'std': std_s, 'pct_below': pct_below, 'z': z}
-
-
-# ==========================================
-# 9b. TEMPORAL ROBUSTNESS -- RANDOM SIP-DAY CHECK
-# ==========================================
-# Every evaluate_params() call needs a sip_trigger array (one True per
-# calendar month, marking which trading day the SIP lands on).
-# build_sip_trigger_mask() is the only place that gets built:
-#   - fixed_offset=0 (default) = always the month's 1st trading day.
-#   - rng=<Generator> = independently randomizes the offset each month,
-#     used by the check below to test whether the edge depends on SIP timing.
-
-def build_sip_trigger_mask(months, rng=None, fixed_offset=0):
-    n_days = len(months)
-    trigger = np.zeros(n_days, dtype=np.bool_)
-    if n_days == 0:
-        return trigger
-    idx = 0
-    while idx < n_days:
-        j = idx
-        while j < n_days and months[j] == months[idx]:
-            j += 1
-        month_len = j - idx
-        if rng is not None:
-            offset = int(rng.integers(0, month_len))
-        else:
-            offset = min(fixed_offset, month_len - 1)
-        trigger[idx + offset] = True
-        idx = j
-    return trigger
-
-
-def run_temporal_robustness_check(best_params, opens, closes, atr, adx,
-                                   months, index_closes, is_div_stock, eligible_mask, years_arr,
-                                   baseline_score, n_runs=TEMPORAL_ROBUSTNESS_RUNS):
-    """Reruns the already-chosen champion n_runs times with an
-    independently random SIP day each month (nothing re-optimized) and
-    checks whether the score survives. Evaluated on the FULL dataset --
-    this is a calendar-mechanics question, not a market-regime one."""
-    n_days = closes.shape[0]
-    scores = []
-    n_gate_failures = 0
-
-    print("\n" + "=" * 60)
-    print(f"TEMPORAL ROBUSTNESS -- RANDOM SIP-DAY CHECK ({n_runs} reruns)")
-    print("=" * 60)
-
-    for i in range(n_runs):
-        rng = np.random.default_rng(seed=5000 + i)
-        trigger = build_sip_trigger_mask(months, rng=rng)
-        score, _ = evaluate_params(best_params, opens, closes, atr, adx,
-                                    trigger, index_closes, is_div_stock, eligible_mask, years_arr,
-                                    start_day=0, end_day=n_days - 1, is_oos=False,
-                                    starting_wealth=0.0)
-        if score > -900:
-            scores.append(score)
-        else:
-            n_gate_failures += 1
-
-    if not scores:
-        print("  All randomized-SIP-day reruns FAILED the hard gates entirely.")
-        print("  -> Viability depends on first-of-month SIP timing. REJECT.")
-        return 0.0, []
-
-    arr = np.array(scores)
-    mean_s, min_s, max_s = float(arr.mean()), float(arr.min()), float(arr.max())
-    ratio = mean_s / abs(baseline_score) if baseline_score > 0 else 0.0
-
-    print(f"  Baseline (1st-of-month) score: {baseline_score:.4f}")
-    print(f"  Reruns passing gates: {len(scores)}/{n_runs}   mean/min/max: {mean_s:.4f} / {min_s:.4f} / {max_s:.4f}")
-    if n_gate_failures > 0:
-        print(f"  WARNING: {n_gate_failures}/{n_runs} reruns failed hard gates entirely.")
-    print(f"  Temporal Robustness Ratio: {ratio:.1%}  ", end="")
-    if ratio >= 0.70 and n_gate_failures == 0:
-        print("STRONG -- edge does not depend on SIP timing")
-    elif ratio >= TEMPORAL_ROBUSTNESS_THRESHOLD and n_gate_failures <= n_runs * 0.2:
-        print("ACCEPTABLE -- some sensitivity to cash-arrival timing")
-    else:
-        print("WEAK -- edge appears to depend on first-of-month SIP timing")
-
-    return ratio, scores
 
 
 # ==========================================
 # 10. CONSOLE REPORTER
 # ==========================================
 
-def _fmt_pf(pf_val):
-    return "inf (no losing trades)" if (isinstance(pf_val, float) and math.isinf(pf_val)) else f"{pf_val:.2f}"
+MA_TYPE_NAMES = {0: 'SMA', 1: 'EMA', 2: 'DEMA', 3: 'WMA', 4: 'SMMA'}
+ENTRY_TYPE_NAMES = {0: 'MA Breakout', 1: 'RSI Crossover', 2: 'MA Crossover'}
+EXIT_TYPE_NAMES = {0: 'Hybrid ATR TP+Trail', 1: '%-Trail from High',
+                    2: 'ATR-Trail from High', 3: 'MA Crossunder',
+                    4: 'RSI Crossunder', 5: 'MA Crossover Exit'}
+
+LEGEND = """
+------------------------------------------------------------------------
+WHAT THE NUMBERS MEAN (plain-language)
+------------------------------------------------------------------------
+  R / R-multiple: how big a trade's profit or loss was, measured against
+    how much risk was taken on entry (not dollars). +2R means the trade
+    made twice what was initially risked; -1R means it lost the full
+    initially-risked amount. Comparable across coins/prices this way.
+  Win Rate: % of trades that were profitable. Trend systems often WIN
+    LESS than half the time but make it up with much bigger winners --
+    a low win rate is not automatically bad here.
+  Profit Factor: total $ won / total $ lost. Above 1.0 = profitable
+    overall; below 1.0 = losing overall, regardless of win rate.
+  Expectancy (R): the average result of one trade, in R. This is the
+    single best "is this worth trading" number -- positive and bigger
+    is better.
+  SQN: how CONSISTENT that edge is (mean R divided by how much R bounces
+    around, adjusted for trade count). A strategy can have good
+    expectancy but a low SQN if results are erratic.
+  Recency-Weighted Avg-R/trade: take typical trade quality in each
+    calendar year, then average across years -- but recent years count
+    MORE than old ones. A strategy that made all its money early and has
+    been quiet since scores worse here than one still working now, even
+    if their lifetime totals are similar.
+  Mean vs Median trade R (raw): if these two are far apart, a handful of
+    huge winning trades are doing most of the work, and the strategy may
+    be less repeatable than the average number suggests. Check the "Top
+    Trades" list when you see a big gap.
+  Concentration penalty: a soft score reduction if one single year or one
+    single coin produced most of the total profit -- a flag, not an
+    automatic rejection.
+  Pyramiding: adding to a position that's already open when the same
+    entry signal fires again, instead of only ever taking one entry per
+    coin. More layers = more conviction added to a working trade.
+------------------------------------------------------------------------"""
 
 
-def print_performance_report(score, metrics, p, label=""):
-    ma_names = ["SMA", "EMA", "DEMA", "WMA"]
-    ts, tl, tsl = ma_names[p['t_s']], ma_names[p['t_l']], ma_names[p['t_sl']]
 
-    entry_names = [
-        "Unfiltered (Any Crossover Valid)",
-        f"Momentum (Price > {tsl}{p['sl_ma']})",
-        f"Value/Pullback (Price < {tsl}{p['sl_ma']})"
-    ]
-    norm_exit_names = [
-        f"Crossunder ({ts}{p['s_ma']} < {tl}{p['l_ma']})",
-        f"Fixed Trailing Stop ({p['n_trail_p']:.1f}% from Peak)",
-        f"Volatility Trailing Stop ({p['n_atr_m']:.2f}x 14-ATR(Wilder) from Peak)"
-    ]
-    rank_names = [
-        "Max Drawdown (Deepest Discount from Signal)",
-        "Risk-Off (Closest to Long MA Support)",
-        "Momentum (Highest Velocity above Short MA)"
-    ]
-    div_exit_names = [
-        "Fixed Peak Drawdown (%)",
-        "Super MA Violation (%)",
-        "Time Decay (Consecutive Days Below Long MA)"
-    ]
+def print_performance_report(score, metrics, p, label="", stock_names=None, master_dates=None):
+    print("\n" + "=" * 78)
+    print(f"{label}")
+    print("=" * 78)
+    print(f"Score: {score:.4f}")
+    print(f"Entry: {ENTRY_TYPE_NAMES.get(p['entry_type'],'?')}   "
+          f"Exit: {EXIT_TYPE_NAMES.get(p['exit_type'],'?')}   "
+          f"Max pyramid layers: {p.get('max_pyramid_layers', 1)}")
+    print(f"BTC entry gate: {p['use_btc_entry_gate']}   "
+          f"BTC exit override: {p['use_btc_exit_override']}   "
+          f"RSI trend filter: {p['use_rsi_trend_filter']}")
 
-    wt = metrics.get('winning_trades', 0)
-    lt = metrics.get('losing_trades',  0)
-    actual_wr   = wt / (wt + lt) if (wt + lt) > 0 else 0.0
-    adx_info    = f"ADX>{p.get('adx_thresh', 0):.0f}" if p.get('adx_thresh', 0) > 0 else "Disabled"
+    if p['entry_type'] == ENTRY_MA_BREAKOUT:
+        print(f"  Entry MA: {p['entry_ma_len']} / {MA_TYPE_NAMES.get(p['entry_ma_type'],'?')}")
+    elif p['entry_type'] == ENTRY_RSI_XOVER:
+        print(f"  RSI fast: {p['rsi_f_len']}/{p['rsi_f_smt']}  RSI slow: {p['rsi_s_len']}/{p['rsi_s_smt']}")
+        if p['use_rsi_trend_filter']:
+            print(f"  Trend MA: {p['rsi_trend_ma_len']} / {MA_TYPE_NAMES.get(p['rsi_trend_ma_type'],'?')}")
+    elif p['entry_type'] == ENTRY_MA_XOVER:
+        print(f"  Short MA: {p['xover_short_len']} / {MA_TYPE_NAMES.get(p['xover_short_type'],'?')}   "
+              f"Long MA: {p['xover_long_len']} / {MA_TYPE_NAMES.get(p['xover_long_type'],'?')}")
 
-    avg_runup   = metrics.get('avg_runup', 0)
-    avg_loss_m  = abs(metrics.get('avg_loss', 1))
-    sortino_raw = metrics.get('sortino', 0)
-    sortino_cap = min(sortino_raw, 4.0)
-    ir          = metrics.get('ir', 0)
-    month_cnt   = metrics.get('month_cnt', 1)
-    ir_scaled   = max(0.0, ir) * math.sqrt(max(1.0, month_cnt) / 12.0)
-    wr_bonus    = max(0.0, actual_wr - 0.50) * 4.0
+    if p['use_btc_entry_gate'] or p['use_btc_exit_override']:
+        print(f"  BTC filter MA: {p['btc_ma_len']} / {MA_TYPE_NAMES.get(p['btc_ma_type'],'?')}")
 
-    ev       = actual_wr * avg_runup - (1.0 - actual_wr) * avg_loss_m
-    ev_in_r  = ev / avg_loss_m if avg_loss_m > 0 else 0.0
+    if p['exit_type'] == EXIT_MA_CROSSUNDER:
+        print(f"  Exit MA: {p['exit_ma_len']} / {MA_TYPE_NAMES.get(p['exit_ma_type'],'?')}")
+    elif p['exit_type'] == EXIT_RSI_CROSSUNDER:
+        print(f"  Exit RSI fast: {p['exit_rsi_f_len']}/{p['exit_rsi_f_smt']}  "
+              f"Exit RSI slow: {p['exit_rsi_s_len']}/{p['exit_rsi_s_smt']}")
+    elif p['exit_type'] == EXIT_MA_XOVER_EXIT:
+        print(f"  Exit short MA: {p['exit_xover_short_len']} / {MA_TYPE_NAMES.get(p['exit_xover_short_type'],'?')}   "
+              f"Exit long MA: {p['exit_xover_long_len']} / {MA_TYPE_NAMES.get(p['exit_xover_long_type'],'?')}")
 
-    start_w = metrics.get('starting_wealth', 0.0)
-    annual_return = metrics.get('annual_return', 0.0)
-    irr_note = "" if metrics.get('irr_converged', True) else "  (solver did not converge -- approximate)"
+    if p['exit_type'] == EXIT_HYBRID:
+        print(f"  SL mult: {p['sl_mult']:.2f}  TP mult: {p['tp_mult']:.2f}  Trail mult: {p['trail_mult']:.2f}")
+    elif p['exit_type'] == EXIT_PCT_TRAIL:
+        print(f"  Trail %: {p['trail_pct']:.2f}")
+    elif p['exit_type'] == EXIT_ATR_TRAIL:
+        print(f"  Exit ATR mult: {p['exit_atr_mult']:.2f}")
+    print(f"  ADX threshold: {p.get('adx_thresh', 0.0)}   (Nominal risk unit sl_mult: {p['sl_mult']:.2f})")
 
-    floor_clamp_warning = ""
-    if metrics.get('n_floor_clamps', 0) > 0:
-        floor_clamp_warning = (
-            f"\n*** WARNING: floor clamp triggered {metrics['n_floor_clamps']}x this run -- "
-            f"should never happen on real data. Check for a NaN/zero-price leak before trusting these numbers. ***\n"
-        )
-
-    bench_annual_return = None
-    cf_days = metrics.get('cf_days', [])
-    cf_amounts = metrics.get('cf_amounts', [])
-    if len(cf_days) >= 2 and metrics.get('bench_wealth', 0) > 0:
-        bench_cf_amounts = list(cf_amounts[:-1]) + [metrics['bench_wealth']]
-        # Swap in the benchmark's own carried-over starting wealth (not the
-        # strategy's) so this IRR reflects a genuine "just the index, same
-        # cash flows" trajectory.
-        if metrics.get('starting_wealth', 0.0) > 0 and len(bench_cf_amounts) >= 1:
-            bench_cf_amounts[0] = -metrics.get('bench_starting_wealth', 0.0)
-        bench_annual_return, bench_irr_ok = money_weighted_annual_return(cf_days, bench_cf_amounts)
-        if not bench_irr_ok:
-            bench_annual_return = None
-
-    print(f"""
-======================================================
-{label if label else 'DIAMOND EXTRACTOR — CHAMPION STRATEGY REPORT (v5.0)'}
-Composite Score: {score:.4f}{floor_clamp_warning}
-------------------------------------------------------
-[CAPITAL & RETURNS]
-Starting Capital Anchor:  Rs.{start_w:,.0f}
-Total SIP Injected:       Rs.{metrics['t_invested']:,.0f}
-Final Portfolio Wealth:   Rs.{metrics['wealth']:,.0f}
-System ROI (vs base):     {metrics['roi']*100:.2f}%  (Index SIP ROI: {metrics['bench_roi']*100:.2f}%)
-Excess Alpha (ROI):       {metrics['alpha']*100:+.2f}%
-Annualized Return (IRR):  {annual_return*100:.2f}%{irr_note}
-""" + (f"Nifty SIP Annualized (IRR): {bench_annual_return*100:.2f}%   (apples-to-apples comparison)\n" if bench_annual_return is not None else "") + f"""------------------------------------------------------
-[RISK & PERFORMANCE]
-Sharpe Ratio:             {metrics['sharpe']:.2f}
-Sortino Ratio:            {sortino_raw:.2f}  (capped to {sortino_cap:.2f} in score)
-Return Skew / Kurtosis:   {metrics.get('skew', 0):.3f} / {metrics.get('kurtosis', 0):.3f}
-Information Ratio:        {ir:.3f}  (scaled: {ir_scaled:.3f})
-Max Portfolio Drawdown:   {metrics['max_dd']*100:.2f}%
-Profit Factor:            {_fmt_pf(metrics.get('pf', 0.0))}
-------------------------------------------------------
-[TRADE STATISTICS]
-Total Closed Trades:      {metrics['trades']}
-  Winning:                {wt}
-  Losing:                 {lt}
-Win Rate:                 {actual_wr*100:.1f}%   <-- hard gate: must be >= {MIN_WIN_RATE_GATE*100:.0f}%
-Avg Bars in Trade:        {metrics['avg_bars']:.0f} days
-Avg Win:                  +{avg_runup*100:.2f}%
-Avg Loss:                 -{avg_loss_m*100:.2f}%
-R:R Ratio:                {avg_runup/avg_loss_m if avg_loss_m > 0 else 0:.2f}x
-Expected Value / R:       {ev_in_r:.3f}
-------------------------------------------------------
-[SCORE BREAKDOWN  (Calmar 30 / Sortino 10 / IR 30 / EV 15 / WR_Bonus 15)]
-Calmar (AnnRet/MaxDD):     {(annual_return/max(abs(metrics['max_dd']),0.001)):.3f}  x0.30
-Sortino (cap 4.0):        {sortino_cap:.2f}   x0.10 = {sortino_cap*0.10:.3f}
-IR scaled:                {ir_scaled:.3f}  x0.30 = {ir_scaled*0.30:.3f}
-EV in R:                  {ev_in_r:.3f}  x0.15 = {ev_in_r*0.15:.3f}
-WR Bonus (WR-50)*4:       {wr_bonus:.3f}  x0.15 = {wr_bonus*0.15:.3f}
-------------------------------------------------------
-[DIAGNOSTICS]
-Avg Cash Sitting Idle:     {metrics.get('avg_cash_frac', 0)*100:.1f}% of portfolio value
-Days >{HIGH_CASH_FRACTION_THRESHOLD*100:.0f}% in Cash:        {metrics.get('pct_days_high_cash', 0):.1f}% of this window
-Floor-Clamp Triggers:     {metrics.get('n_floor_clamps', 0)}  (should be 0)
-Valid Return-Series Days: {metrics.get('valid_days', 0)}
-------------------------------------------------------
-[SIGNAL CONFIGURATION]
-MA Signal:                {ts}{p['s_ma']} x {tl}{p['l_ma']}
-Super MA (Filter):        {tsl}{p['sl_ma']}
-Entry Filter:             {entry_names[p['entry_f']]}
-ADX Filter:               {adx_info}
-Growth Exit:              {norm_exit_names[p['n_exit_m']]}
-Watchlist Priority:       {rank_names[p['wl_rank']]}
-Div Stock Exit:           {div_exit_names[p['div_exit_m']]} @ {p['div_exit_v']:.1f}
-------------------------------------------------------
-[COSTS & FIXED SETTINGS]
-Buy/Sell cost:             {BUY_COST_PCT*100:.3f}% / {SELL_COST_PCT*100:.3f}%   Flat DP charge: Rs.{DP_FLAT_FEE_RS:.0f}   Idle cash yield: {ANNUAL_CASH_YIELD*100:.2f}%
-Position Sizing:          Fixed Rs.{MONTHLY_SIP:,} per signal   Pyramiding: ON
-Exit Model:                Two-phase (signal @ close, fill @ next open)
-Eligibility Mask:         {'Point-in-time file loaded' if POINT_IN_TIME_UNIVERSE_FILE else 'All-eligible (survivorship-biased, disclosed)'}
-Robustness Save Gate:     >= {ROBUSTNESS_DEPLOY_THRESHOLD:.0%} OOS  AND  >= {TEMPORAL_ROBUSTNESS_THRESHOLD:.0%} temporal
-======================================================
-""")
+    print(f"\nTrades: {metrics.get('trades',0)}  |  Win Rate: {metrics.get('win_rate',0)*100:.1f}% "
+          f"(% of trades that made money)  |  Profit Factor: {metrics.get('profit_factor',0):.2f} "
+          f"($ won per $ lost -- above 1.0 is profitable)")
+    print(f"Typical trade price move: {metrics.get('mean_pct',0)*100:+.1f}% average, "
+          f"{metrics.get('median_pct',0)*100:+.1f}% for the middle trade")
+    print(f"Expectancy: {metrics.get('expectancy_r',0):.3f}R (avg profit per trade, in units of "
+          f"risk taken)  |  SQN: {metrics.get('sqn_capped',0):.2f} (consistency of that edge, "
+          f"Van Tharp scale: <1.6 poor, 1.6-2.5 avg, 2.5-4 good, >4 excellent)")
+    print(f"Recency-Weighted Avg-R/trade: {metrics.get('recency_weighted_avg_r',0):.2f} "
+          f"(typical trade quality, tilted toward recent years -- the core consistency check; "
+          f"plain median w/o recency tilt: {metrics.get('median_yearly_avg_r',0):.2f})")
+    print(f"Avg bars held: {metrics.get('avg_bars_held',0):.1f} days  |  Distinct coins: {metrics.get('distinct_coins',0)}")
+    if metrics.get('avg_pyramid_layers', 1.0) > 1.01:
+        print(f"Pyramiding: avg {metrics.get('avg_pyramid_layers',1.0):.2f} layers/trade, "
+              f"{metrics.get('pct_trades_pyramided',0)*100:.0f}% of trades added at least one layer")
+    print(f"Max year profit-share: {metrics.get('max_year_share',0)*100:.1f}%  |  "
+          f"Max coin profit-share: {metrics.get('max_coin_share',0)*100:.1f}%  |  "
+          f"Concentration penalty applied: {metrics.get('concentration_penalty',1.0) < 1.0}")
+    if metrics.get('avg_bars_held', 0) > 180 or metrics.get('max_entry_year_concentration', 0) > 0.40:
+        print(f"** Long avg. hold + entries clustered in one window -- check "
+              f"'REGIME-CONCENTRATION CHECK' in the yearly table before trusting this. **")
+    print_top_trades(metrics, stock_names=stock_names, master_dates=master_dates, n=5)
+    print("=" * 78)
 
 
 # ==========================================
-# 11. PARAM HELPERS (Optuna <-> canonical)
+# 11. OPTUNA SEARCH SPACE + MAIN OPTIMIZER
 # ==========================================
 
-def _params_to_trial_dict(p):
-    trial = {k: v for k, v in p.items() if k != 'div_exit_v'}
-    div_m = int(p.get('div_exit_m', 0))
-    div_v = float(p.get('div_exit_v', 10.0))
-    if   div_m == 0: trial['div_val_peak_pct'] = div_v
-    elif div_m == 1: trial['div_val_ma_pct']   = div_v
-    else:            trial['div_val_days']      = int(div_v)
-    for stale in ('rs_thresh', 'mkt_regime', 'vol_sizing', 'vol_cap_r', 'use_rs',
-                  'div_val', 'div_val_int',
-                  'div_val_type_0', 'div_val_type_1', 'div_val_type_2_int'):
-        trial.pop(stale, None)
-    if 'adx_thresh' in trial:
-        trial['adx_thresh'] = float(trial['adx_thresh'])
-    return trial
+def _suggest_params(trial):
+    entry_type = trial.suggest_categorical('entry_type', [ENTRY_MA_BREAKOUT, ENTRY_RSI_XOVER, ENTRY_MA_XOVER])
+    exit_type  = trial.suggest_categorical('exit_type', [EXIT_HYBRID, EXIT_PCT_TRAIL, EXIT_ATR_TRAIL,
+                                                           EXIT_MA_CROSSUNDER, EXIT_RSI_CROSSUNDER, EXIT_MA_XOVER_EXIT])
 
+    p = {
+        'entry_type': entry_type,
+        'exit_type':  exit_type,
+        'use_btc_entry_gate':    trial.suggest_categorical('use_btc_entry_gate', [False, True]),
+        'use_btc_exit_override': trial.suggest_categorical('use_btc_exit_override', [False, True]),
+        'use_rsi_trend_filter':  trial.suggest_categorical('use_rsi_trend_filter', [False, True]),
+        'adx_thresh': trial.suggest_categorical('adx_thresh', [0.0, 15.0, 20.0, 25.0]),
+        'sl_mult':    trial.suggest_float('sl_mult', 1.5, 8.0),
+        'tp_mult':    trial.suggest_float('tp_mult', 5.0, 70.0),
+        'trail_mult': trial.suggest_float('trail_mult', 2.0, 15.0),
+        'trail_pct':  trial.suggest_float('trail_pct', 5.0, 35.0),
+        'exit_atr_mult': trial.suggest_float('exit_atr_mult', 1.0, 6.0),
+        'max_pyramid_layers': trial.suggest_int('max_pyramid_layers', MAX_PYRAMID_LAYERS_MIN, MAX_PYRAMID_LAYERS_MAX),
+    }
 
-def _trial_to_params(trial_params):
-    p = dict(trial_params)
-    if   'div_val_peak_pct' in p: p['div_exit_v'] = p.pop('div_val_peak_pct')
-    elif 'div_val_ma_pct'   in p: p['div_exit_v'] = p.pop('div_val_ma_pct')
-    elif 'div_val_days'     in p: p['div_exit_v'] = float(p.pop('div_val_days'))
+    if entry_type == ENTRY_MA_BREAKOUT:
+        p['entry_ma_len']  = trial.suggest_int('entry_ma_len', MA_LEN_MIN, MA_LEN_MAX)
+        p['entry_ma_type'] = trial.suggest_int('entry_ma_type', 0, 4)
+    elif entry_type == ENTRY_RSI_XOVER:
+        p['rsi_f_len'] = trial.suggest_int('rsi_f_len', 10, 100)
+        p['rsi_f_smt'] = trial.suggest_int('rsi_f_smt', 5, 50)
+        p['rsi_s_len'] = trial.suggest_int('rsi_s_len', 10, 100)
+        p['rsi_s_smt'] = trial.suggest_int('rsi_s_smt', 5, 50)
+        if p['use_rsi_trend_filter']:
+            p['rsi_trend_ma_len']  = trial.suggest_int('rsi_trend_ma_len', MA_LEN_MIN, MA_LEN_MAX)
+            p['rsi_trend_ma_type'] = trial.suggest_int('rsi_trend_ma_type', 0, 4)
+    elif entry_type == ENTRY_MA_XOVER:
+        short_len = trial.suggest_int('xover_short_len', MA_LEN_MIN, 200)
+        gap       = trial.suggest_int('xover_gap', 10, 150)
+        p['xover_short_len']  = short_len
+        p['xover_short_type'] = trial.suggest_int('xover_short_type', 0, 4)
+        p['xover_long_len']   = min(MA_LEN_MAX, short_len + gap)
+        p['xover_long_type']  = trial.suggest_int('xover_long_type', 0, 4)
+
+    if p['use_btc_entry_gate'] or p['use_btc_exit_override']:
+        p['btc_ma_len']  = trial.suggest_int('btc_ma_len', MA_LEN_MIN, MA_LEN_MAX)
+        p['btc_ma_type'] = trial.suggest_int('btc_ma_type', 0, 4)
+    else:
+        p['btc_ma_len'], p['btc_ma_type'] = 62, 0   # unused placeholders
+
+    if exit_type == EXIT_MA_CROSSUNDER:
+        p['exit_ma_len']  = trial.suggest_int('exit_ma_len', MA_LEN_MIN, MA_LEN_MAX)
+        p['exit_ma_type'] = trial.suggest_int('exit_ma_type', 0, 4)
+    elif exit_type == EXIT_RSI_CROSSUNDER:
+        p['exit_rsi_f_len'] = trial.suggest_int('exit_rsi_f_len', 10, 100)
+        p['exit_rsi_f_smt'] = trial.suggest_int('exit_rsi_f_smt', 5, 50)
+        p['exit_rsi_s_len'] = trial.suggest_int('exit_rsi_s_len', 10, 100)
+        p['exit_rsi_s_smt'] = trial.suggest_int('exit_rsi_s_smt', 5, 50)
+    elif exit_type == EXIT_MA_XOVER_EXIT:
+        e_short = trial.suggest_int('exit_xover_short_len', MA_LEN_MIN, 200)
+        e_gap   = trial.suggest_int('exit_xover_gap', 10, 150)
+        p['exit_xover_short_len']  = e_short
+        p['exit_xover_short_type'] = trial.suggest_int('exit_xover_short_type', 0, 4)
+        p['exit_xover_long_len']   = min(MA_LEN_MAX, e_short + e_gap)
+        p['exit_xover_long_type']  = trial.suggest_int('exit_xover_long_type', 0, 4)
+
     return p
 
+def is_too_close_to_benchmark(p, benchmark_p, tolerance=0.15):
+    """
+    Returns True if 'p' is on the same gradient/neighborhood as 'benchmark_p'.
+    """
+    if benchmark_p is None:
+        return False
 
-# ==========================================
-# 12. MAIN OPTIMIZER
-# ==========================================
+    # If the core signal family is different, it is a completely new setup
+    if p['entry_type'] != benchmark_p['entry_type'] or p['exit_type'] != benchmark_p['exit_type']:
+        return False
+
+    # If in the same family, check if key lookback lengths are within +/- 15%
+    same_family_keys = []
+    if p['entry_type'] == ENTRY_MA_BREAKOUT:
+        same_family_keys += ['entry_ma_len']
+    elif p['entry_type'] == ENTRY_RSI_XOVER:
+        same_family_keys += ['rsi_f_len', 'rsi_s_len']
+    elif p['entry_type'] == ENTRY_MA_XOVER:
+        same_family_keys += ['xover_short_len', 'xover_long_len']
+
+    if p['exit_type'] == EXIT_MA_CROSSUNDER:
+        same_family_keys += ['exit_ma_len']
+
+    close_count = 0
+    for k in same_family_keys:
+        if k in p and k in benchmark_p:
+            val_new = p[k]
+            val_bench = benchmark_p[k]
+            if abs(val_new - val_bench) / max(val_bench, 1) < tolerance:
+                close_count += 1
+
+    # If all primary lookbacks overlap closely, reject as 'not novel'
+    return close_count == len(same_family_keys) and len(same_family_keys) > 0
 
 def run_optimization():
-    tickers = fetch_dynamic_universe()
-    (opens, closes, atr, adx,
-     months, index_closes,
-     is_div_stock, stock_names, eligible_mask, years_arr) = prepare_matrix_data(tickers)
+    tickers = fetch_top100_universe()
+    (opens, closes, atr, adx, years_arr,
+     stock_names, eligible_mask, master_dates) = prepare_matrix_data(tickers)
 
-    clear_ma_cache()  # cache is keyed without a data fingerprint -- must clear before a fresh matrix
-
-    sip_trigger = build_sip_trigger_mask(months, fixed_offset=0)
-
+    clear_caches()
+    n_stocks = closes.shape[1]
     n_days = closes.shape[0]
     is_end = int(n_days * WFO_IS_PCT)
+    inner_split = is_end - int((is_end - 0) * INNER_VAL_PCT)   # inner-train: [0, inner_split); inner-val: [inner_split, is_end)
 
-    print(f"\nMatrix: {n_days} days x {closes.shape[1]} stocks")
-    print(f"IS period:  days 0-{is_end}  ({is_end/252:.1f} yrs)")
-    print(f"OOS period: days {is_end}-{n_days}  ({(n_days-is_end)/252:.1f} yrs -- never seen during opt)")
+    print(f"\nMatrix: {n_days} days x {n_stocks} coins")
+    print(f"Inner-train (search):      days 0-{inner_split}")
+    print(f"Inner-validation (search):  days {inner_split}-{is_end}  <- every trial must hold up here too, not just train")
+    print(f"True OOS (final check only): days {is_end}-{n_days}  <- never touched during the whole search")
+    print(LEGEND)
+    print("\n** ROBUSTNESS-AWARE SEARCH (v1.3) **")
+    print("Every trial is scored on the WORSE of inner-train vs inner-validation, not just")
+    print("inner-train alone -- a parameter set can't win by being lucky in one period only.")
+    print("If a trial passes inner-train but fails inner-validation's gates, it still gets a")
+    print("heavily discounted fallback score (so the search always has SOME signal to follow)")
+    print("instead of a flat rejection -- but it can never outrank a trial that genuinely")
+    print("passes both.\n")
 
     best_is_score = -999999.0
-    best_params   = None
-    all_trial_sharpes = []   # feeds the Sharpe-based DSR diagnostic
-    all_trial_scores  = []   # feeds the score-distribution diagnostic
+    best_params = None
+    all_trial_srs = []
 
-    prev_oos, prev_is, prev_params = load_previous_winner(BEST_PARAMS_FILE)
-    if prev_params is None:
-        _, prev_is, prev_params = load_previous_winner(INTERMEDIATE_FILE)
+    # -------------------------------------------------------------
+    # 1. AUTO-LOAD BENCHMARK (Last Saved Winner or Baseline File)
+    # -------------------------------------------------------------
+    best_is_score = -999999.0
+    best_params = None
+    prev_winner_params = None
 
-    if prev_params is not None:
-        print("\n" + "-" * 60)
-        print("EVALUATING LOADED CHAMPION CONFIGURATION")
-        print("-" * 60)
+    # Try loading from the best params file first, then fallback to baseline config
+    _, prev_is, loaded_params = load_previous_winner(BEST_PARAMS_FILE)
+    if loaded_params is None:
+        loaded_params = load_baseline_config(BASELINE_CONFIG_FILE)
 
-        score_is, metrics_is = evaluate_params(
-            prev_params, opens, closes, atr, adx,
-            sip_trigger, index_closes, is_div_stock, eligible_mask, years_arr,
-            start_day=0, end_day=is_end, is_oos=False, starting_wealth=0.0
+    if loaded_params is not None:
+        # Score the benchmark on the exact search period (inner_split)
+        base_train_score, base_train_m = evaluate_params_signal(
+            loaded_params, opens, closes, atr, adx, years_arr, n_stocks,
+            start_day=0, end_day=inner_split, is_oos=False
         )
-        score_full, metrics_full = evaluate_params(
-            prev_params, opens, closes, atr, adx,
-            sip_trigger, index_closes, is_div_stock, eligible_mask, years_arr,
-            start_day=0, end_day=n_days - 1, is_oos=False, starting_wealth=0.0
+        base_val_score, base_val_m = evaluate_params_signal(
+            loaded_params, opens, closes, atr, adx, years_arr, n_stocks,
+            start_day=inner_split, end_day=is_end, is_oos=True,
+            min_years_required=MIN_YEARS_GATE_INNER
         )
-
-        if score_is > -900:
-            best_is_score = score_is
-            best_params   = prev_params
-            print(f"Loaded champion passes IS gates. Baseline: {best_is_score:.4f}")
-            print("NOTE: the report below evaluates the WHOLE dataset (IS+OOS combined), not a")
-            print("held-out test -- it is expected to look strong since most of that window is")
-            print("the data this champion was originally optimized on. See WALK-FORWARD VALIDATION")
-            print("further down for the actual held-out-only result.")
-            print_performance_report(score_full, metrics_full, prev_params,
-                                     "LOADED CHAMPION (LIFETIME FULL-DATA PERFORMANCE)")
+        
+        # Dual-pass score logic matching the optimizer
+        if base_train_score > -900 and base_val_score > -900:
+            benchmark_score = min(base_train_score, base_val_score)
         else:
-            print("Loaded champion no longer passes strict IS gates. Starting fresh.")
+            benchmark_score = base_train_score if base_train_score > -900 else -999.0
 
-    # ==========================================
-    # BAYESIAN OPTIMIZATION
-    # ==========================================
+        if benchmark_score > -900:
+            best_is_score = benchmark_score
+            best_params = loaded_params
+            prev_winner_params = loaded_params
+            print("\n" + "=" * 70)
+            print(f"BENCHMARK LOADED: Score to beat = {best_is_score:.4f}")
+            print(f"Entry: {ENTRY_TYPE_NAMES.get(loaded_params['entry_type'])} | "
+                  f"Exit: {EXIT_TYPE_NAMES.get(loaded_params['exit_type'])}")
+            print("Optuna must EXCEED this score on a DIFFERENT parameter gradient to save.")
+            print("=" * 70 + "\n")
 
     if OPTUNA_AVAILABLE:
-        print(f"\nBayesian Optimization ({BAYESIAN_TRIALS} trials on IS data only, n_jobs={OPTUNA_N_JOBS})...")
+        print(f"\nBayesian Optimization ({BAYESIAN_TRIALS} trials, robustness-aware)...")
 
         def optuna_objective(trial):
-            s_ma  = trial.suggest_int('s_ma',  20,  80)
-            l_ma  = trial.suggest_int('l_ma',  40, 150)
-            sl_ma = trial.suggest_int('sl_ma', 150, 300)
-            if s_ma >= l_ma: raise optuna.TrialPruned()
+            p = _suggest_params(trial)
+            
+            # FORCED NOVELTY: Reject trials that are merely fine-tuning the old winner
+            if prev_winner_params is not None and is_too_close_to_benchmark(p, prev_winner_params):
+                return -999.0
 
-            div_exit_m = trial.suggest_int('div_exit_m', 0, 2)
-            if   div_exit_m == 0: div_val = trial.suggest_float('div_val_peak_pct', 10.0, 40.0)
-            elif div_exit_m == 1: div_val = trial.suggest_float('div_val_ma_pct',    0.0, 20.0)
-            else:                 div_val = float(trial.suggest_int('div_val_days', 10, 100))
+            train_score, train_m = evaluate_params_signal(
+                p, opens, closes, atr, adx, years_arr, n_stocks,
+                start_day=0, end_day=inner_split, is_oos=False
+            )
+            if train_score <= -900:
+                return -999.0
 
-            p = {
-                's_ma':       s_ma,
-                'l_ma':       l_ma,
-                'sl_ma':      sl_ma,
-                't_s':        trial.suggest_int('t_s',  0, 3),
-                't_l':        trial.suggest_int('t_l',  0, 3),
-                't_sl':       trial.suggest_int('t_sl', 0, 3),
-                'wl_rank':    trial.suggest_int('wl_rank',  0, 2),
-                'entry_f':    trial.suggest_int('entry_f',  0, 2),
-                'n_exit_m':   trial.suggest_int('n_exit_m', 0, 2),
-                'n_trail_p':  trial.suggest_float('n_trail_p', 5.0, 35.0),
-                'n_atr_m':    trial.suggest_float('n_atr_m',   1.0,  5.0),
-                'div_exit_m': div_exit_m,
-                'div_exit_v': float(div_val),
-                'adx_thresh': trial.suggest_categorical('adx_thresh', [0.0, 15.0, 20.0, 25.0]),
-                # NEW: optional Nifty-regime panic-exit/entry filter, ported
-                # from the crypto engine's use_btc_filter -- growth stocks
-                # only (see module docstring). Toggle is searched so Optuna
-                # decides whether it actually helps this configuration
-                # instead of it being forced on or off.
-                'use_nifty_filter': trial.suggest_categorical('use_nifty_filter', [True, False]),
-                'nifty_ma_len':     trial.suggest_int('nifty_ma_len', 20, 150),
-                'nifty_ma_type':    trial.suggest_int('nifty_ma_type', 0, 3),
-                # NEW: optional watchlist-age ranking boost -- off by default,
-                # searched as a toggle so Optuna only keeps it if it actually
-                # helps (see WL_AGE_NORM_DAYS module comment).
-                'use_wl_age_weight': trial.suggest_categorical('use_wl_age_weight', [True, False]),
-                'wl_age_weight':     trial.suggest_float('wl_age_weight', 0.0, 0.50),
-            }
+            val_score, val_m = evaluate_params_signal(
+                p, opens, closes, atr, adx, years_arr, n_stocks,
+                start_day=inner_split, end_day=is_end, is_oos=True,
+                min_years_required=MIN_YEARS_GATE_INNER
+            )
+            if val_score <= -900:
+                return min(train_score, 20.0) * ROBUST_FALLBACK_SCALE - ROBUST_FALLBACK_PENALTY
 
-            score, metrics = evaluate_params(p, opens, closes, atr, adx,
-                                       sip_trigger, index_closes, is_div_stock, eligible_mask, years_arr,
-                                       start_day=0, end_day=is_end, is_oos=False,
-                                       starting_wealth=0.0)
-            if metrics:
-                all_trial_sharpes.append(metrics.get('sharpe', 0.0))
-                if score > -900:
-                    all_trial_scores.append(score)
-            return score if score > -900 else -999.0
+            return min(train_score, val_score)
 
         study = optuna.create_study(
             direction='maximize',
-            sampler=optuna.samplers.TPESampler(seed=42, multivariate=True, group=True)
+            sampler=optuna.samplers.TPESampler(
+                seed=int(time.time()), # Vary seed so every run explores differently
+                n_startup_trials=500,  # Generous exploration phase
+                multivariate=True, 
+                group=True
+            )
         )
-        if best_params is not None:
-            study.enqueue_trial(_params_to_trial_dict(best_params))
-
-        # Lock protects best_is_score/best_params from a race between
-        # concurrently-completing trials when n_jobs > 1.
-        champion_lock = threading.Lock()
+        # NOTE: Do NOT call study.enqueue_trial(benchmark_params) here.
+        # Leaving it out prevents Optuna from biasing the Bayesian density toward the old winner.
 
         def optuna_callback(study, trial):
             nonlocal best_is_score, best_params
-
-            if trial.value is None or trial.value < -900: return
-
-            with champion_lock:
-                if trial.value <= best_is_score:
-                    return
-                p_full = _trial_to_params(trial.params)
-
-                if passes_neighborhood_check(
-                    p_full, trial.value, opens, closes, atr, adx,
-                    sip_trigger, index_closes, is_div_stock, eligible_mask, years_arr, 0, is_end
-                ):
+            if trial.value is None or trial.value <= -900:
+                return
+            if trial.value > best_is_score:
+                p_full = _suggest_params_from_trial(trial)
+                if passes_neighborhood_check(p_full, max(trial.value, 0.01), opens, closes, atr, adx,
+                                             years_arr, n_stocks, 0, inner_split):
                     best_is_score = trial.value
-                    best_params   = p_full
-
-                    score_chk, metrics = evaluate_params(
-                        p_full, opens, closes, atr, adx,
-                        sip_trigger, index_closes, is_div_stock, eligible_mask, years_arr,
-                        0, is_end, is_oos=False, starting_wealth=0.0
-                    )
-                    print_performance_report(score_chk, metrics, p_full,
-                                             f"NEW IS CHAMPION  (trial {trial.number})")
-                    save_winner(0.0, trial.value, p_full, filename=INTERMEDIATE_FILE)
+                    best_params = p_full
+                    train_chk, train_m = evaluate_params_signal(p_full, opens, closes, atr, adx,
+                                                                 years_arr, n_stocks, 0, inner_split, is_oos=False)
+                    val_chk, val_m = evaluate_params_signal(p_full, opens, closes, atr, adx,
+                                                             years_arr, n_stocks, inner_split, is_end, is_oos=True,
+                                                             min_years_required=MIN_YEARS_GATE_INNER)
+                    dual_pass = val_chk > -900
+                    tag = "DUAL-PASS (train + inner-val)" if dual_pass else "FALLBACK (train only -- inner-val failed gates)"
+                    print(f"\n[trial {trial.number}] inner-train score: {train_chk:.4f}   "
+                          f"inner-val score: {val_chk if dual_pass else 'GATE FAIL'}   [{tag}]")
+                    print_performance_report(train_chk, train_m, p_full, f"NEW CHAMPION (trial {trial.number})",
+                                             stock_names=stock_names, master_dates=master_dates)
 
         study.optimize(optuna_objective, n_trials=BAYESIAN_TRIALS,
-                       callbacks=[optuna_callback], show_progress_bar=True,
-                       n_jobs=OPTUNA_N_JOBS)
+                       callbacks=[optuna_callback], show_progress_bar=True)
 
-    # ==========================================
-    # WALK-FORWARD VALIDATION
-    # ==========================================
     if best_params is not None:
-        is_score, oos_score, oos_metrics, robustness, is_end_wealth = run_wfo_validation(
-            best_params, opens, closes, atr, adx,
-            sip_trigger, index_closes, is_div_stock, eligible_mask, years_arr
-        )
-
-        report_subperiod_breakdown(best_params, opens, closes, atr, adx,
-                                   sip_trigger, index_closes, is_div_stock, eligible_mask, years_arr)
-
-        temporal_ratio = 0.0   # only computed below if OOS cleared its own hard gates
-
+        is_score, oos_score, is_m, oos_m, robustness = run_wfo_validation(
+            best_params, opens, closes, atr, adx, years_arr, n_stocks)
+        report_yearly_table(is_m, label="IN-SAMPLE YEAR-BY-YEAR R BREAKDOWN")
         if oos_score > -900:
-            T = oos_metrics.get('valid_days', n_days - is_end)
-            run_overfitting_diagnostic(all_trial_sharpes, oos_metrics, T=T)
-            report_score_distribution_diagnostic(best_is_score, all_trial_scores)
+            run_overfitting_diagnostic(all_trial_srs, oos_m)
+            report_yearly_table(oos_m, label="OUT-OF-SAMPLE YEAR-BY-YEAR R BREAKDOWN")
 
-            full_score, full_metrics = evaluate_params(
-                best_params, opens, closes, atr, adx,
-                sip_trigger, index_closes, is_div_stock, eligible_mask, years_arr,
-                start_day=0, end_day=n_days - 1, is_oos=False, starting_wealth=0.0
-            )
-            temporal_ratio, _ = run_temporal_robustness_check(
-                best_params, opens, closes, atr, adx,
-                months, index_closes, is_div_stock, eligible_mask, years_arr,
-                baseline_score=full_score, n_runs=TEMPORAL_ROBUSTNESS_RUNS
-            )
+        # -- Naive portfolio-risk diagnostics (advisory, see
+        #    compute_naive_risk_metrics' docstring). report_m's naive_max_dd
+        #    was already computed at NAIVE_RISK_PCT_PER_TRADE (1%) inside
+        #    compute_score_signal and factored into its score via
+        #    risk_penalty above -- this just also computes the 2%-risk
+        #    variant for context and prints everything clearly. Falls back
+        #    to IS if OOS failed its gates (oos_m may have too short/empty
+        #    a trade log in that case). --
+        report_m = oos_m if oos_score > -900 else is_m
+        naive_dd_1pct = report_m.get('naive_max_dd', 0.0)
+        naive_dd_2pct = compute_naive_risk_metrics(
+            report_m['entry_days'], report_m['exit_days'], report_m['r_multiple_raw'],
+            risk_per_trade_pct=0.02)['naive_max_dd']
+        max_streak = report_m.get('max_consecutive_losses', 0)
+        streak_ratio = report_m.get('streak_ratio', 0.0)
+        max_conc_open = report_m.get('max_concurrent_open', 0)
+        max_conc_losers = report_m.get('max_concurrent_losers', 0)
+        worst_day_frac = report_m.get('worst_day_loser_fraction', 0.0)
+        risk_penalty_applied = report_m.get('risk_penalty', 1.0)
 
-        if (oos_score > -900 and (oos_score > prev_oos or prev_oos <= 0)
-                and robustness >= ROBUSTNESS_DEPLOY_THRESHOLD
-                and temporal_ratio >= TEMPORAL_ROBUSTNESS_THRESHOLD):
-            print("\nOOS + temporal-robustness validation passed. Saving fully verified champion...")
-            save_winner(oos_score, is_score, best_params, filename=BEST_PARAMS_FILE,
-                       robustness_ratio=robustness)
-            print_performance_report(oos_score, oos_metrics, best_params,
-                                     "OUT-OF-SAMPLE VALIDATED CHAMPION")
-        elif robustness < ROBUSTNESS_DEPLOY_THRESHOLD:
-            robustness_desc = "N/A (OOS failed a hard gate outright)" if robustness <= -1.0 else f"{robustness:.1%}"
-            print(f"\nStrategy rejected -- OOS robustness ({robustness_desc}) below this "
-                  f"script's {ROBUSTNESS_DEPLOY_THRESHOLD:.0%} save threshold.")
-        elif temporal_ratio < TEMPORAL_ROBUSTNESS_THRESHOLD:
-            print(f"\nStrategy rejected -- temporal (random-SIP-day) robustness ratio "
-                  f"({temporal_ratio:.1%}) below this script's "
-                  f"{TEMPORAL_ROBUSTNESS_THRESHOLD:.0%} save threshold. The edge may depend "
-                  f"on first-of-month SIP timing rather than genuine signal quality.")
+        print(f"\n{'='*78}")
+        print("NAIVE PORTFOLIO-RISK DIAGNOSTICS (advisory, NOT a real portfolio")
+        print("simulation -- run crypto_portfolio_optimizer.py for that; see")
+        print("compute_naive_risk_metrics' docstring for exactly what this captures)")
+        print(f"{'='*78}")
+        print(f"  Naive max drawdown:   ~{naive_dd_1pct:.1%} @1% risk/trade, "
+              f"~{naive_dd_2pct:.1%} @2% risk/trade")
+        print(f"  Longest losing streak: {max_streak} trades in a row "
+              f"({streak_ratio:.1f}x what this win rate would statistically predict)")
+        print(f"  Worst correlated moment: {max_conc_losers}/{max_conc_open} concurrently-open "
+              f"trades were eventual losers ({worst_day_frac:.0%})")
+        if risk_penalty_applied < 1.0:
+            print(f"  -> risk_penalty = {risk_penalty_applied:.2f}x was already applied to this "
+                  f"trial's score for the reasons above.")
+        if naive_dd_1pct > NAIVE_DD_SOFT_THRESHOLD:
+            print("  *** Even at a conservative 1% risk per trade, this implies a >50%")
+            print("      equity swing -- this signal's losing trades cluster heavily in")
+            print("      calendar time (a market-wide event, most likely) even though its")
+            print("      per-trade stats above look fine in isolation. The portfolio")
+            print("      optimizer's max_dd gate is likely to reject nearly everything")
+            print("      built on this signal. Worth confirming before spending an 8000-")
+            print("      trial budget on it.")
+        print(f"{'='*78}")
+
+        # -- ALWAYS save + report the best candidate found, honestly tiered.
+        #    A hard "don't save below 50%" gate meant a bad run left you with
+        #    literally nothing. Now you always get the best available result
+        #    with its real robustness clearly labeled, so YOU decide whether
+        #    it's good enough to trade -- rather than the engine silently
+        #    deciding for you by withholding it. --
+        if oos_score > -900 and robustness >= 0.70:
+            tier = "EXCELLENT (>70%) -- deploy with confidence"
+        elif oos_score > -900 and robustness >= ROBUSTNESS_DEPLOY_THRESHOLD:
+            tier = f"ACCEPTABLE ({ROBUSTNESS_DEPLOY_THRESHOLD:.0%}-70%) -- deploy cautiously"
+        elif oos_score > -900 and robustness >= 0.30:
+            tier = "CAUTION (30%-50%) -- meaningful risk this doesn't hold up; consider smaller size"
+        elif oos_score > -900:
+            tier = "POOR (<30%) -- high risk of not holding up; treat as a starting point, not a system"
         else:
-            print(f"\nNew IS champion found but OOS score ({oos_score:.4f}) "
-                  f"did not beat previous champion OOS ({prev_oos:.4f}).")
+            tier = "OOS GATE FAILURE -- this candidate never even cleared the OOS gates (see diagnosis above); the IS-side numbers below are the only evidence of any edge at all"
+        if naive_dd_1pct > NAIVE_DD_SOFT_THRESHOLD:
+            tier += f" | NAIVE DD ~{naive_dd_1pct:.0%} even at 1% risk/trade -- see note above"
+
+        save_winner(oos_score, is_score, best_params, tier=tier,
+                    naive_dd_1pct=naive_dd_1pct, naive_dd_2pct=naive_dd_2pct,
+                    max_consecutive_losses=max_streak, streak_ratio=streak_ratio,
+                    worst_day_loser_fraction=worst_day_frac, universe=tickers)
+        print(f"\n{'='*78}\nFINAL RESULT -- ROBUSTNESS TIER: {tier}\n{'='*78}")
+        print_performance_report(oos_score if oos_score > -900 else is_score,
+                                 oos_m if oos_score > -900 else is_m,
+                                 best_params,
+                                 "BEST CANDIDATE FOUND (see tier above before trading this)",
+                                 stock_names=stock_names, master_dates=master_dates)
+        print(f"\nSaved to {BEST_PARAMS_FILE} regardless of tier -- open that file to see the tier")
+        print("label alongside the params. A CAUTION or POOR tier is real information, not a")
+        print("recommendation to trade it at full size (or at all) -- see it as your current")
+        print("best-tested starting point while a better one keeps searching, not a finished system.")
     else:
-        print("\nNo strategy found that passes all quality gates.")
+        print("\nNo candidate cleared even the inner-train gates across every trial -- this is a")
+        print("stronger signal than a low robustness score: the entry/exit families and parameter")
+        print("ranges searched didn't find ANY combination with a positive, gate-passing edge even")
+        print("before checking generalization. Worth widening the search (see MA_LEN_MIN/MAX, the")
+        print("gate constants in section 0) or reconsidering whether these signal families fit this")
+        print("data before adding more trials.")
+
+
+def _suggest_params_from_trial(trial):
+    """Rebuilds the full params dict from a completed trial's stored
+    params (trial.params only contains what was actually suggested this
+    trial, which is already conditionally correct thanks to _suggest_params'
+    branching -- this just re-derives xover_long_len the same way)."""
+    tp = dict(trial.params)
+    p = {
+        'entry_type': tp['entry_type'], 'exit_type': tp['exit_type'],
+        'use_btc_entry_gate': tp['use_btc_entry_gate'],
+        'use_btc_exit_override': tp['use_btc_exit_override'],
+        'use_rsi_trend_filter': tp['use_rsi_trend_filter'],
+        'adx_thresh': tp['adx_thresh'], 'sl_mult': tp['sl_mult'], 'tp_mult': tp['tp_mult'],
+        'trail_mult': tp['trail_mult'], 'trail_pct': tp['trail_pct'], 'exit_atr_mult': tp['exit_atr_mult'],
+        'max_pyramid_layers': tp['max_pyramid_layers'],
+    }
+    if tp['entry_type'] == ENTRY_MA_BREAKOUT:
+        p['entry_ma_len'], p['entry_ma_type'] = tp['entry_ma_len'], tp['entry_ma_type']
+    elif tp['entry_type'] == ENTRY_RSI_XOVER:
+        p['rsi_f_len'], p['rsi_f_smt'] = tp['rsi_f_len'], tp['rsi_f_smt']
+        p['rsi_s_len'], p['rsi_s_smt'] = tp['rsi_s_len'], tp['rsi_s_smt']
+        if tp['use_rsi_trend_filter']:
+            p['rsi_trend_ma_len'], p['rsi_trend_ma_type'] = tp['rsi_trend_ma_len'], tp['rsi_trend_ma_type']
+    elif tp['entry_type'] == ENTRY_MA_XOVER:
+        p['xover_short_len']  = tp['xover_short_len']
+        p['xover_short_type'] = tp['xover_short_type']
+        p['xover_long_len']   = min(MA_LEN_MAX, tp['xover_short_len'] + tp['xover_gap'])
+        p['xover_long_type']  = tp['xover_long_type']
+
+    if tp['use_btc_entry_gate'] or tp['use_btc_exit_override']:
+        p['btc_ma_len'], p['btc_ma_type'] = tp['btc_ma_len'], tp['btc_ma_type']
+    else:
+        p['btc_ma_len'], p['btc_ma_type'] = 62, 0
+
+    if tp['exit_type'] == EXIT_MA_CROSSUNDER:
+        p['exit_ma_len'], p['exit_ma_type'] = tp['exit_ma_len'], tp['exit_ma_type']
+    elif tp['exit_type'] == EXIT_RSI_CROSSUNDER:
+        p['exit_rsi_f_len'], p['exit_rsi_f_smt'] = tp['exit_rsi_f_len'], tp['exit_rsi_f_smt']
+        p['exit_rsi_s_len'], p['exit_rsi_s_smt'] = tp['exit_rsi_s_len'], tp['exit_rsi_s_smt']
+    elif tp['exit_type'] == EXIT_MA_XOVER_EXIT:
+        p['exit_xover_short_len']  = tp['exit_xover_short_len']
+        p['exit_xover_short_type'] = tp['exit_xover_short_type']
+        p['exit_xover_long_len']   = min(MA_LEN_MAX, tp['exit_xover_short_len'] + tp['exit_xover_gap'])
+        p['exit_xover_long_type']  = tp['exit_xover_long_type']
+
+    return p
 
 
 if __name__ == "__main__":
