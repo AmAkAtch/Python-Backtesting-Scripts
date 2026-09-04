@@ -872,10 +872,14 @@ def compute_score_portfolio(metrics, yearly, is_oos=False):
     actual_wr = winning_trades / total_counted if total_counted > 0 else 0.0
     if actual_wr < MIN_WIN_RATE_GATE: return -999.0
 
+    # BUG FIX (found from a real run of the crypto pair, same fix here): the
+    # denominator is now the sum of POSITIVE years only, bounding a single
+    # year's share to [0%, 100%] instead of letting it exceed 100% when
+    # other years are net negative. See the crypto engine's identical fix.
     if yearly:
-        total_profit = sum(y['nominal_profit'] for y in yearly)
-        if total_profit > 0:
-            max_share = max(y['nominal_profit'] / total_profit for y in yearly)
+        positive_years_sum = sum(y['nominal_profit'] for y in yearly if y['nominal_profit'] > 0)
+        if positive_years_sum > 0:
+            max_share = max(max(0.0, y['nominal_profit']) / positive_years_sum for y in yearly)
             if max_share > CONCENTRATION_GATE_HARD:
                 return -999.0
 
@@ -950,9 +954,9 @@ def diagnose_gates_portfolio(metrics, yearly, is_oos=False):
         ('win_rate >= floor', wr >= MIN_WIN_RATE_GATE, f'{wr*100:.1f}%', f'>= {MIN_WIN_RATE_GATE*100:.0f}%'),
     ]
     if yearly:
-        total_profit = sum(y['nominal_profit'] for y in yearly)
-        if total_profit > 0:
-            max_share = max(y['nominal_profit'] / total_profit for y in yearly)
+        positive_years_sum = sum(y['nominal_profit'] for y in yearly if y['nominal_profit'] > 0)
+        if positive_years_sum > 0:
+            max_share = max(max(0.0, y['nominal_profit']) / positive_years_sum for y in yearly)
             rows.append((f'profit_concentration <= {CONCENTRATION_GATE_HARD*100:.0f}%',
                          max_share <= CONCENTRATION_GATE_HARD, f'{max_share*100:.1f}%',
                          f'<= {CONCENTRATION_GATE_HARD*100:.0f}%'))

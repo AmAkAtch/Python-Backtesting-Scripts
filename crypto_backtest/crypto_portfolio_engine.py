@@ -948,10 +948,20 @@ def compute_score_portfolio(metrics, yearly, is_oos=False):
 
     # HARD concentration gate -- deliberately stricter than the signal
     # engine's soft penalty. See module docstring for why.
+    #
+    # BUG FIX (found from a real run): this used to divide by the NET total
+    # profit across all years. When some years are net negative, one strong
+    # positive year's share of that smaller net total can mathematically
+    # exceed 100% (seen in a real run: 481%, 241%, 201%...) -- technically
+    # consistent with the old formula, but a nonsensical number to show a
+    # user and not what "concentration" is supposed to mean. Denominator is
+    # now the sum of POSITIVE years only, so a single year's share is
+    # properly bounded to [0%, 100%]: "what fraction of the GROSS gains came
+    # from this one year," independent of how much other years lost.
     if yearly:
-        total_profit = sum(y['nominal_profit'] for y in yearly)
-        if total_profit > 0:
-            max_share = max(y['nominal_profit'] / total_profit for y in yearly)
+        positive_years_sum = sum(y['nominal_profit'] for y in yearly if y['nominal_profit'] > 0)
+        if positive_years_sum > 0:
+            max_share = max(max(0.0, y['nominal_profit']) / positive_years_sum for y in yearly)
             if max_share > CONCENTRATION_GATE_HARD:
                 return -999.0
 
@@ -1027,9 +1037,9 @@ def diagnose_gates_portfolio(metrics, yearly, is_oos=False):
         ('win_rate >= floor', wr >= MIN_WIN_RATE_GATE, f'{wr*100:.1f}%', f'>= {MIN_WIN_RATE_GATE*100:.0f}%'),
     ]
     if yearly:
-        total_profit = sum(y['nominal_profit'] for y in yearly)
-        if total_profit > 0:
-            max_share = max(y['nominal_profit'] / total_profit for y in yearly)
+        positive_years_sum = sum(y['nominal_profit'] for y in yearly if y['nominal_profit'] > 0)
+        if positive_years_sum > 0:
+            max_share = max(max(0.0, y['nominal_profit']) / positive_years_sum for y in yearly)
             rows.append((f'profit_concentration <= {CONCENTRATION_GATE_HARD*100:.0f}%',
                          max_share <= CONCENTRATION_GATE_HARD, f'{max_share*100:.1f}%',
                          f'<= {CONCENTRATION_GATE_HARD*100:.0f}%'))

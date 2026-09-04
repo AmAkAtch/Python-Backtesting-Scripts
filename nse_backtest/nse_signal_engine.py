@@ -129,6 +129,16 @@ MIN_WIN_RATE_GATE  = 0.35   # trend systems are SUPPOSED to have a sub-50% win r
 MIN_PROFIT_FACTOR  = 1.10
 MEDIAN_STOCK_R_GATE = 0.0
 
+# -- Signal-level drawdown gate -- reject a candidate outright if ANY stock's
+# own R-multiple-based equity curve would have drawn down more than this.
+# Same rationale as the crypto engine's identical gate: great expectancy/SQN
+# can still hide a stock that would have wiped out a third of an account on
+# its own. See compute_per_coin_drawdowns()'s docstring for exactly how this
+# is computed without needing any shared cash pool. --
+MAX_SIGNAL_DRAWDOWN     = 0.30   # 30% -- reject if any single stock's own equity curve draws down worse than this
+DRAWDOWN_RISK_PER_TRADE = 0.02   # assumed fixed-fractional risk-per-trade for this gate's equity-curve
+                                   # normalization ONLY -- unrelated to the portfolio engine's real sizing
+
 INNER_VAL_PCT        = 0.30
 MIN_YEARS_GATE_INNER  = 2
 MIN_TRADES_INNER_VAL  = 20
@@ -197,6 +207,32 @@ def _recency_weight(year, min_year, max_year):
         return RECENCY_WEIGHT_MAX
     frac = (year - min_year) / (max_year - min_year)
     return RECENCY_WEIGHT_MIN + (RECENCY_WEIGHT_MAX - RECENCY_WEIGHT_MIN) * frac
+
+
+def compute_per_coin_drawdowns(r_multiple, entry_days, stock_idx, risk_per_trade=DRAWDOWN_RISK_PER_TRADE):
+    """Per-stock equity-curve drawdown, identical technique to the crypto
+    engine's version -- see that file's docstring for the full reasoning.
+    Kept the name `per_coin` for exact parity with the crypto engine (this
+    function is otherwise byte-for-byte identical); NSE vocabulary calls
+    the same thing `per_stock` everywhere else in this file."""
+    per_coin_dd = {}
+    for c in np.unique(stock_idx):
+        mask = stock_idx == c
+        order = np.argsort(entry_days[mask])
+        r_seq = r_multiple[mask][order]
+        equity = 1.0
+        peak = 1.0
+        worst_dd = 0.0
+        for r in r_seq:
+            equity *= max(0.0, 1.0 + risk_per_trade * r)
+            if equity > peak:
+                peak = equity
+            elif peak > 0:
+                dd = (equity - peak) / peak
+                if dd < worst_dd:
+                    worst_dd = dd
+        per_coin_dd[int(c)] = abs(worst_dd)
+    return per_coin_dd
 
 
 # ==========================================================================
@@ -1200,6 +1236,15 @@ def compute_score_signal(r_multiple, pct_return, bars_held, entry_years,
         metrics['median_stock_mean_r'] = median_stock_mean_r
         return -999.0, metrics
 
+    # -- signal-level drawdown gate -- see MAX_SIGNAL_DRAWDOWN's docstring
+    # (section 0) and the crypto engine's identical gate for the reasoning.
+    per_stock_drawdown = compute_per_coin_drawdowns(r_multiple, entry_days, stock_idx)
+    worst_stock_drawdown = max(per_stock_drawdown.values()) if per_stock_drawdown else 0.0
+    if worst_stock_drawdown > MAX_SIGNAL_DRAWDOWN:
+        metrics['worst_stock_drawdown'] = worst_stock_drawdown
+        metrics['per_stock_drawdown'] = per_stock_drawdown
+        return -999.0, metrics
+
     mean_r = float(r_capped.mean()); median_r = float(np.median(r_capped)); std_r = float(r_capped.std())
     sqn = (mean_r / std_r) * math.sqrt(min(n_trades, 100)) if std_r > 0 else 0.0
     sqn_capped = min(sqn, SQN_CAP)
@@ -1249,6 +1294,7 @@ def compute_score_signal(r_multiple, pct_return, bars_held, entry_years,
         'sqn': sqn, 'sqn_capped': sqn_capped,
         'median_yearly_avg_r': median_yearly_avg_r, 'recency_weighted_avg_r': recency_weighted_avg_r,
         'median_stock_mean_r': median_stock_mean_r, 'per_stock_mean_r': per_stock_mean_r,
+        'worst_stock_drawdown': worst_stock_drawdown, 'per_stock_drawdown': per_stock_drawdown,
         'year_r_avg': year_r_avg, 'year_r_sum_raw': year_r_sum_raw, 'year_weights': dict(zip(distinct_years, weights)),
         'global_min_year': global_min_year, 'global_max_year': global_max_year,
         'max_year_share': max_year_share, 'max_stock_share': max_stock_share,
@@ -1262,7 +1308,7 @@ def compute_score_signal(r_multiple, pct_return, bars_held, entry_years,
 
 
 def diagnose_gates_signal(r_multiple, pct_return, bars_held, entry_years, stock_idx,
-                           is_oos=False, min_trades_required=None):
+                           entry_days=None, is_oos=False, min_trades_required=None):
     n_trades = len(r_multiple)
     target_trades = min_trades_required if min_trades_required is not None else (
         max(15, int(MIN_TRADES_GATE * (WFO_OOS_PCT / WFO_IS_PCT))) if is_oos else MIN_TRADES_GATE)
@@ -1285,12 +1331,18 @@ def diagnose_gates_signal(r_multiple, pct_return, bars_held, entry_years, stock_
     per_stock_r = [float(r_multiple[stock_idx == c].mean()) for c in np.unique(stock_idx)]
     median_stock_r = float(np.median(per_stock_r)) if per_stock_r else 0.0
     rows.append(('median-stock mean-R > gate', median_stock_r > MEDIAN_STOCK_R_GATE, f'{median_stock_r:.3f}R', f'> {MEDIAN_STOCK_R_GATE}'))
+    if entry_days is not None:
+        per_stock_dd = compute_per_coin_drawdowns(r_multiple, entry_days, stock_idx)
+        worst_dd = max(per_stock_dd.values()) if per_stock_dd else 0.0
+        rows.append((f'worst-stock drawdown <= {MAX_SIGNAL_DRAWDOWN*100:.0f}%', worst_dd <= MAX_SIGNAL_DRAWDOWN,
+                     f'{worst_dd*100:.1f}%', f'<= {MAX_SIGNAL_DRAWDOWN*100:.0f}%'))
     return rows
 
 
 def print_gate_diagnosis_signal(r_multiple, pct_return, bars_held, entry_years, stock_idx,
-                                 is_oos=False, label="GATE DIAGNOSIS", min_trades_required=None):
-    rows = diagnose_gates_signal(r_multiple, pct_return, bars_held, entry_years, stock_idx, is_oos, min_trades_required)
+                                 entry_days=None, is_oos=False, label="GATE DIAGNOSIS", min_trades_required=None):
+    rows = diagnose_gates_signal(r_multiple, pct_return, bars_held, entry_years, stock_idx,
+                                  entry_days, is_oos, min_trades_required)
     print(f"\n{'-'*60}\n{label}\n{'-'*60}")
     first_fail = False
     for name, passed, actual, threshold in rows:
@@ -1499,6 +1551,8 @@ def print_performance_report(score, metrics, p, label=""):
           f"Recency-weighted avg-R/trade: {metrics.get('recency_weighted_avg_r',0):.2f}")
     print(f"Median-stock mean-R: {metrics.get('median_stock_mean_r',0):.3f}R  |  "
           f"Distinct stocks: {metrics.get('distinct_stocks',0)}  |  Distinct years: {len(metrics.get('distinct_years',[]))}")
+    print(f"Worst-stock drawdown: {metrics.get('worst_stock_drawdown',0)*100:.1f}%  "
+          f"(gate: <= {MAX_SIGNAL_DRAWDOWN*100:.0f}%, assumes {DRAWDOWN_RISK_PER_TRADE*100:.0f}% risked per trade)")
     print("=" * 78)
 
 

@@ -120,6 +120,27 @@ MIN_WIN_RATE_GATE     = 0.35   # trend systems are SUPPOSED to have a sub-50% wi
 MIN_PROFIT_FACTOR     = 1.10
 MEDIAN_COIN_R_GATE    = 0.0    # median-across-coins mean-R must clear this (see docstring)
 
+# -- Signal-level drawdown gate -- reject a candidate outright if ANY coin's
+# own R-multiple-based equity curve would have drawn down more than this,
+# even though this file otherwise has no shared cash pool / portfolio
+# equity curve at all. This is a deliberate, narrow exception to "no capital
+# constraints in the signal engine": an entry/exit LOGIC that would
+# realistically wipe out a third of an account on just one coin, traded in
+# isolation with disciplined fixed-fractional risk sizing, isn't a signal
+# worth passing to the portfolio stage no matter how good its expectancy or
+# SQN look -- those aggregate stats can hide a catastrophic losing streak.
+# For each coin, its own trades are replayed in chronological order on a
+# normalized equity curve (equity *= 1 + DRAWDOWN_RISK_PER_TRADE * R per
+# trade), independent of every other coin -- there's still no shared
+# capital, no capital-timing luck, just "how bad would THIS coin's ride
+# have been under disciplined risk sizing." Uses RAW (non-winsorized)
+# R-multiples specifically so a genuine tail trade isn't capped away before
+# it can trip this gate.
+MAX_SIGNAL_DRAWDOWN     = 0.30   # 30% -- reject if any single coin's own equity curve draws down worse than this
+DRAWDOWN_RISK_PER_TRADE = 0.02   # assumed fixed-fractional risk-per-trade for this gate's equity-curve
+                                   # normalization ONLY -- a systematic-trading sizing convention, unrelated
+                                   # to the portfolio engine's real position sizing
+
 # -- Robustness-aware search: the IS window is split into an inner TRAIN
 # slice and an inner VALIDATION slice, and every trial is scored on the
 # WORSE of the two. True OOS (WFO_OOS_PCT) is never touched during search. --
@@ -195,6 +216,40 @@ def _recency_weight(year, min_year, max_year):
         return RECENCY_WEIGHT_MAX
     frac = (year - min_year) / (max_year - min_year)
     return RECENCY_WEIGHT_MIN + (RECENCY_WEIGHT_MAX - RECENCY_WEIGHT_MIN) * frac
+
+
+def compute_per_coin_drawdowns(r_multiple, entry_days, stock_idx, risk_per_trade=DRAWDOWN_RISK_PER_TRADE):
+    """
+    For each coin, replays its own trades in chronological order on a
+    normalized equity curve (equity *= 1 + risk_per_trade * R per trade,
+    geometric compounding under a fixed-fractional risk-sizing assumption)
+    and returns that coin's own worst peak-to-trough drawdown, as a
+    positive fraction. Computed PER COIN, fully independently -- there is
+    no shared cash pool here (that's the portfolio engine's job), so this
+    answers "if this coin alone were traded with disciplined fixed-
+    fractional risk sizing, how bad would the ride have been," not "what
+    would my actual account have done." Deliberately uses RAW r_multiple
+    (not winsorized) so a genuine catastrophic trade isn't capped away
+    before it can register here.
+    """
+    per_coin_dd = {}
+    for c in np.unique(stock_idx):
+        mask = stock_idx == c
+        order = np.argsort(entry_days[mask])
+        r_seq = r_multiple[mask][order]
+        equity = 1.0
+        peak = 1.0
+        worst_dd = 0.0
+        for r in r_seq:
+            equity *= max(0.0, 1.0 + risk_per_trade * r)
+            if equity > peak:
+                peak = equity
+            elif peak > 0:
+                dd = (equity - peak) / peak
+                if dd < worst_dd:
+                    worst_dd = dd
+        per_coin_dd[int(c)] = abs(worst_dd)
+    return per_coin_dd
 
 
 # ==========================================================================
@@ -1156,6 +1211,20 @@ def compute_score_signal(r_multiple, pct_return, bars_held, entry_years,
         metrics['median_coin_mean_r'] = median_coin_mean_r
         return -999.0, metrics
 
+    # -- signal-level drawdown gate: reject outright if any single coin's
+    # own R-multiple equity curve would have drawn down worse than
+    # MAX_SIGNAL_DRAWDOWN, even under disciplined fixed-fractional risk
+    # sizing. See MAX_SIGNAL_DRAWDOWN's docstring (section 0) for why this
+    # lives here despite the signal engine otherwise having no portfolio
+    # equity curve at all -- great expectancy/SQN can still hide a coin
+    # that would have wiped out a third of an account on its own. --
+    per_coin_drawdown = compute_per_coin_drawdowns(r_multiple, entry_days, stock_idx)
+    worst_coin_drawdown = max(per_coin_drawdown.values()) if per_coin_drawdown else 0.0
+    if worst_coin_drawdown > MAX_SIGNAL_DRAWDOWN:
+        metrics['worst_coin_drawdown'] = worst_coin_drawdown
+        metrics['per_coin_drawdown'] = per_coin_drawdown
+        return -999.0, metrics
+
     mean_r   = float(r_capped.mean())
     median_r = float(np.median(r_capped))
     std_r    = float(r_capped.std())
@@ -1218,6 +1287,8 @@ def compute_score_signal(r_multiple, pct_return, bars_held, entry_years,
         'recency_weighted_avg_r': recency_weighted_avg_r,
         'median_coin_mean_r': median_coin_mean_r,
         'per_coin_mean_r': per_coin_mean_r,
+        'worst_coin_drawdown': worst_coin_drawdown,
+        'per_coin_drawdown': per_coin_drawdown,
         'year_r_avg': year_r_avg, 'year_r_sum_raw': year_r_sum_raw,
         'year_weights': dict(zip(distinct_years, weights)),
         'global_min_year': global_min_year, 'global_max_year': global_max_year,
@@ -1234,7 +1305,7 @@ def compute_score_signal(r_multiple, pct_return, bars_held, entry_years,
 
 
 def diagnose_gates_signal(r_multiple, pct_return, bars_held, entry_years,
-                           stock_idx, is_oos=False, min_trades_required=None):
+                           stock_idx, entry_days=None, is_oos=False, min_trades_required=None):
     n_trades = len(r_multiple)
     if min_trades_required is not None:
         target_trades = min_trades_required
@@ -1262,14 +1333,19 @@ def diagnose_gates_signal(r_multiple, pct_return, bars_held, entry_years,
     median_coin_r = float(np.median(per_coin_mean_r)) if per_coin_mean_r else 0.0
     rows.append(('median-coin mean-R > gate', median_coin_r > MEDIAN_COIN_R_GATE,
                  f'{median_coin_r:.3f}R', f'> {MEDIAN_COIN_R_GATE}'))
+    if entry_days is not None:
+        per_coin_dd = compute_per_coin_drawdowns(r_multiple, entry_days, stock_idx)
+        worst_dd = max(per_coin_dd.values()) if per_coin_dd else 0.0
+        rows.append((f'worst-coin drawdown <= {MAX_SIGNAL_DRAWDOWN*100:.0f}%', worst_dd <= MAX_SIGNAL_DRAWDOWN,
+                     f'{worst_dd*100:.1f}%', f'<= {MAX_SIGNAL_DRAWDOWN*100:.0f}%'))
     return rows
 
 
 def print_gate_diagnosis_signal(r_multiple, pct_return, bars_held, entry_years,
-                                 stock_idx, is_oos=False, label="GATE DIAGNOSIS",
+                                 stock_idx, entry_days=None, is_oos=False, label="GATE DIAGNOSIS",
                                  min_trades_required=None):
     rows = diagnose_gates_signal(r_multiple, pct_return, bars_held, entry_years, stock_idx,
-                                  is_oos, min_trades_required)
+                                  entry_days, is_oos, min_trades_required)
     print(f"\n{'-'*60}\n{label}\n{'-'*60}")
     first_fail = False
     for name, passed, actual, threshold in rows:
@@ -1532,6 +1608,8 @@ def print_performance_report(score, metrics, p, label=""):
           f"Recency-weighted avg-R/trade: {metrics.get('recency_weighted_avg_r',0):.2f}")
     print(f"Median-coin mean-R: {metrics.get('median_coin_mean_r',0):.3f}R  "
           f"(the TYPICAL coin's own edge, not the portfolio-dominant one)")
+    print(f"Worst-coin drawdown: {metrics.get('worst_coin_drawdown',0)*100:.1f}%  "
+          f"(gate: <= {MAX_SIGNAL_DRAWDOWN*100:.0f}%, assumes {DRAWDOWN_RISK_PER_TRADE*100:.0f}% risked per trade)")
     print(f"Distinct coins: {metrics.get('distinct_coins',0)}  |  Distinct years: {len(metrics.get('distinct_years',[]))}  |  "
           f"Max coin profit-share: {metrics.get('max_coin_share',0)*100:.1f}%  |  "
           f"Max year profit-share: {metrics.get('max_year_share',0)*100:.1f}%")
