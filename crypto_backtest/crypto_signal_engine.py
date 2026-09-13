@@ -138,8 +138,19 @@ MEDIAN_COIN_R_GATE    = 0.0    # median-across-coins mean-R must clear this (see
 # it can trip this gate.
 MAX_SIGNAL_DRAWDOWN     = 0.30   # 30% -- reject if any single coin's own equity curve draws down worse than this
 DRAWDOWN_RISK_PER_TRADE = 0.02   # assumed fixed-fractional risk-per-trade for this gate's equity-curve
-                                   # normalization ONLY -- a systematic-trading sizing convention, unrelated
-                                   # to the portfolio engine's real position sizing
+                                   # normalization ONLY -- a systematic-trading sizing convention.
+                                   # AUDIT NOTE: this used to be unrelated to the portfolio engine's real
+                                   # position sizing -- that engine sized purely by equal-weight AUM share
+                                   # with no reference to stop distance at all, so a config this gate called
+                                   # "safe" at an assumed 2% risk/trade could reach the portfolio stage and
+                                   # actually risk many times that on one trade (confirmed empirically: a
+                                   # single sl_mult=8.0 trade -- in-range for this file's own search space --
+                                   # produced a 13.4% PORTFOLIO drawdown from that one trade alone before the
+                                   # fix). crypto_portfolio_engine.py now implements real risk-based sizing
+                                   # using this same RISK_PER_TRADE convention (see RISK_PER_TRADE there), so
+                                   # this gate's assumption and that engine's actual behavior are finally
+                                   # the same thing. If you retune DRAWDOWN_RISK_PER_TRADE here, consider
+                                   # whether RISK_PER_TRADE over there should move with it.
 
 # -- Robustness-aware search: the IS window is split into an inner TRAIN
 # slice and an inner VALIDATION slice, and every trial is scored on the
@@ -1233,15 +1244,33 @@ def compute_score_signal(r_multiple, pct_return, bars_held, entry_years,
 
     year_r_avg = {}
     year_r_sum_raw = {}
+    year_coin_median_r = {}
     for yr in distinct_years:
         yr_mask = entry_years == yr
         year_r_avg[yr] = float(r_capped[yr_mask].mean())
         year_r_sum_raw[yr] = float(r_multiple[yr_mask].sum())
-    median_yearly_avg_r = float(np.median(list(year_r_avg.values())))
+        # UPGRADE (per user request): year_r_avg above pools ALL trades that
+        # year regardless of which coin fired them, so a coin that happened
+        # to fire many signals in one year can dominate that year's reading
+        # even if OTHER coins had a mediocre year -- the same trade-count-
+        # weighting bias the median_coin_mean_r gate already guards against
+        # in aggregate, just not per-year until now. year_coin_median_r
+        # fixes this for the SCORED per-year statistic specifically: for
+        # each coin active that year, compute ITS OWN mean R that year, then
+        # take the MEDIAN ACROSS COINS -- "how did the typical coin do in a
+        # typical year," robust to both one coin dominating a year and one
+        # year dominating the recency-weighted average. year_r_avg/
+        # year_r_sum_raw are kept as-is and still feed the concentration
+        # diagnostic below (that's specifically about raw dollar/R exposure,
+        # not a coin-robustness question, so it's deliberately untouched).
+        coins_this_year = np.unique(stock_idx[yr_mask])
+        per_coin_r_this_year = [float(r_capped[yr_mask & (stock_idx == c)].mean()) for c in coins_this_year]
+        year_coin_median_r[yr] = float(np.median(per_coin_r_this_year)) if per_coin_r_this_year else 0.0
+    median_yearly_avg_r = float(np.median(list(year_coin_median_r.values())))
 
     weights = [_recency_weight(yr, global_min_year, global_max_year) for yr in distinct_years]
     w_sum = sum(weights)
-    recency_weighted_avg_r = (sum(w * year_r_avg[yr] for w, yr in zip(weights, distinct_years)) / w_sum
+    recency_weighted_avg_r = (sum(w * year_coin_median_r[yr] for w, yr in zip(weights, distinct_years)) / w_sum
                                if w_sum > 0 else median_yearly_avg_r)
 
     total_r_raw = float(r_multiple.sum())
@@ -1289,7 +1318,7 @@ def compute_score_signal(r_multiple, pct_return, bars_held, entry_years,
         'per_coin_mean_r': per_coin_mean_r,
         'worst_coin_drawdown': worst_coin_drawdown,
         'per_coin_drawdown': per_coin_drawdown,
-        'year_r_avg': year_r_avg, 'year_r_sum_raw': year_r_sum_raw,
+        'year_r_avg': year_r_avg, 'year_r_sum_raw': year_r_sum_raw, 'year_coin_median_r': year_coin_median_r,
         'year_weights': dict(zip(distinct_years, weights)),
         'global_min_year': global_min_year, 'global_max_year': global_max_year,
         'max_year_share': max_year_share, 'max_coin_share': max_coin_share,

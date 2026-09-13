@@ -1249,16 +1249,25 @@ def compute_score_signal(r_multiple, pct_return, bars_held, entry_years,
     sqn = (mean_r / std_r) * math.sqrt(min(n_trades, 100)) if std_r > 0 else 0.0
     sqn_capped = min(sqn, SQN_CAP)
 
-    year_r_avg = {}; year_r_sum_raw = {}
+    year_r_avg = {}; year_r_sum_raw = {}; year_coin_median_r = {}
     for yr in distinct_years:
         yr_mask = entry_years == yr
         year_r_avg[yr] = float(r_capped[yr_mask].mean())
         year_r_sum_raw[yr] = float(r_multiple[yr_mask].sum())
-    median_yearly_avg_r = float(np.median(list(year_r_avg.values())))
+        # UPGRADE (per user request, same as the crypto engine's identical
+        # change): median-across-coins-active-that-year, instead of a
+        # trade-count-weighted pooled mean, drives the SCORED per-year
+        # statistic -- see the crypto engine's comment for the full
+        # reasoning. year_r_avg/year_r_sum_raw are kept as-is for the
+        # concentration diagnostic, which is deliberately untouched.
+        stocks_this_year = np.unique(stock_idx[yr_mask])
+        per_stock_r_this_year = [float(r_capped[yr_mask & (stock_idx == c)].mean()) for c in stocks_this_year]
+        year_coin_median_r[yr] = float(np.median(per_stock_r_this_year)) if per_stock_r_this_year else 0.0
+    median_yearly_avg_r = float(np.median(list(year_coin_median_r.values())))
 
     weights = [_recency_weight(yr, global_min_year, global_max_year) for yr in distinct_years]
     w_sum = sum(weights)
-    recency_weighted_avg_r = (sum(w * year_r_avg[yr] for w, yr in zip(weights, distinct_years)) / w_sum
+    recency_weighted_avg_r = (sum(w * year_coin_median_r[yr] for w, yr in zip(weights, distinct_years)) / w_sum
                                if w_sum > 0 else median_yearly_avg_r)
 
     total_r_raw = float(r_multiple.sum())
@@ -1295,7 +1304,8 @@ def compute_score_signal(r_multiple, pct_return, bars_held, entry_years,
         'median_yearly_avg_r': median_yearly_avg_r, 'recency_weighted_avg_r': recency_weighted_avg_r,
         'median_stock_mean_r': median_stock_mean_r, 'per_stock_mean_r': per_stock_mean_r,
         'worst_stock_drawdown': worst_stock_drawdown, 'per_stock_drawdown': per_stock_drawdown,
-        'year_r_avg': year_r_avg, 'year_r_sum_raw': year_r_sum_raw, 'year_weights': dict(zip(distinct_years, weights)),
+        'year_r_avg': year_r_avg, 'year_r_sum_raw': year_r_sum_raw, 'year_coin_median_r': year_coin_median_r,
+        'year_weights': dict(zip(distinct_years, weights)),
         'global_min_year': global_min_year, 'global_max_year': global_max_year,
         'max_year_share': max_year_share, 'max_stock_share': max_stock_share,
         'concentration_penalty': concentration_penalty, 'distinct_years': distinct_years,

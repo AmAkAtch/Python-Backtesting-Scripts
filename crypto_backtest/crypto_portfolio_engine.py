@@ -30,13 +30,28 @@ have, and leaves the watchlist via the exact same exit rule that would
 have sold it -- never a separate arbitrary max-age/grace-period heuristic.
 
 CONSOLIDATED FROM THE PORTFOLIO-SIMULATION LINEAGE:
-  - Unified cash pool + unconditional monthly SIP, equal-weight target
-    position sizing `(cash + cost-basis of open positions) / n_eligible`
-    (recomputed every deployment step, cost-basis not mark-to-market, so
-    one winner's unrealized paper gain never inflates an unrelated next
-    trade's size) -- replaces an earlier, more primitive fixed-dollar-
-    chunk deployment loop for the reasons documented at the time: fixed
-    chunks either starve simultaneous opportunities or leave cash idle.
+  - Unified cash pool + unconditional monthly SIP, position sizing that's
+    the SMALLER of an equal-weight target -- `(cash + cost-basis of open
+    positions) / min(n_eligible, TARGET_CONCURRENT_POSITIONS)` -- and a
+    risk-based target -- `RISK_PER_TRADE * AUM / stop_distance_pct` -- then
+    capped again by MAX_POSITION_PCT of AUM per coin (recomputed every
+    deployment step, cost-basis not mark-to-market, so one winner's
+    unrealized paper gain never inflates an unrelated next trade's size).
+    BUG FIX (audit finding, see comments at the sizing constants and at the
+    deployment loop itself for the full writeup): this used to be pure
+    equal-weight against EVERY liquidity-eligible coin with no reference to
+    risk at all, which meant crypto_signal_engine.py's drawdown gate -- which
+    only means what it claims under an assumed fixed-fractional risk
+    convention -- was never actually connected to how trades were sized
+    here. It also meant capital was diluted across a much larger notional
+    denominator (commonly 40-60 eligible coins) than the number of positions
+    a selective trend-following signal ever actually holds at once, leaving
+    most contributed capital idle. The original equal-weight approach itself
+    replaced an earlier, more primitive fixed-dollar-chunk deployment loop
+    for the reasons documented at the time: fixed chunks either starve
+    simultaneous opportunities or leave cash idle -- that reasoning still
+    holds, it just needed a more realistic denominator and a risk ceiling
+    alongside it, not a replacement.
   - Two-phase signal-at-close/fill-at-next-open execution discipline,
     identical to the signal engine, so a trade that would have filled
     there fills the same way here.
@@ -133,6 +148,48 @@ MONTHLY_SIP      = 2_000.0
 # floor's only real job is "don't bother with dust trades" -- it should never
 # have been tied to the SIP amount at all.
 MIN_TICKET_SIZE  = 50.0
+
+# BUG FIX (audit finding): position sizing used to be PURELY
+# (cash+invested)/n_eligible -- equal-weight against every liquidity-eligible
+# coin in the universe (commonly 40-60), with zero reference to how far a
+# trade's stop sits. crypto_signal_engine.py's per-coin drawdown gate
+# (MAX_SIGNAL_DRAWDOWN) only means what it claims -- that a config is "safe"
+# -- under an assumed fixed-fractional risk convention (its own
+# DRAWDOWN_RISK_PER_TRADE, 2%); that engine's own comment calls this
+# "unrelated to the portfolio engine's real position sizing." It wasn't
+# unrelated by necessity, just by omission: nothing here ever implemented
+# it. A signal-engine-approved config with a wide stop (sl_mult up to 8.0 is
+# in that engine's own search space) could reach the portfolio engine and
+# risk many multiples of 2% of capital on one trade. RISK_PER_TRADE below
+# closes that gap by actually sizing to risk, matching the convention the
+# signal engine already assumed. Confirmed empirically before this fix: a
+# single sl_mult=8.0 trade in a thin (3-coin-eligible) universe produced a
+# 13.4% PORTFOLIO drawdown from that one trade alone -- 6.7x the 2% the
+# signal engine's gate assumed. Tune this like any other risk knob.
+RISK_PER_TRADE = 0.02
+
+# Hard ceiling on how much of the book any single coin can reach, including
+# after pyramiding (previously unbounded -- every pyramid add re-used the
+# same full, undiluted equal-weight target with no per-coin cap at all).
+# Independent backstop in case risk-sizing alone would still allow a large
+# allocation (e.g. a tight stop on a config that also pyramids to the cap).
+MAX_POSITION_PCT = 0.20
+
+# BUG FIX (audit finding): the equal-weight sizing denominator used to be
+# n_eligible -- the COUNT OF ALL LIQUIDITY-ELIGIBLE COINS on a given day,
+# not any estimate of how many positions this book actually expects to hold
+# at once. A selective trend-following entry signal only ever fires on a
+# handful of coins at a time, so sizing against the full eligible count (up
+# to the low dozens to ~60 depending on TOP_N_COINS) left most contributed
+# capital sitting idle as 0%-yield cash indefinitely, diluting returns
+# toward roughly "however much cash happened to be idle" regardless of how
+# good the underlying signal was. Confirmed empirically before this fix: a
+# coin that returned +203% while it was the ONLY signal in a 21-coin
+# eligible universe produced an overall portfolio ROI of just 0.39% -- the
+# win was real, it was just swamped by undeployed cash. Size instead against
+# a real concurrent-position target; tune to taste.
+TARGET_CONCURRENT_POSITIONS = 10
+
 CRYPTO_DAYS_PER_YEAR = 365.0
 
 BINANCE_TAKER_PCT = 0.00100
@@ -183,8 +240,25 @@ W_BEAR_DEFENSE = 0.50
 # the same limited cash on the same day -- applies uniformly to every
 # candidate this file tests, since it's a money-management choice, not a
 # signal-quality one. 0=deepest %% discount from trigger price, 1=closest
-# to its own trend/entry level, 2=strongest momentum. --
+# to its own trend/entry level, 2=strongest momentum.
+#
+# 3 = NO WATCHLIST / take-the-next-signal (per user request): instead of
+# accumulating a pool of candidates and picking the "best" one whenever
+# cash frees up, this mode doesn't look for a new entry signal AT ALL
+# until cash is already available -- the first (chronologically) coin to
+# trigger from that point on gets funded immediately, no ranking, no
+# cherry-picking among whoever else happens to be waiting. This exists
+# specifically to TEST whether a strategy's edge depends on the ranking
+# mechanism's implicit hindsight (always being able to pick the
+# "best-looking" simultaneous candidate) or holds up under a simpler,
+# selection-bias-free, first-signal-wins policy. Existing positions can
+# still pyramid normally in this mode (that's "adding to a position you
+# already hold," not "competing for a slot"), and shadow candidates can
+# still be invalidated while waiting, same as every other mode -- the ONLY
+# thing this changes is that a fresh signal is never even registered while
+# there's no cash to act on it, so at most one candidate is ever pending.
 WL_RANK_METHOD = 0
+WL_RANK_NO_WATCHLIST = 3
 
 # -- temporal (random-SIP-day) robustness --
 TEMPORAL_ROBUSTNESS_RUNS      = 15
@@ -326,10 +400,12 @@ def build_sip_schedule(master_dates, mode='month_start', seed=None,
 
 # ==========================================================================
 # 3. PORTFOLIO SIMULATOR -- shared cash pool, monthly SIP, watchlist shadow
-# positions, equal-weight sizing. Supports the FULL entry x exit taxonomy
-# from crypto_signal_engine.py (3 entry families x 6 exit families x every
-# toggle including latched-entry), generalized from a money-management
-# pattern that originally only supported one hardcoded entry/exit family.
+# positions, risk-capped equal-weight sizing (see RISK_PER_TRADE /
+# MAX_POSITION_PCT / TARGET_CONCURRENT_POSITIONS above). Supports the FULL
+# entry x exit taxonomy from crypto_signal_engine.py (3 entry families x 6
+# exit families x every toggle including latched-entry), generalized from a
+# money-management pattern that originally only supported one hardcoded
+# entry/exit family.
 # ==========================================================================
 
 @njit(nogil=True)
@@ -349,9 +425,11 @@ def simulate_portfolio_crypto(
         start_day, end_day,
         starting_wealth, bench_starting_wealth,
         buy_cost_pct, sell_cost_pct, annual_cash_yield,
-        monthly_sip, min_ticket_size):
+        monthly_sip, min_ticket_size,
+        risk_per_trade, max_position_pct, target_concurrent_positions):
     """
-    monthly_sip / min_ticket_size are passed explicitly rather than read as
+    monthly_sip / min_ticket_size / risk_per_trade / max_position_pct /
+    target_concurrent_positions are passed explicitly rather than read as
     bare module globals. numba freezes a referenced module-level global's
     value into the compiled function AT FIRST COMPILATION -- reassigning the
     Python-level constant afterward (e.g. while testing) silently has NO
@@ -365,14 +443,32 @@ def simulate_portfolio_crypto(
 
     n_days, n_stocks = closes.shape
     if end_day < 0 or end_day >= n_days: end_day = n_days - 2
+
+    # BUG FIX (audit finding): day index 0 can never be processed by the
+    # main loop below -- it always starts at max(start_day, 1), because
+    # every d-1 lookback in this function needs a prior day to exist. On a
+    # real run start_day arrives here as 0 and the data window starts
+    # exactly on a calendar month boundary (crypto_signal_engine.py's
+    # START_DATE), so sip_flag[0] is True and that very first month's
+    # contribution was silently never injected anywhere -- not into
+    # cash_pool, not into total_invested_capital, not into the XIRR
+    # cashflows. Capture it before the clamp and fold it into the opening
+    # balances instead of losing it.
+    first_day_sip = 0.0
+    if start_day <= 0 and sip_flag[0]:
+        first_day_sip = monthly_sip
     if start_day < 1: start_day = 1
     if max_pyramid_layers < 1: max_pyramid_layers = 1
 
     daily_yield_mult = (1.0 + annual_cash_yield) ** (1.0 / 365.0)
     btc_col = closes[:, 0]
 
-    cash_pool = starting_wealth
-    total_invested_capital = 0.0
+    cash_pool = starting_wealth + first_day_sip
+    total_invested_capital = first_day_sip
+
+    bought_today          = np.zeros(n_stocks, dtype=np.bool_)  # BUG FIX: same-day purchase valuation (see below)
+    partial_realized_pnl  = np.zeros(n_stocks)                  # BUG FIX: fold TP-partial P&L into ONE trade record (see below)
+    partial_invested_val  = np.zeros(n_stocks)
 
     in_pos           = np.zeros(n_stocks, dtype=np.bool_)
     n_layers         = np.zeros(n_stocks, dtype=np.int32)
@@ -418,22 +514,35 @@ def simulate_portfolio_crypto(
     cf_amounts = np.zeros(MAX_CF)
     cf_cnt = 0
     if starting_wealth > 0:
-        cf_days[0] = start_day
-        cf_amounts[0] = -starting_wealth
-        cf_cnt = 1
+        cf_days[cf_cnt] = start_day
+        cf_amounts[cf_cnt] = -starting_wealth
+        cf_cnt += 1
+    if first_day_sip > 0:
+        cf_days[cf_cnt] = start_day
+        cf_amounts[cf_cnt] = -first_day_sip
+        cf_cnt += 1
 
     bench_cf_days = np.zeros(MAX_CF, dtype=np.int32)
     bench_cf_amounts = np.zeros(MAX_CF)
     bench_cf_cnt = 0
     if bench_starting_wealth > 0:
-        bench_cf_days[0] = start_day
-        bench_cf_amounts[0] = -bench_starting_wealth
-        bench_cf_cnt = 1
+        bench_cf_days[bench_cf_cnt] = start_day
+        bench_cf_amounts[bench_cf_cnt] = -bench_starting_wealth
+        bench_cf_cnt += 1
+    if first_day_sip > 0:
+        bench_cf_days[bench_cf_cnt] = start_day
+        bench_cf_amounts[bench_cf_cnt] = -first_day_sip
+        bench_cf_cnt += 1
 
-    bench_shares = bench_starting_wealth / btc_col[start_day] if btc_col[start_day] > 0 else 0.0
+    # BUG FIX: the benchmark must also receive the same first-day SIP the
+    # strategy now gets (see above), or the comparison is no longer
+    # apples-to-apples -- the strategy would look better than BTC-and-hold
+    # purely because it received one extra month of capital the benchmark didn't.
+    bench_shares = (bench_starting_wealth + first_day_sip) / btc_col[start_day] if btc_col[start_day] > 0 else 0.0
 
     for d in range(start_day, end_day):
         cash_pool *= daily_yield_mult
+        bought_today[:] = False   # BUG FIX: reset each day -- see valuation step below
 
         # ---- PHASE A: settle pending exits/partials at today's open ----
         for s in range(n_stocks):
@@ -444,11 +553,16 @@ def simulate_portfolio_crypto(
                 exit_val = sell_shares * fill_price * (1.0 - sell_cost_pct)
                 invested_val = sell_shares * entry_prices[s]
                 profit = exit_val - invested_val
-                pct_change = profit / invested_val if invested_val > 0 else 0.0
-                if profit > 0:
-                    total_wins += profit; win_pct_sum += pct_change; winning_trades += 1
-                else:
-                    total_losses += abs(profit); loss_pct_sum += abs(pct_change); losing_trades += 1
+                # BUG FIX: a TP partial is HALF of one logical position, not
+                # a trade of its own -- crypto_signal_engine.py blends the
+                # partial leg and the final leg into a single trade record
+                # (see collect_trade_log there). Counting it here as its own
+                # win/loss double-counted every EXIT_HYBRID round trip that
+                # ever touched its profit target, inflating both trade count
+                # and win rate relative to the signal engine's numbers.
+                # Accumulate and fold into ONE record at the real exit below.
+                partial_realized_pnl[s] += profit
+                partial_invested_val[s] += invested_val
                 cash_pool += exit_val
                 shares_held[s] -= sell_shares
                 half_sold[s] = True
@@ -461,8 +575,11 @@ def simulate_portfolio_crypto(
                 if not (fill_price > 0): fill_price = closes[d - 1, s]
                 exit_val = shares_held[s] * fill_price * (1.0 - sell_cost_pct)
                 invested_val = shares_held[s] * entry_prices[s]
-                profit = exit_val - invested_val
-                pct_change = profit / invested_val if invested_val > 0 else 0.0
+                # BUG FIX: fold in any earlier partial-TP leg on this SAME
+                # position so the whole round trip is logged as ONE trade.
+                profit = (exit_val - invested_val) + partial_realized_pnl[s]
+                total_cost_basis = invested_val + partial_invested_val[s]
+                pct_change = profit / total_cost_basis if total_cost_basis > 0 else 0.0
                 if profit > 0:
                     total_wins += profit; win_pct_sum += pct_change; winning_trades += 1
                 else:
@@ -474,6 +591,8 @@ def simulate_portfolio_crypto(
                 shares_held[s] = 0.0
                 pending_exit[s] = False
                 half_sold[s] = False
+                partial_realized_pnl[s] = 0.0
+                partial_invested_val[s] = 0.0
 
         # ---- SIP injection ----
         if sip_flag[d]:
@@ -537,6 +656,25 @@ def simulate_portfolio_crypto(
                     should_invalidate = True
                     should_partial = False
 
+                # BUG FIX (audit finding): previously only LATCHED
+                # candidates (wl_is_armed) had their entry filters
+                # re-verified before funding -- see the funding-time check
+                # further down. A NON-latched signal could sit on the
+                # watchlist for days waiting on cash with NO re-check of
+                # whether its own entry conditions (BTC regime, ADX
+                # strength, RSI trend filter) still held; only a price move
+                # through its shadow stop, or a BTC-exit-override, could
+                # drop it. Apply the same ongoing re-validation to both so a
+                # stale non-latched signal can't still get bought on
+                # conditions that no longer exist.
+                if not wl_is_armed[s]:
+                    if use_btc_entry_gate and not btc_bullish:
+                        should_invalidate = True
+                    if adx_threshold > 0.0 and adx[d, s] < adx_threshold:
+                        should_invalidate = True
+                    if entry_type == 1 and use_rsi_trend_filter and not (curr_closes[s] > rsi_trend_ma[d, s]):
+                        should_invalidate = True
+
                 if should_partial and not should_invalidate:
                     wl_half_sold[s] = True
                     if wl_stop_loss[s] < wl_entry_price[s]:
@@ -593,7 +731,16 @@ def simulate_portfolio_crypto(
 
         # ---- WATCHLIST ADDITIONS ----
         adx_ok_today = (adx_threshold <= 0.0)
+        # BUG FIX (audit finding): WL_RANK_NO_WATCHLIST (wl_rank_method==3)
+        # is documented as "don't even look for a new signal until cash is
+        # already available," but that suppression was never implemented --
+        # watchlist additions happened unconditionally regardless of mode.
+        # Gate registration here so mode 3 actually behaves as documented
+        # instead of silently behaving like an unranked mode 0.
+        skip_new_registration = (wl_rank_method == 3 and cash_pool < min_ticket_size)
         for s in range(n_stocks):
+            if skip_new_registration:
+                continue
             if not wl_active[s] and not newly_invalidated[s] and eligible_mask[d, s]:
                 trigger = False
                 filter_ok = True
@@ -634,18 +781,41 @@ def simulate_portfolio_crypto(
                         wl_tp_trigger[s] = curr_closes[s] + e_atr * tp_mult
                         wl_half_sold[s] = False
 
-        # ---- CAPITAL DEPLOYMENT (equal-weight target sizing) ----
+        # ---- CAPITAL DEPLOYMENT ----
+        # BUG FIX (audit finding, both of the following): position size used
+        # to be PURELY (cash+invested)/n_eligible --
+        #  (1) with zero reference to how far the stop sits, so a wide-stop
+        #      config (sl_mult up to 8.0 is in the signal engine's own
+        #      search space) could risk many times the ~2%-of-capital assumed
+        #      by that engine's drawdown gate when it called such a config
+        #      "safe" (its own comment calls that gate's sizing assumption
+        #      "unrelated to the portfolio engine's real position sizing" --
+        #      this is where the two are now actually connected); and
+        #  (2) n_eligible is "how many coins pass the liquidity filter
+        #      today" (commonly 40-60), not "how many positions this book
+        #      realistically holds at once" -- a selective trend-following
+        #      signal only ever fires on a handful of coins, so most
+        #      contributed capital sat as idle, 0%-yield cash indefinitely.
+        # Size against a real concurrent-position target, cap by risk-to-stop,
+        # then cap again by a hard per-coin ceiling that also binds pyramid
+        # adds (previously each add re-used the full, undiluted target size
+        # with no ceiling at all, so a pyramided coin had no limit on how
+        # much of the book it could reach).
         n_eligible = 0
         for s in range(n_stocks):
             if eligible_mask[d, s]:
                 n_eligible += 1
         if n_eligible < 1: n_eligible = 1
+        n_eligible_for_sizing = n_eligible if n_eligible < target_concurrent_positions else target_concurrent_positions
+        if n_eligible_for_sizing < 1: n_eligible_for_sizing = 1
+
+        skip_today = np.zeros(n_stocks, dtype=np.bool_)   # candidates that failed to size meaningfully today
 
         while cash_pool >= min_ticket_size:
             best_rank = -999999.0
             best_s = -1
             for s in range(n_stocks):
-                if not wl_active[s]:
+                if not wl_active[s] or skip_today[s]:
                     continue
                 if wl_is_pyramid[s] and not in_pos[s]:
                     wl_active[s] = False; wl_is_pyramid[s] = False
@@ -671,6 +841,17 @@ def simulate_portfolio_crypto(
                     rank = -abs(curr_closes[s] - wl_entry_price[s]) / curr_closes[s]
                 elif wl_rank_method == 2 and wl_entry_price[s] > 0:
                     rank = (curr_closes[s] - wl_entry_price[s]) / wl_entry_price[s]
+                elif wl_rank_method == 3:
+                    # BUG FIX: mode 3 (WL_RANK_NO_WATCHLIST) had no branch
+                    # here at all before, so it silently fell through to
+                    # whatever the default tie-break happened to produce.
+                    # New registrations are already suppressed above
+                    # whenever there's no cash, so at most a small, genuinely
+                    # -simultaneous set can ever compete here; rank them
+                    # equally (ties resolve to lowest coin index, a fixed
+                    # rule -- exactly the point of a mode meant to NOT
+                    # cherry-pick by heuristic).
+                    rank = 0.0
                 if rank > best_rank:
                     best_rank = rank
                     best_s = s
@@ -681,16 +862,42 @@ def simulate_portfolio_crypto(
             buy_price = opens[d + 1, best_s] if d + 1 < n_days else curr_closes[best_s]
             if not (buy_price > 0):
                 wl_active[best_s] = False
+                skip_today[best_s] = True
                 continue
+
+            # stop distance computed BEFORE sizing so size can respect it
+            e_atr = atr[d, best_s] if atr[d, best_s] > 0 else atr[d - 1, best_s]
+            if not (e_atr > 0): e_atr = buy_price * 0.02
+            stop_dist = e_atr * sl_mult
+            stop_dist_frac = stop_dist / buy_price if buy_price > 0 else 0.0
 
             invested_cost = 0.0
             for s2 in range(n_stocks):
                 if in_pos[s2]:
                     invested_cost += shares_held[s2] * entry_prices[s2]
-            target_size = (cash_pool + invested_cost) / n_eligible
+            aum = cash_pool + invested_cost
+
+            equal_weight_size = aum / n_eligible_for_sizing
+            if stop_dist_frac > 0.0:
+                risk_based_size = (risk_per_trade * aum) / stop_dist_frac
+            else:
+                risk_based_size = equal_weight_size
+            target_size = equal_weight_size if equal_weight_size < risk_based_size else risk_based_size
+
+            existing_cost = shares_held[best_s] * entry_prices[best_s] if in_pos[best_s] else 0.0
+            room_left = (max_position_pct * aum) - existing_cost
+            if room_left < target_size:
+                target_size = room_left
+
             buy_amount = target_size if target_size <= cash_pool else cash_pool
             if buy_amount < min_ticket_size:
-                break
+                # this candidate can't be sized meaningfully right now (at
+                # its per-coin cap, or the book itself is still too small)
+                # -- try the NEXT-best candidate instead of abandoning the
+                # whole day's deployment, since other coins may still have
+                # plenty of room even when this one doesn't.
+                skip_today[best_s] = True
+                continue
 
             cash_pool -= buy_amount
             new_shares = buy_amount / (buy_price * (1.0 + buy_cost_pct))
@@ -701,8 +908,6 @@ def simulate_portfolio_crypto(
                 shares_held[best_s] += new_shares
                 entry_prices[best_s] = (old_cost + new_cost) / shares_held[best_s]
                 n_layers[best_s] += 1
-                e_atr = atr[d, best_s] if atr[d, best_s] > 0 else atr[d - 1, best_s]
-                if not (e_atr > 0): e_atr = buy_price * 0.02
                 pot_sl = entry_prices[best_s] - e_atr * sl_mult
                 if pot_sl > stop_loss_price[best_s]: stop_loss_price[best_s] = pot_sl
             else:
@@ -713,21 +918,28 @@ def simulate_portfolio_crypto(
                 shares_held[best_s] = new_shares
                 high_since_entry[best_s] = buy_price
                 half_sold[best_s] = False
-                e_atr = atr[d, best_s] if atr[d, best_s] > 0 else atr[d - 1, best_s]
-                if not (e_atr > 0): e_atr = buy_price * 0.02
-                entry_risk[best_s] = e_atr * sl_mult
-                stop_loss_price[best_s] = buy_price - e_atr * sl_mult
+                entry_risk[best_s] = stop_dist
+                stop_loss_price[best_s] = buy_price - stop_dist
                 tp_trigger_price[best_s] = buy_price + e_atr * tp_mult
 
+            bought_today[best_s] = True
             wl_active[best_s] = False
             wl_is_pyramid[best_s] = False
             wl_is_armed[best_s] = False
 
         # ---- DAILY VALUATION ----
+        # BUG FIX (audit finding): a position bought today fills at
+        # TOMORROW's open (buy_price = opens[d+1], correctly lagged to match
+        # crypto_signal_engine.py's fill-at-next-open discipline), but was
+        # being marked-to-market here at TODAY's close -- a price that,
+        # chronologically, comes BEFORE its own fill. Mark a same-day
+        # purchase at its own cost basis instead; from tomorrow onward it's
+        # valued at that day's close like any other open position.
         curr_val = cash_pool
         for s in range(n_stocks):
             if in_pos[s]:
-                curr_val += shares_held[s] * curr_closes[s]
+                mark_price = entry_prices[s] if bought_today[s] else curr_closes[s]
+                curr_val += shares_held[s] * mark_price
 
         if d > start_day:
             floor_val = daily_port_val[d - 1] * 0.001
@@ -1138,7 +1350,8 @@ def evaluate_candidate_portfolio(p, opens, closes, atr, adx, years_arr, eligible
         int(start_day), int(end_day),
         float(starting_wealth), float(bench_starting_wealth),
         BUY_COST_PCT, SELL_COST_PCT, ANNUAL_CASH_YIELD,
-        MONTHLY_SIP, MIN_TICKET_SIZE
+        MONTHLY_SIP, MIN_TICKET_SIZE,
+        RISK_PER_TRADE, MAX_POSITION_PCT, float(TARGET_CONCURRENT_POSITIONS)
     )
 
     (f_wealth, f_bench, t_invested, wins, losses, trades, winning_trades, losing_trades,
@@ -1239,7 +1452,12 @@ def save_champion(oos_score, is_score, robustness, temporal_median, p, tier, fil
     data = {
         'engine_version': ENGINE_VERSION,
         'oos_score': float(oos_score), 'is_score': float(is_score),
-        'robustness_ratio': float(robustness), 'temporal_median_score': float(temporal_median),
+        'robustness_ratio': float(robustness),
+        # temporal_median can genuinely be None (IS score never cleared 0,
+        # so the temporal check never ran) -- record that plainly instead
+        # of crashing on float(None).
+        'temporal_median_score': float(temporal_median) if temporal_median is not None else None,
+        'temporal_tested': temporal_median is not None,
         'robustness_tier': tier, 'params': clean,
     }
     with open(filename, 'w') as f:
@@ -1263,8 +1481,11 @@ def print_candidate_report(rank, p, is_score, is_m, oos_score, oos_m, robustness
     else:
         print(f"Out-of-Sample Score: {oos_score:.4f}  (failed OOS gates)")
     rob_str = "N/A" if robustness <= -1.0 else f"{robustness:.1%}"
-    print(f"Robustness Ratio: {rob_str}   Temporal robustness: {'PASS' if temporal_ok else 'FAIL'} "
-          f"(median retained score {temporal_median:.4f})")
+    if temporal_ok is None:
+        temporal_str = "N/A -- not tested (IS score never cleared 0)"
+    else:
+        temporal_str = f"{'PASS' if temporal_ok else 'FAIL'} (median retained score {temporal_median:.4f})"
+    print(f"Robustness Ratio: {rob_str}   Temporal robustness: {temporal_str}")
     print("=" * 78)
 
 
@@ -1290,7 +1511,9 @@ def run_portfolio_validation():
 
     print(f"\nMatrix: {n_days} days x {closes.shape[1]} coins")
     print(f"Testing {len(candidates)} shortlisted candidates under a real ${MONTHLY_SIP:,.0f}/month "
-          f"shared cash pool, equal-weight sizing, and Binance-realistic costs...\n")
+          f"shared cash pool, risk-capped equal-weight sizing "
+          f"(risk/trade={RISK_PER_TRADE*100:.0f}%, cap/coin={MAX_POSITION_PCT*100:.0f}%, "
+          f"~{int(TARGET_CONCURRENT_POSITIONS)} concurrent slots), and Binance-realistic costs...\n")
 
     results = []
     for cand in candidates:
@@ -1299,7 +1522,12 @@ def run_portfolio_validation():
         is_score, is_m, oos_score, oos_m, robustness, is_end_wealth, is_end_bench = run_wfo_validation(
             p, opens, closes, atr, adx, years_arr, eligible_mask, sip_flag_default)
 
-        temporal_ok, temporal_median = True, 0.0
+        # BUG FIX (found from a real run): temporal_ok used to default to True
+        # (printed as "PASS") for any candidate whose IS score never even
+        # cleared 0 -- meaning the temporal check never ran at all, but the
+        # report looked identical to a candidate that was genuinely tested
+        # and held up. None to explicitly mean "not tested."
+        temporal_ok, temporal_median = None, None
         if is_score > 0:
             temporal_ok, temporal_median, _ = run_temporal_robustness_check(
                 p, opens, closes, atr, adx, years_arr, eligible_mask, master_dates, is_score)
@@ -1336,7 +1564,7 @@ def run_portfolio_validation():
     # fit the realities of shared capital better. Nothing here overwrites
     # or hides the signal-engine ranking -- both are reported.
     def sort_key(r):
-        cleared = r['oos_score'] > -900 and r['temporal_ok']
+        cleared = (r['oos_score'] > -900) and bool(r['temporal_ok'])
         return (cleared, r['oos_score'] if r['oos_score'] > -900 else -9999)
     results.sort(key=sort_key, reverse=True)
 
@@ -1349,7 +1577,8 @@ def run_portfolio_validation():
         p = r['params']
         rob = "N/A" if r['robustness'] <= -1.0 else f"{r['robustness']*100:.0f}%"
         oos_str = f"{r['oos_score']:.3f}" if r['oos_score'] > -900 else "GATE FAIL"
-        print(f"{i:<6}{r['signal_rank']:<13}{oos_str:<12}{rob:<12}{'PASS' if r['temporal_ok'] else 'FAIL':<10}"
+        temporal_col = "N/A" if r['temporal_ok'] is None else ('PASS' if r['temporal_ok'] else 'FAIL')
+        print(f"{i:<6}{r['signal_rank']:<13}{oos_str:<12}{rob:<12}{temporal_col:<10}"
               f"{ENTRY_TYPE_NAMES.get(p['entry_type'],'?')} / {EXIT_TYPE_NAMES.get(p['exit_type'],'?')}")
 
     if not results:
@@ -1357,12 +1586,12 @@ def run_portfolio_validation():
         return
 
     winner = results[0]
-    if winner['oos_score'] > -900 and winner['robustness'] >= 0.70 and winner['temporal_ok']:
+    if winner['oos_score'] > -900 and winner['robustness'] >= 0.70 and bool(winner['temporal_ok']):
         tier = "EXCELLENT (>70% robustness, temporal-stable) -- deploy with confidence"
-    elif winner['oos_score'] > -900 and winner['robustness'] >= ROBUSTNESS_DEPLOY_THRESHOLD and winner['temporal_ok']:
+    elif winner['oos_score'] > -900 and winner['robustness'] >= ROBUSTNESS_DEPLOY_THRESHOLD and bool(winner['temporal_ok']):
         tier = f"ACCEPTABLE ({ROBUSTNESS_DEPLOY_THRESHOLD:.0%}-70%) -- deploy cautiously"
     elif winner['oos_score'] > -900 and winner['robustness'] >= 0.30:
-        tier = "CAUTION (30%-50% or failed temporal check) -- meaningful risk; consider smaller size"
+        tier = "CAUTION (30%-50%, or temporal check failed/untested) -- meaningful risk; consider smaller size"
     elif winner['oos_score'] > -900:
         tier = "POOR (<30%) -- high risk of not holding up; treat as a starting point, not a system"
     else:

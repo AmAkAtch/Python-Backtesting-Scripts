@@ -1167,7 +1167,9 @@ def save_champion(oos_score, is_score, robustness, temporal_median, p, tier, fil
                  bool(v) if isinstance(v, (bool, np.bool_)) else v)
              for k, v in p.items()}
     data = {'engine_version': ENGINE_VERSION, 'oos_score': float(oos_score), 'is_score': float(is_score),
-            'robustness_ratio': float(robustness), 'temporal_median_score': float(temporal_median),
+            'robustness_ratio': float(robustness),
+            'temporal_median_score': float(temporal_median) if temporal_median is not None else None,
+            'temporal_tested': temporal_median is not None,
             'robustness_tier': tier, 'params': clean}
     with open(filename, 'w') as f:
         json.dump(data, f, indent=2, default=str)
@@ -1194,8 +1196,11 @@ def print_candidate_report(rank, p, is_score, is_m, oos_score, oos_m, robustness
     else:
         print(f"Out-of-Sample Score: {oos_score:.4f}  (failed OOS gates)")
     rob_str = "N/A" if robustness <= -1.0 else f"{robustness:.1%}"
-    print(f"Robustness Ratio: {rob_str}   Temporal robustness: {'PASS' if temporal_ok else 'FAIL'} "
-          f"(median retained score {temporal_median:.4f})")
+    if temporal_ok is None:
+        temporal_str = "N/A -- not tested (IS score never cleared 0)"
+    else:
+        temporal_str = f"{'PASS' if temporal_ok else 'FAIL'} (median retained score {temporal_median:.4f})"
+    print(f"Robustness Ratio: {rob_str}   Temporal robustness: {temporal_str}")
     print("=" * 78)
 
 
@@ -1230,7 +1235,11 @@ def run_portfolio_validation():
         is_score, is_m, oos_score, oos_m, robustness, is_end_w, is_end_b = run_wfo_validation(
             p, opens, closes, atr, adx, years_arr, index_closes, eligible_mask, is_div_stock, sip_flag_default)
 
-        temporal_ok, temporal_median = True, 0.0
+        # BUG FIX (found from a real run of the crypto pair, same fix here):
+        # None means "not tested" (IS score never cleared 0), distinct from
+        # a genuine False -- the old True/0.0 default printed as a
+        # misleading "PASS" for candidates the check never actually ran on.
+        temporal_ok, temporal_median = None, None
         if is_score > 0:
             temporal_ok, temporal_median, _ = run_temporal_robustness_check(
                 p, opens, closes, atr, adx, years_arr, index_closes, eligible_mask, is_div_stock,
@@ -1255,7 +1264,7 @@ def run_portfolio_validation():
                          'is_metrics': is_m, 'oos_metrics': oos_m})
 
     def sort_key(r):
-        cleared = r['oos_score'] > -900 and r['temporal_ok']
+        cleared = (r['oos_score'] > -900) and bool(r['temporal_ok'])
         return (cleared, r['oos_score'] if r['oos_score'] > -900 else -9999)
     results.sort(key=sort_key, reverse=True)
 
@@ -1268,7 +1277,8 @@ def run_portfolio_validation():
         p = r['params']
         rob = "N/A" if r['robustness'] <= -1.0 else f"{r['robustness']*100:.0f}%"
         oos_str = f"{r['oos_score']:.3f}" if r['oos_score'] > -900 else "GATE FAIL"
-        print(f"{i:<6}{r['signal_rank']:<13}{oos_str:<12}{rob:<12}{'PASS' if r['temporal_ok'] else 'FAIL':<10}"
+        temporal_col = "N/A" if r['temporal_ok'] is None else ('PASS' if r['temporal_ok'] else 'FAIL')
+        print(f"{i:<6}{r['signal_rank']:<13}{oos_str:<12}{rob:<12}{temporal_col:<10}"
               f"{ENTRY_TYPE_NAMES.get(p['entry_type'],'?')} / {EXIT_TYPE_NAMES.get(p['exit_type'],'?')}")
 
     if not results:
@@ -1276,9 +1286,9 @@ def run_portfolio_validation():
         return
 
     winner = results[0]
-    if winner['oos_score'] > -900 and winner['robustness'] >= 0.70 and winner['temporal_ok']:
+    if winner['oos_score'] > -900 and winner['robustness'] >= 0.70 and bool(winner['temporal_ok']):
         tier = "EXCELLENT (>70% robustness, temporal-stable) -- deploy with confidence"
-    elif winner['oos_score'] > -900 and winner['robustness'] >= ROBUSTNESS_DEPLOY_THRESHOLD and winner['temporal_ok']:
+    elif winner['oos_score'] > -900 and winner['robustness'] >= ROBUSTNESS_DEPLOY_THRESHOLD and bool(winner['temporal_ok']):
         tier = f"ACCEPTABLE ({ROBUSTNESS_DEPLOY_THRESHOLD:.0%}-70%) -- deploy cautiously"
     elif winner['oos_score'] > -900 and winner['robustness'] >= 0.30:
         tier = "CAUTION (30%-50% or failed temporal check) -- meaningful risk; consider smaller size"
