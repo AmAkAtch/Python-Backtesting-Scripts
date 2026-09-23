@@ -772,6 +772,35 @@ def simulate_signal_trades(
                 if exit_xover_short[d - 1] >= exit_xover_long[d - 1] and exit_xover_short[d] < exit_xover_long[d]:
                     should_exit_full = True
 
+            # BUG FIX (audit finding, found from a real run where every
+            # shortlisted candidate turned out to use exactly this exit
+            # family and every one of them cratered the portfolio engine
+            # despite passing this file's own 30% drawdown gate):
+            # EXIT_MA_CROSSUNDER, EXIT_RSI_CROSSUNDER, and EXIT_MA_XOVER_EXIT
+            # each only checked their own crossover/crossunder condition --
+            # stop_loss_price was computed at entry (every exit family sets
+            # it) but NEVER READ AGAIN for these three, so sl_mult was a
+            # completely dead, if-actively-searched-by-Optuna, parameter for
+            # half the exit-type space. A position under one of these three
+            # exit families had NO risk cap at all: if the crossunder signal
+            # simply didn't fire (momentum can stay depressed through a
+            # sustained decline without ever "crossing"), the position could
+            # ride an unbounded drawdown all the way down. That drawdown is
+            # INVISIBLE to compute_per_coin_drawdowns below, which only ever
+            # looks at the discrete sequence of REALIZED R-multiples at trade
+            # close -- a trade that endures an 80% intra-trade drawdown and
+            # then happens to recover enough to close at, say, +1R looks
+            # identical to this gate as a trade that never had a rough
+            # moment at all. That's exactly how this passed the 30% signal-
+            # level drawdown gate while still being capable of gutting a
+            # real portfolio: the gate was structurally blind to the risk.
+            # Every exit family now respects the SAME stop_loss_price floor
+            # EXIT_HYBRID already enforced -- the crossover/crossunder
+            # condition still drives the NORMAL exit, this only adds the
+            # backstop for when it doesn't fire in time.
+            if curr_close < stop_loss_price:
+                should_exit_full = True
+
             if override_exit:
                 should_exit_full    = True
                 should_exit_partial = False
@@ -1391,7 +1420,24 @@ def print_gate_diagnosis_signal(r_multiple, pct_return, bars_held, entry_years,
 # ==========================================================================
 
 def passes_neighborhood_check(p, base_score, opens, closes, atr, adx,
-                               years_arr, n_stocks, eligible_mask, start_day, end_day):
+                               years_arr, n_stocks, eligible_mask,
+                               train_start, train_end, val_start, val_end):
+    """
+    Are neighboring configs (small perturbations of each tunable parameter)
+    ALSO good, or is this candidate an isolated spike in the search space
+    -- i.e. likely overfit to this exact combination of values?
+
+    BUG FIX (audit finding, "fix all issues" pass): this used to score each
+    perturbation on the TRAIN window only and compare it against
+    base_score, which is the DUAL (min-of-train-and-val) score the
+    candidate actually earned its spot in the pool with -- an apples-to-
+    oranges comparison. A perturbation could look "stable" purely because
+    it scored well on train while its OWN val-window score (never checked)
+    had actually collapsed, which is exactly the instability this function
+    exists to catch. Perturbations are now scored the same dual way the
+    original candidate was, on the same train/val split, so a perturbation
+    that only looks good on train can no longer slip through as "stable."
+    """
     if base_score <= 0:
         return True
 
@@ -1423,9 +1469,19 @@ def passes_neighborhood_check(p, base_score, opens, closes, atr, adx,
     for delta in perturbations:
         n_p = p.copy()
         n_p.update(delta)
-        n_score, _ = evaluate_params_signal(n_p, opens, closes, atr, adx,
-                                            years_arr, n_stocks, eligible_mask,
-                                            start_day, end_day, is_oos=False)
+        n_train_score, _ = evaluate_params_signal(n_p, opens, closes, atr, adx,
+                                                   years_arr, n_stocks, eligible_mask,
+                                                   train_start, train_end, is_oos=False)
+        if n_train_score <= -900:
+            return False
+        n_val_score, _ = evaluate_params_signal(n_p, opens, closes, atr, adx,
+                                                 years_arr, n_stocks, eligible_mask,
+                                                 val_start, val_end, is_oos=True,
+                                                 min_years_required=MIN_YEARS_GATE_INNER,
+                                                 min_trades_required=MIN_TRADES_INNER_VAL)
+        if n_val_score <= -900:
+            return False
+        n_score = min(n_train_score, n_val_score)
         if n_score < base_score * NEIGHBOR_THRESHOLD:
             return False
     return True
@@ -1566,10 +1622,18 @@ class ShortlistPool:
         existing = self.pool.get(key)
         if existing is None or score > existing['score']:
             self.pool[key] = {'params': params, 'score': score, 'metrics': metrics}
+        # BUG FIX (audit finding, "fix all issues" pass): this used to skip
+        # eviction whenever the single worst-scoring entry happened to be
+        # the one just added (`if worst_key != key`), so the pool could
+        # silently sit at cap+1 forever in that case -- e.g. every time a
+        # new, distinct, but below-average candidate arrives while the pool
+        # is already full. Harmless for final results (top() only ever
+        # takes the best SHORTLIST_SIZE regardless of pool size), but the
+        # pool is supposed to be a bounded working set, so bound it: always
+        # evict the current worst, even if that's the entry just inserted.
         if len(self.pool) > self.cap:
             worst_key = min(self.pool, key=lambda k: self.pool[k]['score'])
-            if worst_key != key:
-                del self.pool[worst_key]
+            del self.pool[worst_key]
 
     def top(self, n):
         return sorted(self.pool.values(), key=lambda x: x['score'], reverse=True)[:n]
@@ -1833,7 +1897,8 @@ def run_signal_search(bayesian_trials=BAYESIAN_TRIALS, top_n_coins=TOP_N_COINS):
     for rank, cand in enumerate(finalists, start=1):
         p = cand['params']
         neighbor_ok = passes_neighborhood_check(p, cand['score'], opens, closes, atr, adx,
-                                                 years_arr, n_stocks, eligible_mask, 0, inner_split)
+                                                 years_arr, n_stocks, eligible_mask,
+                                                 0, inner_split, inner_split, is_end)
         wf = walk_forward_stability_check(p, opens, closes, atr, adx, years_arr, n_stocks,
                                           eligible_mask, 0, n_days - 1)
 

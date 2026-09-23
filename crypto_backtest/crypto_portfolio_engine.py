@@ -64,10 +64,32 @@ CONSOLIDATED FROM THE PORTFOLIO-SIMULATION LINEAGE:
     real money should go behind a candidate, so an extreme one-year/one-
     coin dependency is disqualifying here in a way it correctly isn't at
     the signal-screening stage.
+  - OOS corroboration by direct, per-year comparison against IS -- not a
+    ratio of composite scores. REDESIGN (user request; see
+    compute_oos_corroboration for the full writeup): this used to gate
+    deployment tiers on robustness = oos_score / is_score clearing
+    hardcoded 30%/50%/70% bands, where is_score/oos_score are each a
+    six-term weighted composite (Calmar, Sortino, EV, win-rate bonus,
+    consistency, regime). Two problems with that, regardless of exactly
+    where the bands were drawn: the ratio is numerically unstable (small
+    moves in any one term can swing it wildly, and it blows up whenever
+    is_score lands near zero), and it never actually asked whether OOS
+    looks like a plausible continuation of IS in terms a human can sanity-
+    check. Replaced with three checks on real, per-calendar-year
+    quantities: is a TYPICAL OOS year still profitable; is that typical
+    year at least as good as the WORST year IS itself ever produced
+    (self-calibrated to this strategy's own historical volatility, not an
+    arbitrary global ratio); and does OOS trade about as often, per year,
+    as IS did (catches a strategy going quiet, or starting to thrash, in
+    the OOS regime -- a behavioral-consistency signal a profit-only
+    comparison would miss entirely).
   - Temporal robustness check: rerun a candidate with the SIP landing on
     a randomized day each month; an edge that only survives because it
     always deploys capital at month-start conditions is a real red flag
-    a fixed-schedule backtest can hide.
+    a fixed-schedule backtest can hide. REDESIGN (same request as above):
+    now gates on the fraction of replays that stay PROFITABLE and within
+    the same MAX_DD_HARD_CAP every other evaluation here enforces, not on
+    retaining some percentage of a composite score.
   - Exact money-weighted XIRR via bisection (a single sign-change cash-
     flow stream guarantees a unique real root by Descartes' rule of
     signs), and cash-flow-adjusted daily returns for Sharpe/Sortino/
@@ -203,9 +225,27 @@ WFO_OOS_PCT = 0.30
 
 MIN_TRADES_GATE   = 20
 MIN_MONTHS_GATE   = 24
-MIN_WIN_RATE_GATE = 0.20   # a big reward:risk trend system is SUPPOSED to have a low win rate
 
-ROBUSTNESS_DEPLOY_THRESHOLD = 0.50
+# BUG FIX (audit finding, "fix all issues" pass): this used to be 0.20 here
+# vs 0.35 in crypto_signal_engine.py's MIN_WIN_RATE_GATE, with no stated
+# reason for the two stages disagreeing. A config only reaches this file
+# because it already cleared the signal engine's 0.35 floor on its own
+# (isolated, per-coin) trade log; letting the portfolio stage tolerate a
+# much rougher 0.20 here means a config whose ACTUAL executed trades (after
+# capital competition/ranking reshapes which signals actually fire) degrade
+# well below what got it shortlisted in the first place would still pass
+# silently. Harmonized to the same 0.35 the signal engine already uses and
+# justifies -- one "this is what a legitimate trend system's win rate floor
+# looks like" policy for the whole pipeline, not two.
+MIN_WIN_RATE_GATE = 0.35
+# Same harmonization for profit factor: this used to be an inline `< 1.05`
+# check with no named constant; crypto_signal_engine.py's MIN_PROFIT_FACTOR
+# is 1.10. Promoted to a named constant and matched for the same reason.
+MIN_PROFIT_FACTOR = 1.10
+# Promoted from an inline `max_dd > 0.60` literal duplicated in three places
+# (the hard gate, its diagnostic printer, and now the temporal robustness
+# check below) so the three can't silently drift out of sync.
+MAX_DD_HARD_CAP = 0.60
 
 RECENCY_WEIGHT_MIN = 0.80
 RECENCY_WEIGHT_MAX = 1.00
@@ -257,15 +297,58 @@ W_BEAR_DEFENSE = 0.50
 # still be invalidated while waiting, same as every other mode -- the ONLY
 # thing this changes is that a fresh signal is never even registered while
 # there's no cash to act on it, so at most one candidate is ever pending.
-WL_RANK_METHOD = 0
+#
+# BUG FIX (audit finding, "fix all issues" pass): default changed 0 -> 2.
+# Mode 0 ("deepest %% discount from trigger price") means that whenever two
+# signals compete for the same limited cash, this file used to hand the
+# money to whichever one has pulled back the MOST since it triggered --
+# i.e. the WEAKEST-looking continuation of the two -- which cuts against
+# the whole premise of a trend-following system (lean into strength, not
+# into whichever setup is already fading). Mode 2 (strongest momentum)
+# is the one actually aligned with that premise. Still a policy knob, not
+# a fixed truth -- worth A/B testing against 0 and 1 once the sizing
+# fixes above have had a chance to be evaluated on their own.
+WL_RANK_METHOD = 2
 WL_RANK_NO_WATCHLIST = 3
 
 # -- temporal (random-SIP-day) robustness --
-TEMPORAL_ROBUSTNESS_RUNS      = 15
-TEMPORAL_ROBUSTNESS_SCORE_MIN = 0.70
-TEMPORAL_ROBUSTNESS_PASS_FRAC = 0.70
+TEMPORAL_ROBUSTNESS_RUNS = 15
+# BUG FIX / REDESIGN (user request -- see compute_oos_corroboration below
+# for the full writeup of why): this used to gate on "fraction of the 15
+# randomized-timing replays that retain >=70% of the baseline's composite
+# SCORE" -- the same "ratio against an opaque multi-term number" pattern
+# the OOS gate had, just applied to contribution-timing noise instead of
+# time-period generalization. Replaced with a direct, real-quantity check:
+# what fraction of the 15 replays are still PROFITABLE (annual_return > 0)
+# and stay within the same MAX_DD_HARD_CAP every other evaluation in this
+# file already enforces. If shuffling which day of the month contributions
+# land on can flip the sign of the return or blow through the drawdown
+# cap, that safety was calendar-alignment luck, not a property of the
+# strategy.
+TEMPORAL_MIN_PROFITABLE_FRAC = 0.80
 SIP_RANDOM_MIN_DAY = 1
 SIP_RANDOM_MAX_DAY = 28
+
+# -- OOS corroboration policy (REDESIGN, user request) --
+# The old approach computed robustness = oos_score / is_score (a ratio of
+# two six-term weighted composite scores -- Calmar, Sortino, EV, win-rate
+# bonus, consistency, regime, each independently capped/floored) and gated
+# deployment tiers on that ratio clearing hardcoded 30%/50%/70% bands. Two
+# real problems with that, independent of exactly where the bands were
+# drawn: (1) a ratio of two composite scores is numerically unstable --
+# it can swing wildly from a small move in any ONE of six terms, and blows
+# up whenever is_score happens to land near zero, so "70% robustness"
+# often didn't mean what it sounded like it meant; (2) it never actually
+# asked the question that matters, which is whether OOS looks like a
+# plausible CONTINUATION of IS, in terms a human can sanity-check. Replaced
+# with checks on real, per-calendar-year, directly-interpretable
+# quantities -- realized annual return and trade count -- computed by
+# compute_oos_corroboration() from the SAME per-year breakdown already
+# built for the main scorer (compute_yearly_breakdown).
+OOS_MIN_TRADE_FREQUENCY_RATIO = 0.35   # OOS median trades/year >= this x IS median trades/year (didn't go quiet)
+OOS_MAX_TRADE_FREQUENCY_RATIO = 3.00   # ...and <= this x IS's (didn't start thrashing/overtrading)
+
+
 
 MA_CACHE_LOCAL_NOTE = "MA/RSI caches are imported from crypto_signal_engine and shared as-is."
 
@@ -410,7 +493,7 @@ def build_sip_schedule(master_dates, mode='month_start', seed=None,
 
 @njit(nogil=True)
 def simulate_portfolio_crypto(
-        opens, closes, atr, adx, sip_flag,
+        opens, closes, atr, adx, sip_flag, years_arr,
         entry_ma, xover_short, xover_long,
         rsi_fast, rsi_slow, rsi_trend_ma,
         btc_close, btc_ma,
@@ -439,10 +522,26 @@ def simulate_portfolio_crypto(
     and makes this function's behavior depend on *when* something happened
     to be set rather than what was passed in. Explicit parameters remove
     that trap entirely.
+
+    years_arr (added for OOS corroboration -- see compute_oos_corroboration
+    and the module docstring): per-day calendar year, same length as
+    closes. Used ONLY to bucket closed trades into a per-calendar-year
+    count (yearly_trades, returned below) so the caller can compare how
+    often this config traded in a TYPICAL year of the IS window against a
+    TYPICAL year of the OOS window -- a real, direct signal of whether the
+    strategy's behavior generalized, independent of whether that window
+    happened to be profitable. Every call (IS, OOS, or a randomized-SIP
+    replay) receives the SAME full years_arr regardless of start_day/
+    end_day, so the year->bucket-index mapping is identical across calls
+    and the resulting counts line up correctly when compared.
     """
 
     n_days, n_stocks = closes.shape
     if end_day < 0 or end_day >= n_days: end_day = n_days - 2
+
+    base_year = years_arr[0]
+    n_year_buckets = int(years_arr[n_days - 1] - base_year) + 1
+    yearly_trades = np.zeros(n_year_buckets, dtype=np.int32)
 
     # BUG FIX (audit finding): day index 0 can never be processed by the
     # main loop below -- it always starts at max(start_day, 1), because
@@ -585,6 +684,11 @@ def simulate_portfolio_crypto(
                 else:
                     total_losses += abs(profit); loss_pct_sum += abs(pct_change); losing_trades += 1
                 total_bars_in_trades += (d - 1 - entry_days[s])
+                # bucket this closed trade into its calendar year for the
+                # OOS corroboration check (see compute_oos_corroboration)
+                yi = int(years_arr[d] - base_year)
+                if 0 <= yi < n_year_buckets:
+                    yearly_trades[yi] += 1
                 cash_pool += exit_val
                 in_pos[s] = False
                 n_layers[s] = 0
@@ -651,6 +755,18 @@ def simulate_portfolio_crypto(
                 elif exit_type == 5:  # EXIT_MA_XOVER_EXIT
                     if exit_xover_short[d - 1, s] >= exit_xover_long[d - 1, s] and exit_xover_short[d, s] < exit_xover_long[d, s]:
                         should_invalidate = True
+
+                # BUG FIX (audit finding, same root cause as the identical
+                # fix in PHASE B below -- see that comment for the full
+                # writeup): exit types 3/4/5 never checked wl_stop_loss[s],
+                # so a shadow candidate waiting on the watchlist under one of
+                # these exit families could keep "waiting" through an
+                # unbounded price decline with nothing to ever drop it,
+                # right up until it finally got funded at a badly stale
+                # price. Same backstop, applied consistently to shadow
+                # positions as well as real ones.
+                if curr_closes[s] < wl_stop_loss[s]:
+                    should_invalidate = True
 
                 if use_btc_exit_override and not btc_bullish:
                     should_invalidate = True
@@ -719,6 +835,26 @@ def simulate_portfolio_crypto(
                 elif exit_type == 5:
                     if exit_xover_short[d - 1, s] >= exit_xover_long[d - 1, s] and exit_xover_short[d, s] < exit_xover_long[d, s]:
                         should_exit_full = True
+
+                # BUG FIX (audit finding, found from a real run): exit types
+                # 3/4/5 only checked their own crossover/crossunder signal --
+                # stop_loss_price[s] is computed for every position at entry
+                # but was never read again for these three, so a position
+                # under one of them had NO risk cap: if the crossunder signal
+                # simply didn't fire (momentum can stay depressed through a
+                # sustained decline without ever "crossing"), the position
+                # rides an unbounded drawdown. This is exactly what produced
+                # portfolio-level 60-98% max_dd on candidates whose signal-
+                # engine trade log still showed a healthy win rate and profit
+                # factor -- that gate only ever sees the discrete R-multiple
+                # a trade closes at, never the mark-to-market pain endured
+                # while it was open, so it couldn't see this risk at all. It
+                # also means sl_mult -- an actively Optuna-searched parameter
+                # -- was a complete no-op for half the exit-type search space.
+                # Every exit family now respects the same stop_loss_price
+                # floor EXIT_HYBRID (type 0) already enforced.
+                if curr_closes[s] < stop_loss_price[s]:
+                    should_exit_full = True
 
                 if use_btc_exit_override and not btc_bullish:
                     should_exit_full = True
@@ -1011,7 +1147,8 @@ def simulate_portfolio_crypto(
             total_wins, total_losses, trade_count, winning_trades, losing_trades,
             avg_bars, avg_runup, avg_loss_r, max_dd, sharpe, sortino,
             cf_days, cf_amounts, cf_cnt, bench_cf_days, bench_cf_amounts, bench_cf_cnt,
-            daily_port_val, daily_bench_val, skew, kurt, valid_days)
+            daily_port_val, daily_bench_val, skew, kurt, valid_days,
+            yearly_trades, base_year)
 
 
 # ==========================================================================
@@ -1125,11 +1262,40 @@ def compute_yearly_breakdown(daily_port_val, daily_bench_val, years_arr,
         nominal_profit = (port_end - port_start) - nominal_contrib
         coverage_frac = min(1.0, len(yr_idxs) / YEAR_FULL_COVERAGE_DAYS)
 
+        # BUG FIX (audit finding, caught by testing this exact redesign): the
+        # XIRR bisection above can only find a root inside [r_lo, r_hi] =
+        # [-99.9%, +1000%] by construction. A year catastrophic enough that
+        # contributed capital is nearly wiped out (a real possibility this
+        # very pipeline can produce, e.g. while the sizing bugs elsewhere in
+        # this file were still live) has a TRUE money-weighted return more
+        # extreme than -99.9%, so npv() stays the same sign across the
+        # entire bracket and the solver reports port_ok=False. This used to
+        # silently fall back to port_irr=0.0 -- indistinguishable from a
+        # perfectly FLAT year -- which corrupts every scoring term that
+        # reads it (CONSISTENCY, REGIME) by making a disastrous year look
+        # neutral instead of disastrous, and would have silently defeated
+        # compute_oos_corroboration's "OOS >= IS's own worst year" check by
+        # understating exactly the number that check depends on most.
+        # Fall back to a Simple Dietz approximation instead (assumes
+        # contributions land, on average, mid-year -- a standard, well-known
+        # approximation for exactly this "irregular cashflows within a
+        # period, need a return estimate" situation) so an extreme year is
+        # at least reported in roughly the right direction and magnitude,
+        # not as a false flat 0%.
+        if not port_ok:
+            avg_capital = port_start + 0.5 * nominal_contrib
+            port_irr = (nominal_profit / avg_capital) if avg_capital > 0 else 0.0
+        if not bench_ok:
+            bench_nominal_contrib = sum(-a for a in year_bcf_amts if a < 0)
+            bench_avg_capital = bench_start + 0.5 * bench_nominal_contrib
+            bench_irr = ((bench_end - bench_start - bench_nominal_contrib) / bench_avg_capital
+                         if bench_avg_capital > 0 else 0.0)
+
         out.append({
-            'year': yr, 'port_irr': port_irr if port_ok else 0.0,
-            'bench_irr': bench_irr if bench_ok else 0.0,
+            'year': yr, 'port_irr': port_irr,
+            'bench_irr': bench_irr,
             'nominal_profit': nominal_profit, 'coverage_frac': coverage_frac,
-            'days': len(yr_idxs),
+            'days': len(yr_idxs), 'irr_converged': port_ok,
         })
     return out
 
@@ -1148,8 +1314,8 @@ def compute_score_portfolio(metrics, yearly, is_oos=False):
     target_trades = max(15, MIN_TRADES_GATE * (WFO_OOS_PCT / WFO_IS_PCT)) if is_oos else MIN_TRADES_GATE
 
     if trades < target_trades: return -999.0
-    if max_dd > 0.60: return -999.0
-    if metrics['pf'] < 1.05: return -999.0
+    if max_dd > MAX_DD_HARD_CAP: return -999.0
+    if metrics['pf'] < MIN_PROFIT_FACTOR: return -999.0
     if roi <= 0: return -999.0
     if avg_loss <= 0: return -999.0
     if not math.isfinite(annual_return): return -999.0
@@ -1242,8 +1408,8 @@ def diagnose_gates_portfolio(metrics, yearly, is_oos=False):
     target_trades = max(15, MIN_TRADES_GATE * (WFO_OOS_PCT / WFO_IS_PCT)) if is_oos else MIN_TRADES_GATE
     rows = [
         ('trades >= target', trades >= target_trades, trades, f'>= {target_trades:.0f}'),
-        ('max_dd <= 60%', max_dd <= 0.60, f'{max_dd*100:.1f}%', '<= 60.0%'),
-        ('profit_factor >= 1.05', pf >= 1.05, f'{pf:.2f}', '>= 1.05'),
+        (f'max_dd <= {MAX_DD_HARD_CAP*100:.0f}%', max_dd <= MAX_DD_HARD_CAP, f'{max_dd*100:.1f}%', f'<= {MAX_DD_HARD_CAP*100:.1f}%'),
+        (f'profit_factor >= {MIN_PROFIT_FACTOR:.2f}', pf >= MIN_PROFIT_FACTOR, f'{pf:.2f}', f'>= {MIN_PROFIT_FACTOR:.2f}'),
         ('roi > 0', roi > 0, f'{roi*100:.1f}%', '> 0%'),
         ('avg_loss > 0', avg_loss > 0, f'{avg_loss:.4f}', '> 0'),
         ('win_rate >= floor', wr >= MIN_WIN_RATE_GATE, f'{wr*100:.1f}%', f'>= {MIN_WIN_RATE_GATE*100:.0f}%'),
@@ -1337,7 +1503,7 @@ def evaluate_candidate_portfolio(p, opens, closes, atr, adx, years_arr, eligible
      ) = _prep_indicator_arrays(p, closes, n_days, n_stocks)
 
     result = simulate_portfolio_crypto(
-        opens, closes, atr, adx, sip_flag,
+        opens, closes, atr, adx, sip_flag, years_arr,
         entry_ma, xover_short, xover_long, rsi_fast, rsi_slow, rsi_trend_ma,
         closes[:, 0], btc_ma,
         exit_ma, exit_xover_short, exit_xover_long, exit_rsi_fast, exit_rsi_slow,
@@ -1357,7 +1523,8 @@ def evaluate_candidate_portfolio(p, opens, closes, atr, adx, years_arr, eligible
     (f_wealth, f_bench, t_invested, wins, losses, trades, winning_trades, losing_trades,
      avg_bars, avg_runup, avg_loss, max_dd, sharpe, sortino,
      cf_days, cf_amounts, cf_cnt, bench_cf_days, bench_cf_amounts, bench_cf_cnt,
-     daily_port_val, daily_bench_val, skew, kurt, valid_days) = result
+     daily_port_val, daily_bench_val, skew, kurt, valid_days,
+     yearly_trades, base_year) = result
 
     if t_invested <= 0:
         return -999.0, {}
@@ -1378,6 +1545,10 @@ def evaluate_candidate_portfolio(p, opens, closes, atr, adx, years_arr, eligible
                                        cf_days, cf_amounts, cf_cnt,
                                        bench_cf_days, bench_cf_amounts, bench_cf_cnt,
                                        int(start_day), int(end_day))
+    # attach each year's closed-trade count (for compute_oos_corroboration)
+    for y in yearly:
+        yi = int(y['year'] - base_year)
+        y['trades'] = int(yearly_trades[yi]) if 0 <= yi < len(yearly_trades) else 0
 
     month_cnt = max(1, int(round((end_day - start_day) / 30.44)))
 
@@ -1400,6 +1571,127 @@ def evaluate_candidate_portfolio(p, opens, closes, atr, adx, years_arr, eligible
 # 8. WALK-FORWARD IS/OOS VALIDATION (wealth chained IS -> OOS)
 # ==========================================================================
 
+def compute_oos_corroboration(is_yearly, oos_yearly):
+    """
+    REDESIGN (user request): does the OOS window's realized, year-by-year
+    behavior look like a plausible continuation of what IS showed -- rather
+    than the old approach of gating on whether a RATIO of two opaque,
+    six-term composite scores (oos_score / is_score) cleared a hardcoded
+    band. See the OOS_MIN/MAX_TRADE_FREQUENCY_RATIO comment above for the
+    full case against that approach.
+
+    Three checks, each on a real, directly-interpretable, per-year quantity
+    (using the SAME per-year breakdown compute_score_portfolio already
+    builds via compute_yearly_breakdown, so nothing new needs computing --
+    only 'trades' per year, added specifically for this, is new):
+
+      1. A TYPICAL OOS year is still profitable (median yearly port_irr > 0).
+         This is the one question that actually matters: does the edge
+         still exist out of sample?
+      2. That typical OOS year isn't worse than the single worst year IS
+         itself ever produced. Deliberately self-calibrated to how choppy
+         THIS strategy's own year-to-year results already are, rather than
+         an arbitrary global ratio -- a strategy that had one brutal year
+         even in-sample (crypto has had several) shouldn't be held to a
+         standard it never met on its own training data.
+      3. OOS trades about as often, per year, as IS did (within
+         OOS_MIN/MAX_TRADE_FREQUENCY_RATIO of IS's median). A strategy that
+         goes quiet, or starts firing far more often, in the OOS window is
+         behaving DIFFERENTLY there -- a direct generalization-failure
+         signal that's true independent of whether that window happened to
+         still be profitable, and one a profit-only comparison would miss
+         entirely.
+
+    Only years meeting MIN_YEAR_COVERAGE_FOR_SCORING count, same as the
+    main scorer, so a stub partial year at either end of a window can't
+    swing the comparison.
+    """
+    is_scoring = [y for y in is_yearly if y['coverage_frac'] >= MIN_YEAR_COVERAGE_FOR_SCORING]
+    oos_scoring = [y for y in oos_yearly if y['coverage_frac'] >= MIN_YEAR_COVERAGE_FOR_SCORING]
+
+    if not is_scoring or not oos_scoring:
+        return {
+            'passed': False, 'insufficient_data': True,
+            'is_years_used': len(is_scoring), 'oos_years_used': len(oos_scoring),
+            'checks': {}, 'notes': ['not enough full-coverage years on one or both sides to compare'],
+        }
+
+    is_returns = [y['port_irr'] for y in is_scoring]
+    oos_returns = [y['port_irr'] for y in oos_scoring]
+    is_trades = [y.get('trades', 0) for y in is_scoring]
+    oos_trades = [y.get('trades', 0) for y in oos_scoring]
+
+    is_median_return = float(np.median(is_returns))
+    oos_median_return = float(np.median(oos_returns))
+    is_worst_return = float(min(is_returns))
+    is_median_trades = float(np.median(is_trades))
+    oos_median_trades = float(np.median(oos_trades))
+
+    check_profitable = oos_median_return > 0.0
+    check_not_below_is_worst_year = oos_median_return >= is_worst_return
+
+    if is_median_trades > 0:
+        trade_ratio = oos_median_trades / is_median_trades
+        check_trade_freq = OOS_MIN_TRADE_FREQUENCY_RATIO <= trade_ratio <= OOS_MAX_TRADE_FREQUENCY_RATIO
+    else:
+        trade_ratio = float('inf') if oos_median_trades > 0 else 0.0
+        check_trade_freq = True   # IS itself barely traded; nothing meaningful to compare against
+
+    checks = {
+        'oos_typical_year_profitable': check_profitable,
+        'oos_not_below_is_worst_year': check_not_below_is_worst_year,
+        'trade_frequency_consistent': check_trade_freq,
+    }
+
+    return {
+        'passed': all(checks.values()), 'insufficient_data': False,
+        'is_years_used': len(is_scoring), 'oos_years_used': len(oos_scoring),
+        'is_median_yearly_return': is_median_return, 'oos_median_yearly_return': oos_median_return,
+        'is_worst_yearly_return': is_worst_return,
+        'is_median_yearly_trades': is_median_trades, 'oos_median_yearly_trades': oos_median_trades,
+        'trade_frequency_ratio': trade_ratio,
+        'checks': checks,
+    }
+
+
+def print_oos_corroboration(corrob, label="OOS CORROBORATION"):
+    print(f"\n{'-'*60}\n{label}\n{'-'*60}")
+    if corrob.get('insufficient_data'):
+        print(f"  [SKIP] only {corrob.get('is_years_used', 0)} full IS year(s) and "
+              f"{corrob.get('oos_years_used', 0)} full OOS year(s) available -- too little "
+              f"to compare; treat this candidate's OOS result with extra caution.")
+        print("-" * 60)
+        return
+    # BUG FIX (caught by testing): this crashed with a KeyError whenever
+    # corrob came from the "IS or OOS failed its own hard gates" fallback
+    # in run_wfo_validation, which sets checks={} without the numeric
+    # is_median_yearly_return/etc keys at all -- a different shape than the
+    # insufficient_data case above. The one caller in run_portfolio_validation
+    # happened to always guard against this by checking corrob['checks']
+    # before calling here, but that made this function correct only by
+    # accident of how it's currently called, not on its own. Handle the
+    # shape directly instead of relying on every future caller to remember.
+    if not corrob.get('checks'):
+        print("  [SKIP] IS or OOS failed its own hard gates before corroboration could run.")
+        print("-" * 60)
+        return
+    c = corrob['checks']
+    print(f"  IS:  {corrob['is_years_used']} full year(s), median yearly return "
+          f"{corrob['is_median_yearly_return']*100:+.1f}%, worst year "
+          f"{corrob['is_worst_yearly_return']*100:+.1f}%, median {corrob['is_median_yearly_trades']:.0f} trades/yr")
+    print(f"  OOS: {corrob['oos_years_used']} full year(s), median yearly return "
+          f"{corrob['oos_median_yearly_return']*100:+.1f}%, median {corrob['oos_median_yearly_trades']:.0f} trades/yr")
+    marker = lambda b: "PASS" if b else "FAIL"
+    print(f"  [{marker(c['oos_typical_year_profitable'])}] a typical OOS year is profitable "
+          f"(median yearly return > 0%)")
+    print(f"  [{marker(c['oos_not_below_is_worst_year'])}] typical OOS year >= IS's own worst year "
+          f"({corrob['oos_median_yearly_return']*100:+.1f}% vs {corrob['is_worst_yearly_return']*100:+.1f}%)")
+    print(f"  [{marker(c['trade_frequency_consistent'])}] trade frequency held up "
+          f"({corrob['trade_frequency_ratio']*100:.0f}% of IS's median yearly trade count, "
+          f"needed {OOS_MIN_TRADE_FREQUENCY_RATIO*100:.0f}%-{OOS_MAX_TRADE_FREQUENCY_RATIO*100:.0f}%)")
+    print("-" * 60)
+
+
 def run_wfo_validation(p, opens, closes, atr, adx, years_arr, eligible_mask, sip_flag):
     n_days = closes.shape[0]
     is_end = int(n_days * WFO_IS_PCT)
@@ -1413,38 +1705,64 @@ def run_wfo_validation(p, opens, closes, atr, adx, years_arr, eligible_mask, sip
                                                      sip_flag, start_day=is_end, end_day=n_days - 1, is_oos=True,
                                                      starting_wealth=is_end_wealth, bench_starting_wealth=is_end_bench)
 
-    if oos_score <= -900:
-        robustness = -1.0
-    elif is_score > 0:
-        robustness = oos_score / is_score if oos_score > 0 else oos_score / abs(is_score)
+    if is_score > -900 and oos_score > -900:
+        corroboration = compute_oos_corroboration(is_m.get('yearly', []), oos_m.get('yearly', []))
     else:
-        robustness = 0.0
+        corroboration = {'passed': False, 'insufficient_data': False, 'checks': {},
+                          'is_years_used': 0, 'oos_years_used': 0,
+                          'notes': ['IS or OOS failed its own hard gates before corroboration could run']}
 
-    return is_score, is_m, oos_score, oos_m, robustness, is_end_wealth, is_end_bench
+    return is_score, is_m, oos_score, oos_m, corroboration, is_end_wealth, is_end_bench
 
 
 def run_temporal_robustness_check(p, opens, closes, atr, adx, years_arr, eligible_mask, master_dates,
-                                   baseline_score, n_runs=TEMPORAL_ROBUSTNESS_RUNS):
-    if baseline_score <= 0:
-        return True, 0.0, []
+                                   n_runs=TEMPORAL_ROBUSTNESS_RUNS):
+    """
+    Does performance hold up regardless of which day of the month
+    contributions land on -- a nuisance parameter that has nothing to do
+    with strategy skill.
+
+    REDESIGN (user request, same philosophy as compute_oos_corroboration
+    above): this used to gate on "fraction of the N replays that retain
+    >=70% of a baseline composite SCORE" -- the same ratio-of-an-opaque-
+    number pattern the OOS gate had. Replaced with two direct checks per
+    replay: is it still profitable (annual_return > 0), and does it stay
+    within the SAME MAX_DD_HARD_CAP every other evaluation in this file
+    enforces. If shuffling contribution timing alone can flip the sign of
+    the return or blow through the drawdown cap, that safety was calendar-
+    alignment luck, not a robust property of the strategy.
+    """
     n_days = closes.shape[0]
-    scores = []
+    annual_returns, max_dds = [], []
     for seed in range(n_runs):
         sip_flag = build_sip_schedule(master_dates, mode='random', seed=seed)
-        s, _ = evaluate_candidate_portfolio(p, opens, closes, atr, adx, years_arr, eligible_mask,
+        _, m = evaluate_candidate_portfolio(p, opens, closes, atr, adx, years_arr, eligible_mask,
                                              sip_flag, start_day=0, end_day=n_days - 1, is_oos=False)
-        scores.append(s)
-    scores_arr = np.array(scores)
-    frac_holding = float(np.mean(scores_arr >= baseline_score * TEMPORAL_ROBUSTNESS_SCORE_MIN))
-    median_score = float(np.median(scores_arr))
-    return frac_holding >= TEMPORAL_ROBUSTNESS_PASS_FRAC, median_score, scores
+        annual_returns.append(m.get('annual_return', -1.0) if m else -1.0)
+        max_dds.append(abs(m.get('max_dd', 1.0)) if m else 1.0)
+
+    annual_returns_arr = np.array(annual_returns)
+    max_dds_arr = np.array(max_dds)
+    frac_profitable = float(np.mean(annual_returns_arr > 0))
+    frac_within_dd_cap = float(np.mean(max_dds_arr <= MAX_DD_HARD_CAP))
+    passed = (frac_profitable >= TEMPORAL_MIN_PROFITABLE_FRAC and
+              frac_within_dd_cap >= TEMPORAL_MIN_PROFITABLE_FRAC)
+
+    return {
+        'passed': passed,
+        'frac_profitable': frac_profitable, 'frac_within_dd_cap': frac_within_dd_cap,
+        'median_annual_return': float(np.median(annual_returns_arr)),
+        'worst_max_dd': float(np.max(max_dds_arr)) if len(max_dds_arr) else 1.0,
+        'n_runs': n_runs,
+    }
+
 
 
 # ==========================================================================
 # 9. SAVE / REPORTING
 # ==========================================================================
 
-def save_champion(oos_score, is_score, robustness, temporal_median, p, tier, filename=CHAMPION_FILE):
+def save_champion(oos_score, is_score, corroboration, temporal, p, tier, filename=CHAMPION_FILE):
     clean = {k: (float(v) if isinstance(v, (float, np.floating)) else
                  int(v) if isinstance(v, (int, np.integer)) and not isinstance(v, bool) else
                  bool(v) if isinstance(v, (bool, np.bool_)) else v)
@@ -1452,20 +1770,21 @@ def save_champion(oos_score, is_score, robustness, temporal_median, p, tier, fil
     data = {
         'engine_version': ENGINE_VERSION,
         'oos_score': float(oos_score), 'is_score': float(is_score),
-        'robustness_ratio': float(robustness),
-        # temporal_median can genuinely be None (IS score never cleared 0,
-        # so the temporal check never ran) -- record that plainly instead
-        # of crashing on float(None).
-        'temporal_median_score': float(temporal_median) if temporal_median is not None else None,
-        'temporal_tested': temporal_median is not None,
+        'oos_corroboration': {k: (float(v) if isinstance(v, (float, np.floating)) else v)
+                               for k, v in corroboration.items() if k != 'checks'},
+        'oos_corroboration_checks': corroboration.get('checks', {}),
+        # temporal can genuinely be None (IS score never cleared 0, so the
+        # temporal check never ran) -- record that plainly instead of
+        # crashing trying to serialize it.
+        'temporal_robustness': temporal, 'temporal_tested': temporal is not None,
         'robustness_tier': tier, 'params': clean,
     }
     with open(filename, 'w') as f:
         json.dump(data, f, indent=2, default=str)
 
 
-def print_candidate_report(rank, p, is_score, is_m, oos_score, oos_m, robustness,
-                            temporal_ok, temporal_median, neighbor_note=""):
+def print_candidate_report(rank, p, is_score, is_m, oos_score, oos_m, corroboration,
+                            temporal, neighbor_note=""):
     from crypto_signal_engine import ENTRY_TYPE_NAMES, EXIT_TYPE_NAMES
     print("\n" + "=" * 78)
     print(f"CANDIDATE #{rank}  {neighbor_note}")
@@ -1480,12 +1799,23 @@ def print_candidate_report(rank, p, is_score, is_m, oos_score, oos_m, robustness
               f"Sharpe: {oos_m.get('sharpe',0):.2f}  MaxDD: {abs(oos_m.get('max_dd',0))*100:.1f}%  Trades: {oos_m.get('trades',0)}")
     else:
         print(f"Out-of-Sample Score: {oos_score:.4f}  (failed OOS gates)")
-    rob_str = "N/A" if robustness <= -1.0 else f"{robustness:.1%}"
-    if temporal_ok is None:
+
+    if corroboration.get('insufficient_data'):
+        corrob_str = "N/A -- not enough full-coverage years on one or both sides"
+    elif not corroboration.get('checks'):
+        corrob_str = "N/A -- IS or OOS failed its own hard gates first"
+    else:
+        n_pass = sum(corroboration['checks'].values())
+        corrob_str = f"{'PASS' if corroboration['passed'] else 'FAIL'} ({n_pass}/3 checks; see corroboration detail below)"
+    if temporal is None:
         temporal_str = "N/A -- not tested (IS score never cleared 0)"
     else:
-        temporal_str = f"{'PASS' if temporal_ok else 'FAIL'} (median retained score {temporal_median:.4f})"
-    print(f"Robustness Ratio: {rob_str}   Temporal robustness: {temporal_str}")
+        temporal_str = (f"{'PASS' if temporal['passed'] else 'FAIL'} "
+                         f"({temporal['frac_profitable']*100:.0f}% of {temporal['n_runs']} timing-shuffled "
+                         f"replays still profitable, {temporal['frac_within_dd_cap']*100:.0f}% stayed under "
+                         f"{MAX_DD_HARD_CAP*100:.0f}% drawdown)")
+    print(f"OOS Corroboration: {corrob_str}")
+    print(f"Temporal robustness: {temporal_str}")
     print("=" * 78)
 
 
@@ -1519,21 +1849,20 @@ def run_portfolio_validation():
     for cand in candidates:
         p = cand['params']
         rank_in = cand.get('rank', '?')
-        is_score, is_m, oos_score, oos_m, robustness, is_end_wealth, is_end_bench = run_wfo_validation(
+        is_score, is_m, oos_score, oos_m, corroboration, is_end_wealth, is_end_bench = run_wfo_validation(
             p, opens, closes, atr, adx, years_arr, eligible_mask, sip_flag_default)
 
-        # BUG FIX (found from a real run): temporal_ok used to default to True
+        # BUG FIX (found from a real run): temporal used to default to True
         # (printed as "PASS") for any candidate whose IS score never even
         # cleared 0 -- meaning the temporal check never ran at all, but the
         # report looked identical to a candidate that was genuinely tested
-        # and held up. None to explicitly mean "not tested."
-        temporal_ok, temporal_median = None, None
+        # and held up. None means "not tested," explicitly.
+        temporal = None
         if is_score > 0:
-            temporal_ok, temporal_median, _ = run_temporal_robustness_check(
-                p, opens, closes, atr, adx, years_arr, eligible_mask, master_dates, is_score)
+            temporal = run_temporal_robustness_check(
+                p, opens, closes, atr, adx, years_arr, eligible_mask, master_dates)
 
-        print_candidate_report(rank_in, p, is_score, is_m, oos_score, oos_m, robustness,
-                                temporal_ok, temporal_median,
+        print_candidate_report(rank_in, p, is_score, is_m, oos_score, oos_m, corroboration, temporal,
                                 neighbor_note=f"(signal-engine rank #{rank_in}, signal IS score {cand.get('is_score', 0):.3f})")
 
         # BUG FIX (found from a real run): a candidate that fails used to print
@@ -1550,35 +1879,45 @@ def run_portfolio_validation():
         elif oos_score <= -900:
             print_gate_diagnosis(oos_m, oos_m.get('yearly', []), is_oos=True,
                                  label=f"Candidate #{rank_in} -- passed IS, why OOS failed")
+        elif not corroboration.get('insufficient_data'):
+            print_oos_corroboration(corroboration, label=f"Candidate #{rank_in} -- OOS corroboration detail")
 
         results.append({
             'signal_rank': rank_in, 'params': p, 'is_score': is_score, 'oos_score': oos_score,
-            'robustness': robustness, 'temporal_ok': temporal_ok, 'temporal_median': temporal_median,
+            'corroboration': corroboration, 'temporal': temporal,
             'is_metrics': is_m, 'oos_metrics': oos_m,
         })
 
-    # rank: prefer candidates that cleared OOS gates AND temporal robustness,
-    # then by OOS score -- exactly the point of this whole file: a candidate
-    # that ranked #1 on signal quality alone might not win here, and a
-    # candidate that ranked lower on signal quality might, if it happens to
-    # fit the realities of shared capital better. Nothing here overwrites
-    # or hides the signal-engine ranking -- both are reported.
+    # rank: prefer candidates that cleared OOS corroboration AND temporal
+    # robustness, then by OOS score -- exactly the point of this whole
+    # file: a candidate that ranked #1 on signal quality alone might not
+    # win here, and a candidate that ranked lower on signal quality might,
+    # if it happens to fit the realities of shared capital better and
+    # actually carry its IS-window behavior into OOS. Nothing here
+    # overwrites or hides the signal-engine ranking -- both are reported.
     def sort_key(r):
-        cleared = (r['oos_score'] > -900) and bool(r['temporal_ok'])
+        cleared = (r['oos_score'] > -900) and bool(r['corroboration'].get('passed')) and bool(
+            r['temporal']['passed'] if r['temporal'] else False)
         return (cleared, r['oos_score'] if r['oos_score'] > -900 else -9999)
     results.sort(key=sort_key, reverse=True)
 
     print("\n" + "=" * 78)
     print("FINAL RANKING -- portfolio-validated, not signal-only")
     print("=" * 78)
-    print(f"{'Rank':<6}{'Signal Rank':<13}{'OOS Score':<12}{'Robustness':<12}{'Temporal':<10}{'Entry/Exit'}")
+    print(f"{'Rank':<6}{'Signal Rank':<13}{'OOS Score':<12}{'Corroboration':<16}{'Temporal':<10}{'Entry/Exit'}")
     from crypto_signal_engine import ENTRY_TYPE_NAMES, EXIT_TYPE_NAMES
     for i, r in enumerate(results, start=1):
         p = r['params']
-        rob = "N/A" if r['robustness'] <= -1.0 else f"{r['robustness']*100:.0f}%"
+        c = r['corroboration']
+        if c.get('insufficient_data'):
+            corrob_col = "N/A"
+        elif not c.get('checks'):
+            corrob_col = "N/A"
+        else:
+            corrob_col = f"{'PASS' if c['passed'] else 'FAIL'} ({sum(c['checks'].values())}/3)"
         oos_str = f"{r['oos_score']:.3f}" if r['oos_score'] > -900 else "GATE FAIL"
-        temporal_col = "N/A" if r['temporal_ok'] is None else ('PASS' if r['temporal_ok'] else 'FAIL')
-        print(f"{i:<6}{r['signal_rank']:<13}{oos_str:<12}{rob:<12}{temporal_col:<10}"
+        temporal_col = "N/A" if r['temporal'] is None else ('PASS' if r['temporal']['passed'] else 'FAIL')
+        print(f"{i:<6}{r['signal_rank']:<13}{oos_str:<12}{corrob_col:<16}{temporal_col:<10}"
               f"{ENTRY_TYPE_NAMES.get(p['entry_type'],'?')} / {EXIT_TYPE_NAMES.get(p['exit_type'],'?')}")
 
     if not results:
@@ -1586,20 +1925,33 @@ def run_portfolio_validation():
         return
 
     winner = results[0]
-    if winner['oos_score'] > -900 and winner['robustness'] >= 0.70 and bool(winner['temporal_ok']):
-        tier = "EXCELLENT (>70% robustness, temporal-stable) -- deploy with confidence"
-    elif winner['oos_score'] > -900 and winner['robustness'] >= ROBUSTNESS_DEPLOY_THRESHOLD and bool(winner['temporal_ok']):
-        tier = f"ACCEPTABLE ({ROBUSTNESS_DEPLOY_THRESHOLD:.0%}-70%) -- deploy cautiously"
-    elif winner['oos_score'] > -900 and winner['robustness'] >= 0.30:
-        tier = "CAUTION (30%-50%, or temporal check failed/untested) -- meaningful risk; consider smaller size"
-    elif winner['oos_score'] > -900:
-        tier = "POOR (<30%) -- high risk of not holding up; treat as a starting point, not a system"
-    else:
-        tier = "OOS GATE FAILURE -- even the best shortlisted candidate didn't hold up under real capital constraints"
+    w_corrob = winner['corroboration']
+    w_temporal = winner['temporal']
 
-    save_champion(winner['oos_score'], winner['is_score'], winner['robustness'],
-                  winner['temporal_median'], winner['params'], tier)
-    print(f"\n{'='*78}\nWINNER -- ROBUSTNESS TIER: {tier}\n{'='*78}")
+    # BUG FIX / REDESIGN (user request): replaces the old nested
+    # robustness-ratio bands (>=70% / >=50% / >=30% of an opaque composite-
+    # score ratio, none of which had a principled basis for exactly where
+    # the line sat) with named, specific failure states, each pointing at
+    # the actual check that produced it -- so "why isn't this EXCELLENT"
+    # has a concrete answer instead of "the ratio wasn't high enough."
+    if winner['is_score'] <= -900:
+        tier = "IS GATE FAILURE -- even the best shortlisted candidate didn't clear basic in-sample gates under real capital constraints"
+    elif winner['oos_score'] <= -900:
+        tier = "OOS GATE FAILURE -- passed in-sample, but the OOS window itself didn't clear the same basic gates (too few trades, unprofitable, etc.)"
+    elif w_corrob.get('insufficient_data'):
+        tier = "UNVERIFIED -- OOS window too short to compare year-by-year against IS; treat any pass as provisional"
+    elif not w_corrob.get('passed'):
+        failed_checks = [k for k, v in w_corrob.get('checks', {}).items() if not v]
+        tier = f"OOS CORROBORATION FAILURE -- OOS cleared its own gates but didn't corroborate IS on: {', '.join(failed_checks)}"
+    elif w_temporal is not None and not w_temporal.get('passed'):
+        tier = "TIMING-SENSITIVE -- OOS corroborates IS, but results depend meaningfully on which day of the month contributions land"
+    elif w_temporal is None:
+        tier = "VALIDATED, TEMPORAL UNTESTED -- OOS corroborates IS on profitability and trade frequency (temporal check didn't run)"
+    else:
+        tier = "VALIDATED -- OOS corroborates IS on profitability and trade frequency, and holds up regardless of contribution timing"
+
+    save_champion(winner['oos_score'], winner['is_score'], w_corrob, w_temporal, winner['params'], tier)
+    print(f"\n{'='*78}\nWINNER -- STATUS: {tier}\n{'='*78}")
     print(f"Saved to {CHAMPION_FILE}. This was signal-engine rank #{winner['signal_rank']} of "
           f"{len(candidates)} tested -- ", end="")
     if winner['signal_rank'] != 1:
