@@ -1,0 +1,88 @@
+{
+    "universe": "NIFTY50",
+    "is_score": 0.4138186229630389,
+    "is_metrics": {
+        "score": 0.4138186229630389,
+        "full": {
+            "trades": 1457,
+            "net_pnl": 1863857.5631747548,
+            "account_roi": 264.37695931556806,
+            "rocar": 269.00358138172453,
+            "win_rate": 41.72958133150309,
+            "profit_factor": 1.7597219994632427
+        },
+        "organic": {
+            "trades": 1442,
+            "net_pnl": 1769195.516400423,
+            "account_roi": 250.94971863835784,
+            "rocar": 255.34136270883116,
+            "win_rate": 41.33148404993065,
+            "profit_factor": 1.724081395948116
+        },
+        "eot_trades": 15,
+        "eot_pnl": 94662.04677433157,
+        "max_dd": 21.76943497281536,
+        "utilization": 98.29929441616673
+    },
+    "oos_metrics": {
+        "score": 0.1754631756702984,
+        "full": {
+            "trades": 492,
+            "net_pnl": 13529.074232034243,
+            "account_roi": 5.637114263347601,
+            "rocar": 9.245352951924819,
+            "win_rate": 43.49593495934959,
+            "profit_factor": 1.0752185094180045
+        },
+        "organic": {
+            "trades": 477,
+            "net_pnl": 14384.635875629221,
+            "account_roi": 5.993598281512176,
+            "rocar": 9.830017447920795,
+            "win_rate": 44.0251572327044,
+            "profit_factor": 1.0812331700353317
+        },
+        "eot_trades": 15,
+        "eot_pnl": -855.5616435949723,
+        "max_dd": 12.491236501304796,
+        "utilization": 97.94717751200668
+    },
+    "stress_test": {
+        "score": -999.0,
+        "full": {
+            "trades": 15,
+            "net_pnl": 1665.1657821517938,
+            "account_roi": 5.550552607172646,
+            "rocar": 13.123302782405524,
+            "win_rate": 33.33333333333333,
+            "profit_factor": 1.4555526704194113
+        },
+        "organic": {
+            "trades": 10,
+            "net_pnl": -0.04950993705642759,
+            "account_roi": -0.0001650331235214253,
+            "rocar": -0.00039019171646064354,
+            "win_rate": 20.0,
+            "profit_factor": 0.9999852895482028
+        },
+        "eot_trades": 5,
+        "eot_pnl": 1665.2152920888502,
+        "max_dd": 12.953296053743719,
+        "utilization": 72.12472451307364
+    },
+    "best_params": {
+        "entry_type": 0,
+        "entry_ma_len": 60,
+        "entry_ma_type": 3,
+        "use_market_macro_system": false,
+        "adx_thresh": 15.0,
+        "max_pyramid_layers": 2,
+        "wl_mode": "WL_DEEPEST_DISCOUNT",
+        "use_global_tp": false,
+        "max_holding_bars": 50,
+        "trail_atr_mult": 4.6,
+        "sl_mult": 2.5,
+        "exit_type": 0
+    },
+    "updated_at": "2026-09-23T21:58:50.915525"
+}
