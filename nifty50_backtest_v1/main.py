@@ -23,6 +23,7 @@ from __future__ import annotations
 import os
 import io
 import sys
+import ast
 import copy
 import json
 import time
@@ -79,6 +80,7 @@ MACRO_INDEX_NAME: str = "NIFTY50"
 MACRO_INDEX_TICKER: str = "^NSEI"
 
 FORCE_MACRO_REGIME_FILTER: Optional[bool] = None
+FORCE_TRAIL_STOP: Optional[bool] = None  # Set True to lock trailing stops off (trail_atr_mult=0.0, trail_pct=0.0)
 
 START_YEAR: int = 2008
 QUOTE_CURRENCY: str = "INR"
@@ -868,12 +870,10 @@ class BacktestEngine:
                 exit_reason = ""
                 raw_exit_px = o_bar
 
-                # Phase 2A: Open Exits
-                if o_bar <= tr.current_sl:
-                    exit_triggered = True
-                    exit_reason = f"GAP_{tr.stop_reason}"
-                    raw_exit_px = o_bar
-                elif macro_bear_confirmed:
+                # Phase 2A: Open Exits (non-stop-loss triggers only; these already follow the
+                # signal-on-T-1/fill-on-T-open convention used elsewhere and are unaffected
+                # by the stop-loss change below)
+                if macro_bear_confirmed:
                     exit_triggered = True
                     exit_reason = "MACRO_REGIME_EXIT"
                     raw_exit_px = o_bar
@@ -887,20 +887,25 @@ class BacktestEngine:
                         exit_reason = f"SIGNAL_EXIT_TYPE_{xt}"
                         raw_exit_px = o_bar
 
-                # Phase 2B: Intraday Exits
+                # Phase 2B: Close-of-Bar Exits. Stop-loss is decided off the EOD Close (not the
+                # intraday Low, and not a same-bar Open gap-through) because the live companion
+                # bot only ever observes one already-closed daily bar per run and has no way to
+                # react to intrabar prices or gaps. Take-profit still uses the intraday High,
+                # since the live bot checks that the same way.
                 if not exit_triggered:
-                    sl_breached = (l_bar <= tr.current_sl)
+                    c_bar = grid.close_mat[c_i, t]
+                    sl_breached = (c_bar <= tr.current_sl)
                     tp_price = tr.entry_price + (tp_mult * tr.entry_atr)
                     tp_breached = (use_tp and not tr.tp_done and (h_bar >= tp_price))
 
                     if sl_breached and tp_breached:
                         exit_triggered = True
                         exit_reason = tr.stop_reason
-                        raw_exit_px = tr.current_sl
+                        raw_exit_px = c_bar
                     elif sl_breached:
                         exit_triggered = True
                         exit_reason = tr.stop_reason
-                        raw_exit_px = min(o_bar, tr.current_sl)
+                        raw_exit_px = c_bar
                     elif tp_breached:
                         close_units = tr.units * tp_size
                         part_rate_tp = min(1.0, max(0.0, (close_units * tp_price) / adv))
@@ -1127,12 +1132,15 @@ class BacktestEngine:
 
                         h_today = grid.high_mat[c_i, t]
                         l_today = grid.low_mat[c_i, t]
+                        c_today = grid.close_mat[c_i, t]
 
-                        # Day-1 Entry Stop Check
-                        if l_today <= sl_price:
-                            part_rate_exit = min(1.0, max(0.0, (units * sl_price) / adv_30d))
+                        # Day-1 Entry Stop Check — decided off the Close, matching the live
+                        # bot's EOD-only stop evaluation (Phase 2B above uses the same rule
+                        # for positions opened on prior days).
+                        if c_today <= sl_price:
+                            part_rate_exit = min(1.0, max(0.0, (units * c_today) / adv_30d))
                             slip_exit = (BASE_SLIPPAGE_BPS + IMPACT_COEF_BPS * np.sqrt(part_rate_exit)) / 10000.0
-                            fill_exit_px, proceeds, fee_exit = _sell_fill_audited(units, sl_price, slip_exit, apply_dp=True)
+                            fill_exit_px, proceeds, fee_exit = _sell_fill_audited(units, c_today, slip_exit, apply_dp=True)
                             cash += proceeds
                             pnl = proceeds - total_cost
 
@@ -1689,12 +1697,17 @@ def sample_hyperparameters(trial: optuna.Trial) -> Dict[str, Any]:
     p["max_holding_bars"] = trial.suggest_int("max_holding_bars", 10, 60, step=5)
     p["sl_mult"] = round(trial.suggest_float("sl_mult", 2.0, 6.0, step=0.2), 1)
 
-    p["exit_type"] = trial.suggest_categorical("exit_type", [0, 1, 3, 4, 5, 6, 7])
-    if p["exit_type"] == 1:
-        p["trail_pct"] = round(trial.suggest_float("trail_pct", 5.0, 25.0, step=1.0), 1)
+    if FORCE_TRAIL_STOP is True:
+        p["exit_type"] = trial.suggest_categorical("exit_type", [0, 3, 4, 5, 6, 7])
+        p["trail_pct"] = 0.0
         p["trail_atr_mult"] = 0.0
     else:
-        p["trail_atr_mult"] = trial.suggest_categorical("trail_atr_mult", [0.0, 2.5, 3.5, 5.0, 6.5])
+        p["exit_type"] = trial.suggest_categorical("exit_type", [0, 1, 3, 4, 5, 6, 7])
+        if p["exit_type"] == 1:
+            p["trail_pct"] = round(trial.suggest_float("trail_pct", 5.0, 25.0, step=1.0), 1)
+            p["trail_atr_mult"] = 0.0
+        else:
+            p["trail_atr_mult"] = trial.suggest_categorical("trail_atr_mult", [0.0, 2.5, 3.5, 5.0, 6.5])
 
     if p["exit_type"] == 3:
         p["exit_ma_len"] = trial.suggest_int("exit_ma_len", 10, 150, step=5)
@@ -1720,11 +1733,27 @@ def sample_hyperparameters(trial: optuna.Trial) -> Dict[str, Any]:
     return p
 
 
+def _canonical_func_source(fn) -> str:
+    """Extracts an AST dump of a function, stripping docstrings, comments, and whitespace formatting."""
+    try:
+        source = inspect.getsource(fn)
+        tree = ast.parse(source)
+        for node in ast.walk(tree):
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.Module)):
+                if (node.body and isinstance(node.body[0], ast.Expr) and
+                        isinstance(node.body[0].value, (ast.Constant, ast.Str))):
+                    node.body.pop(0)
+        return ast.dump(tree)
+    except Exception:
+        return inspect.getsource(fn)
+
+
 ENGINE_HASH_INPUT: str = (
-    inspect.getsource(sample_hyperparameters) +
-    inspect.getsource(calculate_metrics) +
-    inspect.getsource(compile_signals_fast) +
+    _canonical_func_source(sample_hyperparameters) +
+    _canonical_func_source(calculate_metrics) +
+    _canonical_func_source(compile_signals_fast) +
     str(FORCE_MACRO_REGIME_FILTER) +
+    str(FORCE_TRAIL_STOP) +
     str(START_YEAR)
 )
 PARAM_SPACE_HASH: str = hashlib.sha256(ENGINE_HASH_INPUT.encode()).hexdigest()[:8]
@@ -2298,7 +2327,7 @@ def run_optimization():
     f3_label = f"{grid.dates[f3_s].year}-{str(grid.dates[f3_e - 1].year)[2:]}"
 
     wf_folds_md = (
-        f"| Candidate Rank | Score | Fold 1 ({f1_label}) | ^NSEI F1 | Fold 2 ({f2_label}) | ^NSEI F2 | Fold 3 ({f3_label}) | ^NSEI F3 | Consistency / Status |\n"
+        f"| Candidate Rank | Search Score* | Fold 1 ({f1_label}) | ^NSEI F1 | Fold 2 ({f2_label}) | ^NSEI F2 | Fold 3 ({f3_label}) | ^NSEI F3 | Consistency / Status |\n"
         f"| :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- |\n"
     )
 
@@ -2539,7 +2568,7 @@ def run_optimization():
 | **Nominal Win Rate (PnL > 0)** | {is_metrics['full']['win_rate']:.2f}% | {oos_metrics['full']['win_rate']:.2f}% | Includes marginal wins |
 | **Strategy Profit Factor** | {is_metrics['full']['profit_factor']:.2f} | {oos_metrics['full']['profit_factor']:.2f} | Full trade population audited |
 | **Completed Trades** | {is_metrics['full']['trades']} | {oos_metrics['full']['trades']} | Trade volume |
-| **Composite Fitness Score** | {is_metrics['score']:.4f} | {oos_metrics['score']:.4f} | Multi-term Calmar fitness |
+| **Raw Composite Fitness Score** | {is_metrics['score']:.4f} | {oos_metrics['score']:.4f} | Undiscounted full-horizon Calmar/MAR fitness |
 
 ### B. Distinct Ticker & Point-in-Time Exposure Telemetry
 | Concentration Metric | In-Sample (IS) | Out-of-Sample (OOS) | Operational Risk Assessment |
@@ -2561,7 +2590,10 @@ def run_optimization():
 > **Champion Promotion Diagnostic:** {selection_diagnosis_msg}
 > 
 > **Methodological Note (Fold 3 vs Literal OOS):** Fold 3 covers the final 33% of all available sessions ({f3_label}), spanning the late In-Sample bull market plus the entire Out-of-Sample test window. Literal OOS strictly isolates the final 25% of trading history. An algorithm can produce positive alpha over the pure OOS test window while still trailing the index during the broader bull run embedded in Fold 3.
+>
+> **\* Score Reconciliation:** The *Search Score* in this table is the search-time objective value after plateau neighborhood stability, crisis drawdown penalties, and jackknife sub-sampling. It is lower than the *Raw Composite Fitness Score* in Section 1, which measures undiscounted full-sample execution.
 
+{wf_folds_md}
 {wf_folds_md}
 ## 5. TWR Beta, Capture Ratios & Dual Placebo Suite
 | Metric | In-Sample Value | Out-of-Sample Value | Context / Benchmark Baseline |
