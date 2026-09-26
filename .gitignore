@@ -8,10 +8,13 @@ __pycache__/
 *$py.class
 data/
 data_cache/
+data_cache_crypto/
 **/data/
 **/data/
 **/data_cache/
+**/data_cache_crypto/
 **/results/
+**/output/
 
 # Java / Gradle build outputs
 *.class
