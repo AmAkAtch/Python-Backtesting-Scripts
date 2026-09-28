@@ -62,8 +62,8 @@ FORCE_TRAIL_STOP: Optional[bool] = None
 
 START_YEAR: int = 2017
 QUOTE_CURRENCY: str = "USD"
-INITIAL_CAPITAL: float = 10_000.0
-MONTHLY_CONTRIBUTION: float = 500.0
+INITIAL_CAPITAL: float = 1_000.0
+MONTHLY_CONTRIBUTION: float = 1_000.0
 CASH_ANNUAL_YIELD: float = 0.0          # 0.0% pure risk-free yield
 MIN_HISTORY_DAYS: int = 250
 WARMUP_BARS: int = 300
@@ -87,8 +87,8 @@ MAX_POSITION_EQUITY_PCT: float = 0.25     # Hard cap on aggregate allocation per
 MAX_ADV_PARTICIPATION: float = 0.015      # Max 1.5% of 30-day ADV
 NEIGHBORHOOD_DROP_LIMIT: float = 0.25
 
-DATA_DIR = Path("data_cache_crypto")
-OUTPUT_DIR = Path("output_crypto") / f"{UNIVERSE_NAME}_TOP_{TOP_N_COINS}"
+DATA_DIR = Path("data_cache")
+OUTPUT_DIR = Path("output") / f"TOP_{TOP_N_COINS}"
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -1825,7 +1825,7 @@ def sample_hyperparameters(trial: optuna.Trial) -> Dict[str, Any]:
         p["tp_move_sl_be"] = trial.suggest_categorical("tp_move_sl_be", [True, False])
 
     p["be_trigger_atr"] = trial.suggest_categorical("be_trigger_atr", [0.0, 1.5, 2.5, 3.5])
-    p["max_holding_bars"] = trial.suggest_int("max_holding_bars", 10, 45, step=5)
+    p["max_holding_bars"] = trial.suggest_int("max_holding_bars", 10, 100, step=5)
     p["sl_mult"] = round(trial.suggest_float("sl_mult", 2.0, 6.0, step=0.2), 1)
 
     if FORCE_TRAIL_STOP is True:

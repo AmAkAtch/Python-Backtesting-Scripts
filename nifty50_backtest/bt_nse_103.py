@@ -1751,7 +1751,7 @@ def sample_hyperparameters(trial: optuna.Trial) -> Dict[str, Any]:
         p["tp_move_sl_be"] = trial.suggest_categorical("tp_move_sl_be", [True, False])
 
     p["be_trigger_atr"] = trial.suggest_categorical("be_trigger_atr", [0.0, 1.5, 2.5, 3.5])
-    p["max_holding_bars"] = trial.suggest_int("max_holding_bars", 10, 60, step=5)
+    p["max_holding_bars"] = trial.suggest_int("max_holding_bars", 10, 180, step=5)
     p["sl_mult"] = round(trial.suggest_float("sl_mult", 2.0, 6.0, step=0.2), 1)
 
     if FORCE_TRAIL_STOP is True:
