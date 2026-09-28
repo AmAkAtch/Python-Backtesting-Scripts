@@ -1,0 +1,91 @@
+{
+    "version": "V10.2-INSTITUTIONAL",
+    "param_hash": "661b583f",
+    "study_name": "crypto_swing_v10.2-institutional_top_crypto_liquid_top50_661b583f",
+    "universe": "TOP_CRYPTO_LIQUID",
+    "top_n_coins": 50,
+    "is_score": 11.797518129179124,
+    "is_metrics": {
+        "score": 11.797518129179124,
+        "full": {
+            "trades": 78,
+            "net_pnl": 999567.6261498187,
+            "cagr": 158.06611462463263,
+            "total_return": 7165.234729076161,
+            "win_rate": 39.743589743589745,
+            "pure_win_rate": 39.743589743589745,
+            "be_rate": 37.17948717948718,
+            "loss_rate": 23.076923076923077,
+            "profit_factor": 4.624181969654564
+        },
+        "eot_trades": 0,
+        "eot_pnl": 0.0,
+        "cagr_organic": 158.06611462463258,
+        "max_dd": 41.73896727060743,
+        "utilization": 25.03573289409285
+    },
+    "oos_metrics": {
+        "score": 2.404006758512594,
+        "full": {
+            "trades": 27,
+            "net_pnl": 15789.894643648524,
+            "cagr": 60.75191328482556,
+            "total_return": 104.74394441522561,
+            "win_rate": 48.148148148148145,
+            "pure_win_rate": 48.148148148148145,
+            "be_rate": 22.22222222222222,
+            "loss_rate": 29.629629629629626,
+            "profit_factor": 3.2973578850668415
+        },
+        "eot_trades": 4,
+        "eot_pnl": 5915.535083939707,
+        "cagr_organic": 42.081786852299686,
+        "max_dd": 21.734001433978587,
+        "utilization": 21.74325409676216
+    },
+    "is_twr_analytics": {
+        "twr_corr": 0.26153652539161787,
+        "twr_beta": 0.2698015349468759,
+        "up_capture": 37.267997902064145,
+        "down_capture": 13.294955847614077
+    },
+    "oos_twr_analytics": {
+        "twr_corr": 0.2274100244921447,
+        "twr_beta": 0.22437527955600092,
+        "up_capture": 44.24243463076249,
+        "down_capture": 25.22274103205268
+    },
+    "is_placebo_suite": {
+        "conditioned_median": 22.35984933818228,
+        "conditioned_p5": -4.5172349749211405,
+        "conditioned_p95": 57.94977158122985
+    },
+    "oos_placebo_suite": {
+        "conditioned_median": 2.7330222192485487,
+        "conditioned_p5": -17.185910238185674,
+        "conditioned_p95": 29.389927395956818
+    },
+    "best_params": {
+        "entry_type": 3,
+        "adx_thresh": 20.0,
+        "vol_ma_len": 40,
+        "vol_mult": 3.5,
+        "price_lookback": 40,
+        "body_atr_mult": 1.4,
+        "use_market_macro_system": true,
+        "macro_ma_len": 50,
+        "macro_ma_type": 0,
+        "macro_active_exit": true,
+        "max_concurrent_tranches": 4,
+        "max_pyramid_layers": 1,
+        "wl_mode": "WL_STRONGEST_MOMENTUM",
+        "use_global_tp": false,
+        "be_trigger_atr": 1.5,
+        "max_holding_bars": 35,
+        "sl_mult": 6.0,
+        "exit_type": 7,
+        "trail_atr_mult": 0.0,
+        "bb_exit_len": 50
+    },
+    "updated_at": "2026-09-28T11:15:53.060809"
+}

@@ -48,7 +48,7 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(me
 # ==============================================================================
 
 ENGINE_VERSION: str = "V10.1"
-UNIVERSE_NAME: str = "SMALLCAP250"
+UNIVERSE_NAME: str = "NIFTY50"
 
 UNIVERSE_CONSTITUENT_FILES: Dict[str, str] = {
     "NIFTY50":     "constituents/ind_nifty50list.csv",
@@ -83,9 +83,9 @@ MACRO_INDEX_TICKER: str = "^NSEI"
 FORCE_MACRO_REGIME_FILTER: Optional[bool] = None
 FORCE_TRAIL_STOP: Optional[bool] = None  # Set True to lock trailing stops off (trail_atr_mult=0.0, trail_pct=0.0)
 
-START_YEAR: int = 2008
+START_YEAR: int = 2015
 QUOTE_CURRENCY: str = "INR"
-INITIAL_CAPITAL: float = 100000.0
+INITIAL_CAPITAL: float = 10000.0
 MONTHLY_CONTRIBUTION: float = 10000.0
 CASH_ANNUAL_YIELD: float = 0.0              # Strictly 0.0% cash yield (pure trade alpha)
 MIN_HISTORY_DAYS: int = 300
@@ -118,6 +118,7 @@ UNIVERSE_IMPACT_COEF_BPS: Dict[str, float] = {
 BASE_SLIPPAGE_BPS: float = UNIVERSE_SLIPPAGE_BPS[UNIVERSE_NAME]
 IMPACT_COEF_BPS: float = UNIVERSE_IMPACT_COEF_BPS[UNIVERSE_NAME]
 NEIGHBORHOOD_DROP_LIMIT: float = 0.25
+EOT_EXCESS_WEIGHT: float = 0.30  # Credit only a fraction of terminal-bar unrealized excess CAGR
 
 # Statutory Charges (NSE Delivery Rates Card)
 BROKERAGE_MODE: str = "ZERO_DELIVERY"
@@ -406,7 +407,14 @@ def fetch_from_yfinance(symbol: str, start_year: int) -> Optional[pd.DataFrame]:
     raw = raw[raw["date"] < today]
     for col in ["open", "high", "low", "close", "volume", "quote_volume"]:
         raw[col] = pd.to_numeric(raw[col], errors="coerce")
-    raw = raw.dropna(subset=["close"])
+    raw = raw.dropna(subset=["open", "high", "low", "close"])
+    # Reject invalid ticks and extreme split/data artifacts before indicators/ADV are built.
+    raw = raw[
+        (raw["open"] > 0) &
+        (raw["close"] > 0) &
+        (raw["high"] >= raw["low"]) &
+        (raw["high"] / np.maximum(1e-8, raw["low"]) < 50.0)
+    ]
     if len(raw) < MIN_HISTORY_DAYS:
         return None
     return raw.set_index("date")
@@ -1269,8 +1277,8 @@ class BacktestEngine:
             if idx == 0:
                 daily_twr_ret = 0.0
             else:
-                equity_net_of_flows = eod_equity - inflow_today
-                daily_twr_ret = (equity_net_of_flows - prev_equity) / max(1.0, prev_equity)
+                capital_base = prev_equity + inflow_today
+                daily_twr_ret = (eod_equity - capital_base) / max(1.0, capital_base)
 
             current_twr *= (1.0 + daily_twr_ret)
             prev_equity = eod_equity
@@ -1316,6 +1324,8 @@ def calculate_benchmarks(grid: MarketGrid, start_bar: int, end_bar: int, macro_o
     basket_close = grid.close_mat[:, start_bar:end_bar]
     alive_slice = grid.alive_mat[:, start_bar:end_bar]
     basket_returns = np.diff(basket_close, axis=1) / np.maximum(1e-6, basket_close[:, :-1])
+    # Prevent a single corrupted small-cap tick from dominating the benchmark CAGR.
+    basket_returns = np.clip(basket_returns, -0.95, 3.0)
 
     daily_basket_ret = np.zeros(n_bars - 1, dtype=np.float64)
     for b in range(n_bars - 1):
@@ -1454,9 +1464,23 @@ def calculate_metrics(results: Dict[str, Any], grid: MarketGrid, start_bar: int,
         return {
             "score": -10.0, "full": full,
             "eot_trades": eot_trades, "eot_pnl": eot_pnl,
+            "cagr_organic": 0.0,
             "max_dd": float(max_dd), "closed_trade_dd_pct": float(closed_trade_dd_pct),
             "utilization": float(utilization * 100.0),
         }
+
+    # Anti-cheating discount: terminal-bar mark-to-market gains are not treated as fully
+    # realized alpha during Optuna selection.
+    final_equity = float(eq[-1]) if len(eq) > 0 else INITIAL_CAPITAL
+    organic_final_equity = max(1e-6, final_equity - eot_pnl)
+    final_twr = max(1e-6, float(twr_series[-1]))
+    organic_twr_ratio = np.clip(organic_final_equity / max(1e-6, final_equity), 0.0, 1.0)
+    organic_twr_end = final_twr * organic_twr_ratio
+    years_248 = max(1, n_bars) / 248.0
+    cagr_organic = float(((organic_twr_end ** (1.0 / years_248)) - 1.0) * 100.0)
+
+    unclosed_excess_cagr = max(0.0, cagr_full - cagr_organic)
+    anti_cheat_cagr = max(0.0, cagr_organic) + (EOT_EXCESS_WEIGHT * unclosed_excess_cagr)
 
     if len(tdf) > 5:
         trade_rets = tdf["ret"].values
@@ -1466,7 +1490,7 @@ def calculate_metrics(results: Dict[str, Any], grid: MarketGrid, start_bar: int,
     else:
         expectance_discount = 1.0
 
-    trimmed_cagr = cagr_full * expectance_discount
+    trimmed_cagr = anti_cheat_cagr * expectance_discount
     rf_cagr = CASH_ANNUAL_YIELD * 100.0
     cagr_excess_rf = max(0.0, trimmed_cagr - rf_cagr)
 
@@ -1487,6 +1511,7 @@ def calculate_metrics(results: Dict[str, Any], grid: MarketGrid, start_bar: int,
     return {
         "score": float(np.nan_to_num(score, nan=-10.0)), "full": full,
         "eot_trades": eot_trades, "eot_pnl": eot_pnl,
+        "cagr_organic": float(cagr_organic),
         "max_dd": float(max_dd), "closed_trade_dd_pct": float(closed_trade_dd_pct),
         "utilization": float(utilization * 100.0),
     }
@@ -1565,6 +1590,28 @@ def evaluate_neighborhood_stability(params: Dict[str, Any], candidate_score: flo
     return is_stable, plateau_score, pass_rate, neighbor_scores
 
 
+def slice_market_grid(grid: MarketGrid, cutoff_bar: int) -> MarketGrid:
+    """Return a physically truncated MarketGrid so indicators can be recomputed independently."""
+    return MarketGrid(
+        symbols=grid.symbols,
+        dates=grid.dates[:cutoff_bar],
+        open_mat=grid.open_mat[:, :cutoff_bar].copy(),
+        high_mat=grid.high_mat[:, :cutoff_bar].copy(),
+        low_mat=grid.low_mat[:, :cutoff_bar].copy(),
+        close_mat=grid.close_mat[:, :cutoff_bar].copy(),
+        volume_mat=grid.volume_mat[:, :cutoff_bar].copy(),
+        atr14_mat=grid.atr14_mat[:, :cutoff_bar].copy(),
+        dvol30_mat=grid.dvol30_mat[:, :cutoff_bar].copy(),
+        adx14_mat=grid.adx14_mat[:, :cutoff_bar].copy(),
+        delist_mat=grid.delist_mat[:, :cutoff_bar].copy(),
+        alive_mat=grid.alive_mat[:, :cutoff_bar].copy(),
+        macro_close=grid.macro_close[:cutoff_bar].copy(),
+        macro_open=grid.macro_open[:cutoff_bar].copy(),
+        months_arr=grid.months_arr[:cutoff_bar].copy(),
+        years_arr=grid.years_arr[:cutoff_bar].copy()
+    )
+
+
 def verify_behavioral_causality(grid: MarketGrid):
     logging.info("Executing Complete 5-Archetype Prefix-Invariance Causality Audit (Comparing Row Data)...")
     n_bars = len(grid.dates)
@@ -1573,6 +1620,9 @@ def verify_behavioral_causality(grid: MarketGrid):
 
     t_cutoff = n_bars - 80
     t_cutoff_date = grid.dates[t_cutoff]
+    # IMPORTANT: indicators/signals must be recomputed on the shorter grid.
+    # Slicing signal arrays from the full grid would make this audit tautological.
+    grid_trunc = slice_market_grid(grid, t_cutoff)
 
     test_cfgs = [
         {"entry_type": 0, "entry_ma_len": 50, "entry_ma_type": 1, "use_market_macro_system": True,
@@ -1606,11 +1656,17 @@ def verify_behavioral_causality(grid: MarketGrid):
         raw_sig, entry_full, exit_full, macro_full, state_full = compile_signals_fast(grid, cfg)
         engine_full = BacktestEngine(params=cfg)
         res_full = engine_full.run_interval(grid, raw_sig, entry_full, exit_full, macro_full, 300, t_cutoff, state_mat=state_full)
+
+        raw_trunc, entry_trunc, exit_trunc, macro_trunc, state_trunc = compile_signals_fast(grid_trunc, cfg)
+        engine_trunc = BacktestEngine(params=cfg)
         f_prior = res_full["trades"]
         if len(f_prior) > 0:
             f_prior = f_prior[(f_prior["reason"] != "END_OF_TEST") & (f_prior["exit_date"] < t_cutoff_date)].sort_values(by=["coin", "entry_date"]).reset_index(drop=True)
 
-        res_trunc = engine_full.run_interval(grid, raw_sig[:, :t_cutoff], entry_full[:, :t_cutoff], exit_full[:, :t_cutoff], macro_full[:t_cutoff], 300, t_cutoff, state_mat=state_full[:, :t_cutoff])
+        res_trunc = engine_trunc.run_interval(
+            grid_trunc, raw_trunc, entry_trunc, exit_trunc, macro_trunc,
+            300, t_cutoff, state_mat=state_trunc
+        )
         t_prior = res_trunc["trades"]
         if len(t_prior) > 0:
             t_prior = t_prior[(t_prior["reason"] != "END_OF_TEST") & (t_prior["exit_date"] < t_cutoff_date)].sort_values(by=["coin", "entry_date"]).reset_index(drop=True)
@@ -2012,18 +2068,20 @@ def run_optimization():
             crisis_mult = float(np.min(crisis_penalties)) if len(crisis_penalties) > 0 else 1.0
 
             n_syms_grid = len(grid.symbols)
+            min_active = max(5, int(n_syms_grid * 0.40))
             jackknife_scores = []
-            np.random.seed(trial.number)
+            rng = np.random.default_rng(trial.number)
             for _ in range(3):
-                subset_mask = (np.random.rand(n_syms_grid) < 0.70)
-                if np.sum(subset_mask) < 25:
-                    subset_mask[:25] = True
+                subset_mask = (rng.random(n_syms_grid) < 0.70)
+                if np.sum(subset_mask) < min_active:
+                    subset_mask[:min_active] = True
                 res_jk = engine.run_interval(grid, raw_sig, entry_mat, exit_mat, macro_ok, is_start, is_end, active_symbols_mask=subset_mask, state_mat=state_mat)
                 m_jk = calculate_metrics(res_jk, grid, is_start, is_end, is_bench["nsei_twr_cagr"])
                 jackknife_scores.append(m_jk["score"])
 
             p10_jk_score = float(np.percentile(jackknife_scores, 10))
             if p10_jk_score <= 0.0:
+                logging.info(f"Trial {trial.number} REJECTED [Concentrated Scrip Alpha]: p10 jackknife <= 0")
                 return 0.01
 
             jk_ratio = min(1.0, max(0.1, p10_jk_score / max(1e-6, raw_score)))
@@ -2557,6 +2615,7 @@ def run_optimization():
 | **Rule-Closed Net Profit (Pre-Tax)** | **{format_price(is_metrics['full']['net_pnl'])}** | **{format_price(oos_metrics['full']['net_pnl'])}** | — |
 | **Estimated Post-Tax Net Profit (STCG)** | {format_price(is_tax_pnl)} | {format_price(oos_tax_pnl)} | 15% / 20% Net of FY Loss Set-Off |
 | **Strategy Annualized TWR (CAGR)** | **{is_metrics['full']['cagr']:.2f}%** | **{oos_metrics['full']['cagr']:.2f}%** | {oos_metrics['full']['cagr']/max(0.01, is_metrics['full']['cagr']):.2f}x |
+| **Organic CAGR (Anti-Cheat)** | {is_metrics['cagr_organic']:.2f}% | {oos_metrics['cagr_organic']:.2f}% | Terminal unclosed gains receive only {EOT_EXCESS_WEIGHT:.0%} incremental credit |
 | **Estimated Post-Tax CAGR** | {is_tax_cagr:.2f}% | {oos_tax_cagr:.2f}% | Indian Fiscal Year audited |
 | **Literal ^NSEI Index CAGR** | {is_bench['nsei_twr_cagr']:.2f}% | {oos_bench['nsei_twr_cagr']:.2f}% | Buy-and-Hold index |
 | **Reference 200-SMA Timed Index CAGR** | {is_bench['ref_200sma_timed_cagr']:.2f}% | {oos_bench['ref_200sma_timed_cagr']:.2f}% | Fixed trend-following benchmark |
@@ -2569,7 +2628,7 @@ def run_optimization():
 | **Nominal Win Rate (PnL > 0)** | {is_metrics['full']['win_rate']:.2f}% | {oos_metrics['full']['win_rate']:.2f}% | Includes marginal wins |
 | **Strategy Profit Factor** | {is_metrics['full']['profit_factor']:.2f} | {oos_metrics['full']['profit_factor']:.2f} | Full trade population audited |
 | **Completed Trades** | {is_metrics['full']['trades']} | {oos_metrics['full']['trades']} | Trade volume |
-| **Raw Composite Fitness Score** | {is_metrics['score']:.4f} | {oos_metrics['score']:.4f} | Undiscounted full-horizon Calmar/MAR fitness |
+| **Raw Composite Fitness Score** | {is_metrics['score']:.4f} | {oos_metrics['score']:.4f} | EOT-adjusted full-horizon Calmar/MAR fitness |
 
 ### B. Distinct Ticker & Point-in-Time Exposure Telemetry
 | Concentration Metric | In-Sample (IS) | Out-of-Sample (OOS) | Operational Risk Assessment |
@@ -2594,7 +2653,6 @@ def run_optimization():
 >
 > **\* Score Reconciliation:** The *Search Score* in this table is the search-time objective value after plateau neighborhood stability, crisis drawdown penalties, and jackknife sub-sampling. It is lower than the *Raw Composite Fitness Score* in Section 1, which measures undiscounted full-sample execution.
 
-{wf_folds_md}
 {wf_folds_md}
 ## 5. TWR Beta, Capture Ratios & Dual Placebo Suite
 | Metric | In-Sample Value | Out-of-Sample Value | Context / Benchmark Baseline |

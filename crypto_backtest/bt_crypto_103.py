@@ -199,6 +199,15 @@ def shift_1d(arr: np.ndarray, fill_value: float = np.nan) -> np.ndarray:
     return res
 
 
+def calc_percentile(value: float, samples: List[float]) -> float:
+    """Empirical percentile rank of value within a finite sample distribution."""
+    vals = np.asarray(samples, dtype=np.float64)
+    vals = vals[np.isfinite(vals)]
+    if len(vals) == 0:
+        return 0.0
+    return float(np.mean(vals <= value) * 100.0)
+
+
 # ==============================================================================
 # FAST NUMPY INDICATOR KERNELS
 # ==============================================================================
@@ -1408,8 +1417,8 @@ class BacktestEngine:
             if idx == 0:
                 daily_twr_ret = 0.0
             else:
-                equity_net_of_flows = eod_equity - inflow_today
-                daily_twr_ret = (equity_net_of_flows - prev_equity) / max(1.0, prev_equity)
+                capital_base = prev_equity + inflow_today
+                daily_twr_ret = (eod_equity - capital_base) / max(1.0, capital_base)
 
             current_twr *= (1.0 + daily_twr_ret)
             prev_equity = eod_equity
@@ -1718,6 +1727,15 @@ def dynamic_parameter_neighbors(base_p: Dict[str, Any]) -> List[Dict[str, Any]]:
         cand_macro["macro_active_exit"] = not cand_macro["macro_active_exit"]
         neighbors.append(cand_macro)
 
+    if "wl_mode" in base_p:
+        cand_wl = copy.deepcopy(base_p)
+        cand_wl["wl_mode"] = (
+            "WL_STRONGEST_MOMENTUM"
+            if cand_wl["wl_mode"] != "WL_STRONGEST_MOMENTUM"
+            else "WL_NONE"
+        )
+        neighbors.append(cand_wl)
+
     return neighbors
 
 
@@ -2021,6 +2039,42 @@ def run_trailing_stop_ablation(grid: MarketGrid, p: Dict[str, Any], is_start: in
 # AUDIT & OPTIMIZATION PIPELINE
 # ==============================================================================
 
+def run_macro_active_exit_ablation(grid: MarketGrid, p: Dict[str, Any],
+                                     is_start: int, is_end: int, oos_start: int, oos_end: int,
+                                     is_bench_cagr: float, oos_bench_cagr: float) -> str:
+    """Counterfactual comparison with macro-active exits toggled off/on."""
+    if not p.get("use_market_macro_system", False):
+        return "*Macro-Active Exit Ablation not applicable: the winning configuration does not use the macro system.*\\n"
+
+    ablated_params = copy.deepcopy(p)
+    ablated_params["macro_active_exit"] = not p.get("macro_active_exit", False)
+
+    raw, ent, ext, mac, st = compile_signals_fast(grid, p)
+    raw_a, ent_a, ext_a, mac_a, st_a = compile_signals_fast(grid, ablated_params)
+
+    eng = BacktestEngine(params=p)
+    eng_a = BacktestEngine(params=ablated_params)
+
+    r_is = eng.run_interval(grid, raw, ent, ext, mac, is_start, is_end, state_mat=st)
+    r_oos = eng.run_interval(grid, raw, ent, ext, mac, oos_start, oos_end, state_mat=st)
+    r_is_a = eng_a.run_interval(grid, raw_a, ent_a, ext_a, mac_a, is_start, is_end, state_mat=st_a)
+    r_oos_a = eng_a.run_interval(grid, raw_a, ent_a, ext_a, mac_a, oos_start, oos_end, state_mat=st_a)
+
+    m_is = calculate_metrics(r_is, grid, is_start, is_end, is_bench_cagr)
+    m_oos = calculate_metrics(r_oos, grid, oos_start, oos_end, oos_bench_cagr)
+    m_is_a = calculate_metrics(r_is_a, grid, is_start, is_end, is_bench_cagr)
+    m_oos_a = calculate_metrics(r_oos_a, grid, oos_start, oos_end, oos_bench_cagr)
+
+    return (
+        "| Configuration | IS CAGR | OOS CAGR | IS Score | OOS Score |\\n"
+        "| :--- | ---: | ---: | ---: | ---: |\\n"
+        f"| **Macro-active exit {'ON' if p.get('macro_active_exit', False) else 'OFF'}** | "
+        f"{m_is['full']['cagr']:.2f}% | {m_oos['full']['cagr']:.2f}% | {m_is['score']:.4f} | {m_oos['score']:.4f} |\\n"
+        f"| **Counterfactual {'ON' if ablated_params.get('macro_active_exit', False) else 'OFF'}** | "
+        f"{m_is_a['full']['cagr']:.2f}% | {m_oos_a['full']['cagr']:.2f}% | {m_is_a['score']:.4f} | {m_oos_a['score']:.4f} |\\n"
+    )
+
+
 def run_optimization():
     logging.info(f"Initializing Crypto Framework {ENGINE_VERSION}: Universe = {UNIVERSE_NAME}, Top {TOP_N_COINS} Coins, Start Year = {START_YEAR}")
     logging.info(f"Param Signature: {PARAM_SPACE_HASH} | Study DB: {STUDY_DB}")
@@ -2216,6 +2270,25 @@ def run_optimization():
     best_trial = best_candidate_record["trial"]
     best_params = reconstitute_params(best_trial.params)
 
+    # Promotion transparency: surface the same multi-fold gate diagnostics used for selection.
+    wf_folds_md = "| Candidate | Search Score | Fold 1 vs Index | Fold 2 vs Index | Fold 3 vs Index | Beats All 3 | Beats Recent | Recent Margin |\\n"
+    wf_folds_md += "| :--- | ---: | ---: | ---: | ---: | :---: | :---: | ---: |\\n"
+    for rank, rec in enumerate(scored_candidates[:10], 1):
+        wf_folds_md += (
+            f"| **#{rank} Trial {rec['trial'].number}** | {rec['score']:.4f} | "
+            f"{rec['c1'] - rec['i1']:+.2f}% | {rec['c2'] - rec['i2']:+.2f}% | "
+            f"{rec['c3'] - rec['i3']:+.2f}% | "
+            f"{'YES' if rec['beats_all'] else 'NO'} | "
+            f"{'YES' if rec['beats_recent'] else 'NO'} | {rec['recent_margin']:+.2f}% |\\n"
+        )
+
+    if best_candidate_record["beats_all"]:
+        selection_diagnosis_msg = "Champion cleared all three sequential folds against the macro benchmark."
+    elif best_candidate_record["beats_recent"]:
+        selection_diagnosis_msg = "No candidate cleared all folds; champion cleared the most recent fold with the strongest recent margin among the survivors."
+    else:
+        selection_diagnosis_msg = "No candidate cleared all folds or the recent benchmark; champion was selected by the documented fallback ordering."
+
     raw_sig_final, entry_final, exit_final, macro_final, state_final = compile_signals_fast(grid, best_params)
     final_engine = BacktestEngine(params=best_params)
 
@@ -2274,6 +2347,117 @@ def run_optimization():
         grid, best_params, is_start, is_end, oos_start, oos_end,
         is_bench["macro_twr_cagr"], oos_bench["macro_twr_cagr"]
     )
+    macro_ablation_md = run_macro_active_exit_ablation(
+        grid, best_params, is_start, is_end, oos_start, oos_end,
+        is_bench["macro_twr_cagr"], oos_bench["macro_twr_cagr"]
+    )
+
+    is_placebo_pct = calc_percentile(is_metrics["full"]["cagr"], is_placebo_suite["conditioned_samples"])
+    oos_placebo_pct = calc_percentile(oos_metrics["full"]["cagr"], oos_placebo_suite["conditioned_samples"])
+
+    # Leave-top-5-out concentration diagnostic.
+    leave5_cagr = None
+    leave5_table_md = "*Not enough In-Sample trades for a leave-top-5-out concentration test.*"
+    if len(is_results["trades"]) >= 10:
+        symbol_pnl = is_results["trades"].groupby("coin").agg(
+            net_pnl=("pnl", "sum"), trades=("pnl", "count"),
+            win_rate=("pnl", lambda x: (x > 0).mean() * 100.0)
+        ).sort_values("net_pnl", ascending=False)
+        top5 = symbol_pnl.head(5).index.tolist()
+        active_mask = ~np.isin(np.arange(len(grid.symbols)), [grid.symbols.index(s) for s in top5 if s in grid.symbols])
+        res_leave5 = final_engine.run_interval(
+            grid, raw_sig_final, entry_final, exit_final, macro_final,
+            is_start, is_end, active_symbols_mask=active_mask, state_mat=state_final,
+            window_label="IS_LEAVE_TOP5_OUT"
+        )
+        m_leave5 = calculate_metrics(res_leave5, grid, is_start, is_end, is_bench["macro_twr_cagr"])
+        leave5_cagr = m_leave5["full"]["cagr"]
+        leave5_table_md = (
+            "| Diagnostic | Result |\\n| :--- | :--- |\\n"
+            f"| Top 5 symbol profit drivers removed | {', '.join(top5)} |\\n"
+            f"| Baseline IS CAGR | {is_metrics['full']['cagr']:.2f}% |\\n"
+            f"| Leave-top-5-out IS CAGR | {leave5_cagr:.2f}% |\\n"
+        )
+
+    exposure_md = (
+        "| Window | Peak Single-Asset Exposure |\\n| :--- | ---: |\\n"
+        f"| In-Sample | {is_results['peak_single_asset_pct']:.2f}% |\\n"
+        f"| Out-of-Sample | {oos_results['peak_single_asset_pct']:.2f}% |\\n"
+    )
+
+    def _trade_reason_md(tdf):
+        if len(tdf) == 0:
+            return "*No trades.*"
+        vc = tdf["reason"].value_counts()
+        md = "| Exit Reason | Trades | Share |\\n| :--- | ---: | ---: |\\n"
+        for reason, count in vc.items():
+            md += f"| {reason} | {int(count)} | {100.0 * count / len(tdf):.1f}% |\\n"
+        return md
+
+    def _excursion_md(tdf):
+        if len(tdf) == 0:
+            return "*No trades.*"
+        return (
+            "| Metric | Median | Mean |\\n| :--- | ---: | ---: |\\n"
+            f"| MFE | {tdf['mfe_pct'].median():.2f}% | {tdf['mfe_pct'].mean():.2f}% |\\n"
+            f"| MAE | {tdf['mae_pct'].median():.2f}% | {tdf['mae_pct'].mean():.2f}% |\\n"
+            f"| Bars to Peak | {tdf['bars_to_peak'].median():.1f} | {tdf['bars_to_peak'].mean():.1f} |\\n"
+        )
+
+    is_reason_md = _trade_reason_md(is_results["trades"])
+    oos_reason_md = _trade_reason_md(oos_results["trades"])
+    is_excursion_md = _excursion_md(is_results["trades"])
+    oos_excursion_md = _excursion_md(oos_results["trades"])
+
+    # Annual TWR attribution across the complete continuous test book (IS + OOS).
+    yearly_md = "| Calendar Year | Strategy TWR | " + MACRO_INDEX_NAME + " Return | Completed Trades | Win Rate |\\n"
+    yearly_md += "| :--- | ---: | ---: | ---: | ---: |\\n"
+    cont_dates = pd.to_datetime(continuous_results["dates"])
+    for yr in sorted(cont_dates.year.unique()):
+        yidx = np.where(cont_dates.year == yr)[0]
+        if len(yidx) >= 2:
+            strat_yr = (continuous_results["twr_curve"][yidx[-1]] / max(1e-9, continuous_results["twr_curve"][yidx[0]])) - 1.0
+            g0 = is_start + int(yidx[0])
+            g1 = is_start + int(yidx[-1]) + 1
+            bench_yr = calculate_benchmarks(grid, g0, g1)["macro_total_return"] / 100.0
+            yr_trades = all_trades[pd.to_datetime(all_trades["exit_date"]).dt.year == yr]
+            yr_wr = (yr_trades["pnl"] > 0).mean() * 100.0 if len(yr_trades) else 0.0
+            yearly_md += f"| **{yr}** | {strat_yr*100:+.2f}% | {bench_yr*100:+.2f}% | {len(yr_trades)} | {yr_wr:.1f}% |\\n"
+
+
+    f_disp = is_results["funnel_stats"]
+    funnel_table_md = f"""| Stage in Funnel | Unique Signals | Disposition Description |
+| :--- | :--- | :--- |
+| **Total Raw Technical Triggers** | **{f_disp['raw_triggers']}** | Close > HHV, RSI cross, or MA trigger |
+| ├── Macro Gate Blocked | -{f_disp['macro_blocked']} | {MACRO_INDEX_NAME} below Macro Moving Average |
+| ├── Liquidity Floor Blocked | -{f_disp['liquidity_blocked']} | ADV < {format_price(LIQUIDITY_FLOOR_USD)} |
+| ├── ADX Trend Blocked | -{f_disp['adx_blocked']} | ADX < Selected Threshold |
+| ├── Pyramid Limit Blocked | -{f_disp['pyramid_blocked']} | Asset already at max layers or averaging down |
+| ├── Revalidation Dropped | -{f_disp['revalidation_dropped']} | Failed macro/ADX/state check at fill time |
+| ├── Slot Saturated Dropped | -{f_disp['slot_saturated_dropped']} | No open portfolio slots available |
+| ├── Cash Starved Dropped | -{f_disp['cash_starved_dropped']} | Cash below {format_price(TRANCHE_FLOOR_USD)} |
+| ├── Scrip Risk Cap Dropped | -{f_disp['risk_cap_dropped']} | Exceeded single-asset 25% exposure ceiling |
+| ├── Expired in Watchlist | -{f_disp['expired_unfilled']} | Exceeded {WL_MAX_AGE_BARS} bars or shadow stop |
+| **Executed Trades on Ledger** | **{f_disp['executed_fills']}** | Successfully filled and audited |
+"""
+    funnel_checksum = (
+        f_disp["raw_triggers"]
+        - f_disp["macro_blocked"]
+        - f_disp["liquidity_blocked"]
+        - f_disp["adx_blocked"]
+        - f_disp["pyramid_blocked"]
+        - f_disp["revalidation_dropped"]
+        - f_disp["slot_saturated_dropped"]
+        - f_disp["cash_starved_dropped"]
+        - f_disp["risk_cap_dropped"]
+        - f_disp["expired_unfilled"]
+        - f_disp["executed_fills"]
+    )
+
+    funnel_table_md = funnel_table_md.rstrip() + (
+        f"\n| **Checksum: raw triggers - all dispositions - executed** | "
+        f"**{funnel_checksum}** | Expected 0 |\n"
+    )
 
     winner_data = {
         "version": ENGINE_VERSION,
@@ -2315,23 +2499,7 @@ def run_optimization():
         export_df["fee_slippage"] = export_df["frictions"].apply(lambda f: f.slippage_cost if hasattr(f, "slippage_cost") else 0.0)
         export_df = export_df.drop(columns=["frictions"])
     export_df.to_csv(TRADES_CSV_FILE, index=False)
-
-    f_disp = is_results["funnel_stats"]
-    funnel_table_md = f"""| Stage in Funnel | Unique Signals | Disposition Description |
-| :--- | :--- | :--- |
-| **Total Raw Technical Triggers** | **{f_disp['raw_triggers']}** | Close > HHV, RSI cross, or MA trigger |
-| ├── Macro Gate Blocked | -{f_disp['macro_blocked']} | {MACRO_INDEX_NAME} below Macro Moving Average |
-| ├── Liquidity Floor Blocked | -{f_disp['liquidity_blocked']} | ADV < {format_price(LIQUIDITY_FLOOR_USD)} |
-| ├── ADX Trend Blocked | -{f_disp['adx_blocked']} | ADX < Selected Threshold |
-| ├── Pyramid Limit Blocked | -{f_disp['pyramid_blocked']} | Asset already at max layers or averaging down |
-| ├── Revalidation Dropped | -{f_disp['revalidation_dropped']} | Failed macro/ADX/state check at fill time |
-| ├── Slot Saturated Dropped | -{f_disp['slot_saturated_dropped']} | No open portfolio slots available |
-| ├── Cash Starved Dropped | -{f_disp['cash_starved_dropped']} | Cash below {format_price(TRANCHE_FLOOR_USD)} |
-| ├── Scrip Risk Cap Dropped | -{f_disp['risk_cap_dropped']} | Exceeded single-asset 25% exposure ceiling |
-| ├── Expired in Watchlist | -{f_disp['expired_unfilled']} | Exceeded {WL_MAX_AGE_BARS} bars or shadow stop |
-| **Executed Trades on Ledger** | **{f_disp['executed_fills']}** | Successfully filled and audited |
-"""
-
+    
     report_md = f"""# Crypto Quantitative Strategy Audit Dossier ({ENGINE_VERSION}) — {UNIVERSE_NAME} (Top {TOP_N_COINS})
 
 ## 1. Segregated Performance Accounting (Pure 365-Day Continuous TWR)
@@ -2342,6 +2510,7 @@ def run_optimization():
 | **Strategy Annualized TWR (CAGR)** | **{is_metrics['full']['cagr']:.2f}%** | **{oos_metrics['full']['cagr']:.2f}%** | 365 Continuous Days/Year |
 | **Strategy Organic CAGR (Anti-Cheat)** | {is_metrics['cagr_organic']:.2f}% | {oos_metrics['cagr_organic']:.2f}% | Deflated by terminal unclosed equity |
 | **Benchmark ({MACRO_INDEX_NAME}) CAGR** | {is_bench['macro_twr_cagr']:.2f}% | {oos_bench['macro_twr_cagr']:.2f}% | Buy-and-Hold {MACRO_INDEX_NAME} |
+| **Beats Index?** | {'PASSED' if is_metrics['full']['cagr'] > is_bench['macro_twr_cagr'] else 'FAILED'} | {'PASSED' if oos_metrics['full']['cagr'] > oos_bench['macro_twr_cagr'] else 'FAILED'} | Direct CAGR comparison |
 | **Equal-Weight Filtered Basket CAGR** | {is_bench['basket_twr_cagr']:.2f}% | {oos_bench['basket_twr_cagr']:.2f}% | Unweighted clean crypto set (clipped) |
 | **Strategy TWR Max Drawdown** | **{is_metrics['max_dd']:.2f}%** | **{oos_metrics['max_dd']:.2f}%** | Pure capital decline |
 | **Benchmark ({MACRO_INDEX_NAME}) Max DD** | {is_bench['macro_max_dd']:.2f}% | {oos_bench['macro_max_dd']:.2f}% | Market systemic peak-to-trough |
@@ -2356,18 +2525,49 @@ def run_optimization():
 ### B. Matched Placebo Noise Suite (50 Seeds Control)
 | Evaluation Window | Strategy CAGR | Conditioned Noise Median | Noise [P5, P95] Range | Statistical Edge Status |
 | :--- | :--- | :--- | :--- | :--- |
-| **In-Sample** | **{is_metrics['full']['cagr']:.2f}%** | {is_placebo_suite['conditioned'][0]:.2f}% | [{is_placebo_suite['conditioned'][1]:.2f}%, {is_placebo_suite['conditioned'][2]:.2f}%] | {'CONFIRMED (> P95)' if is_metrics['full']['cagr'] > is_placebo_suite['conditioned'][2] else 'INSIDE NOISE BAND'} |
-| **Out-of-Sample** | **{oos_metrics['full']['cagr']:.2f}%** | {oos_placebo_suite['conditioned'][0]:.2f}% | [{oos_placebo_suite['conditioned'][1]:.2f}%, {oos_placebo_suite['conditioned'][2]:.2f}%] | {'CONFIRMED (> P95)' if oos_metrics['full']['cagr'] > oos_placebo_suite['conditioned'][2] else 'INSIDE NOISE BAND'} |
+| **In-Sample** | **{is_metrics['full']['cagr']:.2f}%** | {is_placebo_suite['conditioned'][0]:.2f}% | [{is_placebo_suite['conditioned'][1]:.2f}%, {is_placebo_suite['conditioned'][2]:.2f}%] | Empirical percentile: **{is_placebo_pct:.1f}th** |
+| **Out-of-Sample** | **{oos_metrics['full']['cagr']:.2f}%** | {oos_placebo_suite['conditioned'][0]:.2f}% | [{oos_placebo_suite['conditioned'][1]:.2f}%, {oos_placebo_suite['conditioned'][2]:.2f}%] | Empirical percentile: **{oos_placebo_pct:.1f}th** |
 
 ## 2. Crypto Black Swan Stress Audit
 | Historical Crash Period | Strategy Return | Strategy Max DD | {MACRO_INDEX_NAME} Return | {MACRO_INDEX_NAME} Max DD | Timed Macro Return | Active Trades |
 | :--- | :--- | :--- | :--- | :--- | :--- | :--- |
 {stress_rows_md}
-## 3. Trailing Stop Mechanism Ablation
+## 3. Macro & Trailing Stop Ablation Audits
+### A. Macro-Active Exit Ablation
+{macro_ablation_md}
+### B. Trailing Stop Mechanism Ablation
 {trailing_ablation_md}
-## 4. Signal Funnel & Opportunity Attrition Matrix
+
+## 4. Top-K Walk-Forward Stability Matrix
+> **Champion Promotion Diagnostic:** {selection_diagnosis_msg}
+
+{wf_folds_md}
+
+## 5. Matched Placebo Percentile & Concentration Diagnostics
+{leave5_table_md}
+
+## 6. Exposure Telemetry
+{exposure_md}
+
+## 7. Signal Funnel & Opportunity Attrition Matrix
 {funnel_table_md}
-## 5. Discovered Optimal Parameter Set
+
+## 8. Trade Excursion & Timing Decay Analysis (MFE / MAE)
+### In-Sample
+{is_excursion_md}
+### Out-of-Sample
+{oos_excursion_md}
+
+## 9. Trade-Reason Population Breakdown
+### In-Sample
+{is_reason_md}
+### Out-of-Sample
+{oos_reason_md}
+
+## 10. Annual Pure Time-Weighted Return Attribution
+{yearly_md}
+
+## 11. Discovered Optimal Parameter Set
 ```json
 {json.dumps(best_params, indent=4)}
 """
