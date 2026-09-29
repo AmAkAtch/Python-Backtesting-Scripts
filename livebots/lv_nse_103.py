@@ -23,6 +23,7 @@ import smtplib
 import ssl
 import urllib.request
 from pathlib import Path
+from dotenv import load_dotenv
 from dataclasses import dataclass, field, asdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from email.mime.multipart import MIMEMultipart
@@ -37,6 +38,8 @@ import yfinance as yf
 # 1. USER CONTROL PANEL, CREDENTIALS & MANUAL OVERRIDES
 # ==============================================================================
 
+# Loads variables from .env into os.environ
+load_dotenv()
 # --- EMAIL NOTIFICATION CREDENTIALS (SET VIA ENV VARS OR UPDATE BELOW) ---
 GMAIL_USER: str = os.getenv("GMAIL_USER", "your_email@gmail.com")
 GMAIL_APP_PASSWORD: str = os.getenv("GMAIL_APP_PASSWORD", "your_app_password_here")
@@ -46,12 +49,30 @@ SEND_EMAIL_NOTIFICATION: bool = True     # Set False to disable email dispatch
 # --- MANUAL WALLET OVERRIDE ---
 # Set to None to let the bot manage cash automatically via its ledger.
 # Set to a float (e.g., 50000.0) to force-reset available INR cash.
-MANUAL_WALLET_OVERRIDE: Optional[float] = None
+MANUAL_WALLET_OVERRIDE: Optional[float] = 0.0
 FORCE_RERUN_TODAY: bool = True
 
 # --- MANUAL POSITION INJECTIONS & FORCED EXITS ---
-# Example: [{"coin": "RELIANCE", "units": 15, "entry_price": 2980.50, "entry_date": "2026-09-24"}]
-MANUAL_POSITIONS_ADD: List[Dict[str, Any]] = []
+# Parsed from Upstox Trade Register (Active holdings as of 28-Sep-2026)
+MANUAL_POSITIONS_ADD: List[Dict[str, Any]] = [
+    {"coin": "ITC", "units": 20, "entry_price": 348.90, "entry_date": "2026-01-02"},          # ITC LTD
+    {"coin": "CGPOWER", "units": 14, "entry_price": 740.55, "entry_date": "2026-03-13"},      # CG POWER
+    {"coin": "NATCOPHARM", "units": 8, "entry_price": 927.55, "entry_date": "2026-03-23"},    # NATCO PHARMA
+    {"coin": "NIFTYBEES", "units": 20, "entry_price": 253.34, "entry_date": "2026-04-02"},    # NIFTY BEES
+    {"coin": "TATAPOWER", "units": 20, "entry_price": 395.00, "entry_date": "2026-04-08"},    # TATA POWER
+    {"coin": "NHPC", "units": 67, "entry_price": 78.50, "entry_date": "2026-05-12"},          # NHPC
+    {"coin": "JSWENERGY", "units": 15, "entry_price": 515.05, "entry_date": "2026-05-15"},    # JSW ENERGY
+    {"coin": "NTPCGREEN", "units": 73, "entry_price": 110.15, "entry_date": "2026-05-15"},    # NTPC GREEN ENERGY LIMITED
+    {"coin": "GAIL", "units": 45, "entry_price": 175.78, "entry_date": "2026-06-18"},          # GAIL INDIA
+    {"coin": "HUDCO", "units": 38, "entry_price": 208.71, "entry_date": "2026-07-03"},         # Housing & Urban Development Cor
+    {"coin": "MOTILALOFS", "units": 9, "entry_price": 869.30, "entry_date": "2026-07-27"},     # MOTILALOFS
+    {"coin": "ADANIGREEN", "units": 6, "entry_price": 1377.80, "entry_date": "2026-07-28"},   # Adani Green Energy Limited
+    {"coin": "HDBFS", "units": 12, "entry_price": 684.85, "entry_date": "2026-07-29"},        # HDB FINANCIAL SERVICES LIMITED
+    {"coin": "PHOENIXLTD", "units": 4, "entry_price": 1908.70, "entry_date": "2026-08-11"},   # PHOENIX MILL
+    {"coin": "ITCHOTELS", "units": 48, "entry_price": 164.93, "entry_date": "2026-08-17"},    # ITC Hotels Limited
+    {"coin": "NATIONALUM", "units": 14, "entry_price": 374.00, "entry_date": "2026-09-03"},   # NAT ALUM CO
+    {"coin": "CHOLAFIN", "units": 4, "entry_price": 1765.60, "entry_date": "2026-09-16"},     # CHOLAFIN
+]
 
 # Force-exit positions immediately (Paper state exits, proceeds return to cash):
 # Example: ["INFY", "TCS"]
@@ -96,8 +117,8 @@ MACRO_INDEX_TICKER: str = "^NSEI"
 
 START_YEAR: int = 2015
 QUOTE_CURRENCY: str = "INR"
-INITIAL_CAPITAL: float = 100_000.0
-MIN_HISTORY_DAYS: int = 300
+INITIAL_CAPITAL: float = 1_000.0
+MIN_HISTORY_DAYS: int = 100
 PARALLEL_DOWNLOAD_WORKERS: int = 8
 CACHE_MAX_AGE_HOURS: float = 12.0
 WL_MAX_AGE_BARS: int = 15
@@ -110,8 +131,8 @@ UNIVERSE_LIQUIDITY_FLOOR_INR: Dict[str, float] = {
 }
 LIQUIDITY_FLOOR_INR: float = UNIVERSE_LIQUIDITY_FLOOR_INR.get(UNIVERSE_NAME, 0.0)
 
-TRANCHE_FLOOR_INR: float = 10_000.0
-DEFAULT_MAX_CONCURRENT_TRANCHES: int = 8
+TRANCHE_FLOOR_INR: float = 5_000.0
+DEFAULT_MAX_CONCURRENT_TRANCHES: int = 20
 MAX_POSITION_EQUITY_PCT: float = 0.25
 MAX_ADV_PARTICIPATION: float = 0.015
 
@@ -155,28 +176,29 @@ WINNER_CONFIG_FILE = OUTPUT_DIR / "winner.json"
 CURRENT_WINNER_FILE = OUTPUT_DIR / "current_winner.json"
 
 DEFAULT_CONFIG: Dict[str, Any] = {
-    "entry_type": 3,
-    "adx_thresh": 15.0,
-    "vol_ma_len": 20,
-    "vol_mult": 2.5,
-    "price_lookback": 20,
-    "body_atr_mult": 0.8,
-    "use_market_macro_system": True,
-    "macro_ma_len": 100,
-    "macro_ma_type": 0,
-    "macro_active_exit": False,
-    "max_concurrent_tranches": 8,
-    "max_pyramid_layers": 1,
-    "wl_mode": "WL_NONE",
-    "use_global_tp": False,
-    "be_trigger_atr": 0.0,
-    "max_holding_bars": 20,
-    "sl_mult": 3.0,
-    "exit_type": 6,
-    "trail_atr_mult": 0.0,
-    "exit_vol_ma_len": 20,
-    "exit_vol_mult": 1.5,
-}
+        "entry_type": 3,
+        "adx_thresh": 20.0,
+        "vol_ma_len": 14,
+        "vol_mult": 2.5,
+        "price_lookback": 44,
+        "body_atr_mult": 1.0,
+        "use_market_macro_system": False,
+        "macro_ma_len": 210,
+        "macro_ma_type": 4,
+        "macro_active_exit": True,
+        "max_concurrent_tranches": 11,
+        "max_pyramid_layers": 2,
+        "wl_mode": "WL_DEEPEST_DISCOUNT",
+        "use_global_tp": True,
+        "tp_mult": 5.5,
+        "tp_size_pct": 35.0,
+        "tp_move_sl_be": False,
+        "be_trigger_atr": 2.5,
+        "max_holding_bars": 60,
+        "sl_mult": 6.0,
+        "exit_type": 0,
+        "trail_atr_mult": 0.0
+    }
 
 
 def format_price(px: float) -> str:
@@ -731,19 +753,47 @@ def compute_max_affordable_tranche(cash: float, adv_30d: float) -> float:
     return float(np.nan_to_num(tranche_guess * (1.0 - 1e-6), nan=0.0))
 
 
-def _buy_fill_audited(tranche_inr: float, ref_open_price: float, slip_mult: float) -> Tuple[float, float, float, FeeBreakdown]:
+def _buy_fill_audited(
+    tranche_inr: float, 
+    ref_open_price: float, 
+    slip_mult: float, 
+    max_available_cash: Optional[float] = None
+) -> Tuple[float, int, float, FeeBreakdown]:
+    """Computes exact whole-share fill price, integer units, and audited transaction costs."""
     fill_px = ref_open_price * (1.0 + slip_mult)
-    units = tranche_inr / ref_open_price if ref_open_price > 0 else 0.0
-    gross_at_slip = units * fill_px
-    slip_cost = units * (fill_px - ref_open_price)
-    total_cash_cost, fees = compute_buy_cost_audited(gross_at_slip, slip_cost)
-    return fill_px, units, total_cash_cost, fees
+    if ref_open_price <= 0:
+        return fill_px, 0, 0.0, FeeBreakdown()
+
+    # Floor raw calculation to whole integer shares
+    raw_units = tranche_inr / ref_open_price
+    units = int(np.floor(raw_units))
+
+    # Guard: Ensure fees + slippage on whole shares do not overshoot wallet cash
+    cash_limit = max_available_cash if max_available_cash is not None else tranche_inr * 1.05
+    while units > 0:
+        gross_at_slip = units * fill_px
+        slip_cost = units * (fill_px - ref_open_price)
+        total_cash_cost, fees = compute_buy_cost_audited(gross_at_slip, slip_cost)
+        if total_cash_cost <= cash_limit:
+            return fill_px, units, total_cash_cost, fees
+        units -= 1  # Decrement if statutory fees push cost over cash
+
+    return fill_px, 0, 0.0, FeeBreakdown()
 
 
-def _sell_fill_audited(units: float, ref_price: float, slip_mult: float, apply_dp: bool = True) -> Tuple[float, float, FeeBreakdown]:
+def _sell_fill_audited(
+    units: int | float, 
+    ref_price: float, 
+    slip_mult: float, 
+    apply_dp: bool = True
+) -> Tuple[float, float, FeeBreakdown]:
+    """Computes sell proceeds strictly on integer share quantities."""
+    int_units = int(np.floor(units))
+    if int_units <= 0:
+        return ref_price, 0.0, FeeBreakdown()
     fill_px = ref_price * (1.0 - slip_mult)
-    gross = units * fill_px
-    slip_cost = units * (ref_price - fill_px)
+    gross = int_units * fill_px
+    slip_cost = int_units * (ref_price - fill_px)
     net_proceeds, fees = compute_sell_proceeds_audited(gross, slip_cost, apply_dp=apply_dp)
     return fill_px, net_proceeds, fees
 
@@ -759,8 +809,8 @@ class Position:
     coin_idx: int
     entry_date: str
     entry_price: float
-    initial_units: float
-    units: float
+    initial_units: int        # Whole shares only
+    units: int                # Whole shares only
     cost_inr: float
     entry_atr: float
     current_sl: float
@@ -790,10 +840,10 @@ class WatchlistItem:
 
 @dataclass
 class ActionItem:
-    action_type: str        # "BUY", "FULL_EXIT", "PARTIAL_TP", "UPDATE_SL"
+    action_type: str          # "BUY", "FULL_EXIT", "PARTIAL_TP", "UPDATE_SL"
     coin: str
     inr_amount: float
-    units: float
+    units: int                # Whole shares only
     estimated_price: float
     stop_loss: float
     reason: str
@@ -955,27 +1005,34 @@ class LiveNSEExecutionEngine:
                         exit_reason = pos.stop_reason
                         raw_exit_px = c_bar
                     elif tp_breached:
-                        close_units = pos.units * tp_size_pct
-                        part_rate_tp = min(1.0, max(0.0, (close_units * tp_price) / adv_30d))
-                        slip_tp = (BASE_SLIPPAGE_BPS + IMPACT_COEF_BPS * np.sqrt(part_rate_tp)) / 10000.0
-                        fill_px, credit, _ = _sell_fill_audited(close_units, max(o_bar, tp_price), slip_tp, apply_dp=True)
-                        self.state["wallet_cash"] += credit
-                        pos.units -= close_units
-                        pos.tp_proceeds += credit
-                        pos.tp_done = True
+                        # Floor partial exit shares; cannot sell < 1 share
+                        close_units = int(np.floor(pos.units * tp_size_pct))
+                        
+                        if close_units >= 1 and (pos.units - close_units) >= 1:
+                            part_rate_tp = min(1.0, max(0.0, (close_units * tp_price) / adv_30d))
+                            slip_tp = (BASE_SLIPPAGE_BPS + IMPACT_COEF_BPS * np.sqrt(part_rate_tp)) / 10000.0
+                            fill_px, credit, _ = _sell_fill_audited(close_units, max(o_bar, tp_price), slip_tp, apply_dp=True)
+                            
+                            self.state["wallet_cash"] += credit
+                            pos.units -= close_units
+                            pos.tp_proceeds += credit
+                            pos.tp_done = True
 
-                        if tp_move_sl_be and pos.current_sl < (pos.entry_price * 1.002):
-                            pos.current_sl = pos.entry_price * 1.002
-                            pos.stop_reason = "BREAKEVEN_SL"
+                            if tp_move_sl_be and pos.current_sl < (pos.entry_price * 1.002):
+                                pos.current_sl = pos.entry_price * 1.002
+                                pos.stop_reason = "BREAKEVEN_SL"
 
-                        if is_decision_day:
-                            self.action_feed.append(ActionItem(
-                                action_type="PARTIAL_TP", coin=coin, inr_amount=credit, units=close_units,
-                                estimated_price=fill_px, stop_loss=pos.current_sl, reason="GLOBAL_TAKE_PROFIT",
-                                notes=f"Take Profit triggered: Sell {tp_size_pct*100:.0f}% of {coin}. Stop loss raised to Breakeven ({format_price(pos.current_sl)})."
-                            ))
-                        else:
-                            self.missed_alerts.append(f"[{curr_date_str}] MISSED TAKE PROFIT: {coin} reached TP target {format_price(tp_price)}. Executed 50% partial exit in paper ledger.")
+                            if is_decision_day:
+                                self.action_feed.append(ActionItem(
+                                    action_type="PARTIAL_TP", coin=coin, inr_amount=credit, units=close_units,
+                                    estimated_price=fill_px, stop_loss=pos.current_sl, reason="GLOBAL_TAKE_PROFIT",
+                                    notes=f"Take Profit triggered: Sell {close_units} shares of {coin}. Stop loss raised to Breakeven ({format_price(pos.current_sl)})."
+                                ))
+                            else:
+                                self.missed_alerts.append(f"[{curr_date_str}] MISSED TAKE PROFIT: {coin} reached TP target {format_price(tp_price)}. Sold {close_units} shares in paper ledger.")
+                        elif pos.units == 1:
+                            # If holding only 1 share, do not partially sell; leave full share to trail
+                            pass
 
                 if exit_triggered:
                     part_rate_exit = min(1.0, max(0.0, (pos.units * raw_exit_px) / adv_30d))
@@ -1132,7 +1189,9 @@ class LiveNSEExecutionEngine:
                 m_coin = man_pos.get("coin", man_pos.get("symbol", "")).upper().strip()
                 if m_coin in grid.symbols and m_coin not in self.state["positions"]:
                     m_idx = grid.symbols.index(m_coin)
-                    m_units = float(man_pos.get("units", 0.0))
+                    m_units = int(np.floor(float(man_pos.get("units", 0.0))))
+                    if m_units <= 0:
+                        continue
                     m_px = float(man_pos.get("entry_price", man_pos.get("entry_price_inr", grid.close_mat[m_idx, t])))
                     m_atr = float(grid.atr14_mat[m_idx, t])
                     m_sl = m_px - (p.get("sl_mult", 3.0) * m_atr)
@@ -1207,10 +1266,14 @@ class LiveNSEExecutionEngine:
                     part_rate = min(1.0, max(0.0, tranche_inr / adv_30d))
                     slip_mult = (BASE_SLIPPAGE_BPS + IMPACT_COEF_BPS * np.sqrt(part_rate)) / 10000.0
 
-                    fill_px, units, total_cost, fee_buy = _buy_fill_audited(tranche_inr, today_open, slip_mult)
+                    fill_px, units, total_cost, fee_buy = _buy_fill_audited(
+                        tranche_inr, today_open, slip_mult, max_available_cash=self.state["wallet_cash"]
+                    )
 
-                    if (self.state["wallet_cash"] >= total_cost and tranche_inr >= TRANCHE_FLOOR_INR and
-                            units > 0 and len(self.state["positions"]) < max_slots and coin_layers < max_pyramid):
+                    if (self.state["wallet_cash"] >= total_cost and 
+                            units >= 1 and 
+                            len(self.state["positions"]) < max_slots and 
+                            coin_layers < max_pyramid):
 
                         sl_price = fill_px - (p.get("sl_mult", 3.0) * item_dict["entry_atr"])
                         self.state["wallet_cash"] -= total_cost
@@ -1220,8 +1283,7 @@ class LiveNSEExecutionEngine:
                             entry_date=curr_date_str, entry_price=fill_px, initial_units=units,
                             units=units, cost_inr=total_cost, entry_atr=item_dict["entry_atr"],
                             current_sl=sl_price, stop_reason="STOP_LOSS",
-                            highest_high=fill_px,
-                            lowest_low=fill_px,
+                            highest_high=fill_px, lowest_low=fill_px,
                             layer=coin_layers + 1, days_held=0, tp_done=False
                         )
                         self.state["positions"][coin] = asdict(new_pos)
@@ -1229,7 +1291,7 @@ class LiveNSEExecutionEngine:
                         self.action_feed.append(ActionItem(
                             action_type="BUY", coin=coin, inr_amount=total_cost, units=units,
                             estimated_price=fill_px, stop_loss=sl_price, reason="SIGNAL_QUALIFIED",
-                            notes=f"BUY SIGNAL: Allocate {format_price(total_cost)} into {coin} (~{units:.2f} units @ {format_price(fill_px)}). Set Initial Stop Loss at {format_price(sl_price)}."
+                            notes=f"BUY SIGNAL: Allocate {format_price(total_cost)} into {coin} ({units} shares @ {format_price(fill_px)}). Set Initial Stop Loss at {format_price(sl_price)}."
                         ))
                     else:
                         unfilled.append(item_dict)
@@ -1289,7 +1351,7 @@ def generate_executive_html_email(actions: List[ActionItem], state: Dict[str, An
 
         pos_rows_html += f"""
         <tr style="border-bottom: 1px solid #1e293b; font-size: 13px;">
-            <td style="padding: 10px; font-weight: 700; color: #f8fafc;">{coin}</td>
+            <td style="padding: 10px; font-weight: 700; color: #f8fafc;">{coin}({int(p_dict['units'])} sh)</td>
             <td style="padding: 10px; color: #94a3b8;">{format_price(p_dict['entry_price'])}</td>
             <td style="padding: 10px; color: #f8fafc; font-weight: 600;">{format_price(cur_px)}</td>
             <td style="padding: 10px; color: {pnl_color}; font-weight: 700;">{pnl_sign}{format_price(pnl)} ({pnl_sign}{pnl_pct:.2f}%)</td>
@@ -1323,7 +1385,7 @@ def generate_executive_html_email(actions: List[ActionItem], state: Dict[str, An
                 <td style="padding: 12px;"><span style="background-color: {badge_color}22; color: {badge_color}; border: 1px solid {badge_color}55; padding: 4px 8px; border-radius: 4px; font-weight: 700;">{a.action_type}</span></td>
                 <td style="padding: 12px; font-weight: 700; color: #f8fafc;">{a.coin}</td>
                 <td style="padding: 12px; color: #38bdf8; font-weight: 600;">{format_price(a.inr_amount) if a.inr_amount > 0 else "-"}</td>
-                <td style="padding: 12px; color: #e2e8f0;">{f"{a.units:.2f}" if a.units > 0 else "-"}</td>
+                <td style="padding: 12px; color: #e2e8f0;">{f"{int(a.units)}" if a.units > 0 else "-"}</td>
                 <td style="padding: 12px; color: #cbd5e1;">{a.notes}</td>
             </tr>
             """
