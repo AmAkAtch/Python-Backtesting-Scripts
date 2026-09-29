@@ -1,178 +1,728 @@
-%%writefile nse_live_companion.py
 #!/usr/bin/env python3
 """
-NSE EQUITY LIVE SNAPSHOT SWING-TRADING COMPANION
-Hardcoded UnifiedSwingBot Colab Drive Paths
+NSE EQUITY QUANTITATIVE SWING TRADING ENGINE (V10.1 - LIVE PAPER TRADING)
+========================================================================
+1:1 Daily Execution & Paper Portfolio Management Engine
+Translates the V10.1 Institutional Backtesting Framework to Live Operation:
+- Evaluates signals exclusively on closed NSE daily bars (post-market close).
+- Replays missed sessions chronologically to ensure exits and trailing stops track accurately.
+- Generates an actionable Broker Action Feed for exact order mirroring.
+- Supports manual capital overrides, manual position injection, and watchlist editing.
+- Dispatches an executive HTML email report via Gmail SMTP.
 """
+
 from __future__ import annotations
 
-import argparse
-import copy
-import html
-import io
-import json
-import logging
 import os
-import random
+import io
+import sys
+import json
+import time
+import copy
 import smtplib
 import ssl
-import sys
-import time
-import traceback
-from datetime import datetime, timedelta
+import urllib.request
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
-from zoneinfo import ZoneInfo
+from dataclasses import dataclass, field, asdict
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from email.mime.multipart import MIMEMultipart
+from email.mime.text import MIMEText
+from typing import Dict, List, Tuple, Any, Optional, Set
 
 import numpy as np
 import pandas as pd
-import requests
 import yfinance as yf
 
-from swing_live_parity_core_v10x import (
-    FastIndicators,
-    SignalArrays,
-    compile_single_symbol,
-    np_rolling_mean,
-    reconstitute_params,
-)
-
 # ==============================================================================
-# HARDCODED UNIFIED PATHS
+# 1. USER CONTROL PANEL, CREDENTIALS & MANUAL OVERRIDES
 # ==============================================================================
-UNIVERSE_NAME = "NIFTY50"
-IST = ZoneInfo("Asia/Kolkata")
 
-BASE_DIR = Path("/content/drive/MyDrive/UnifiedSwingBot")
-DATA_DIR = BASE_DIR / "nse" / "data_cache"
-STATE_PATH = BASE_DIR / "nse" / f"state_{UNIVERSE_NAME.lower()}.json"
-WINNER_PATH = BASE_DIR / "winners" / UNIVERSE_NAME / "winner.json"
-LOG_FILE = BASE_DIR / "nse" / "nse_live.log"
+# --- EMAIL NOTIFICATION CREDENTIALS (SET VIA ENV VARS OR UPDATE BELOW) ---
+GMAIL_USER: str = os.getenv("GMAIL_USER", "your_email@gmail.com")
+GMAIL_APP_PASSWORD: str = os.getenv("GMAIL_APP_PASSWORD", "your_app_password_here")
+RECIPIENT_EMAIL: str = os.getenv("RECIPIENT_EMAIL", "recipient_email@gmail.com")
+SEND_EMAIL_NOTIFICATION: bool = True     # Set False to disable email dispatch
 
-DATA_DIR.mkdir(parents=True, exist_ok=True)
+# --- MANUAL WALLET OVERRIDE ---
+# Set to None to let the bot manage cash automatically via its ledger.
+# Set to a float (e.g., 50000.0) to force-reset available INR cash.
+MANUAL_WALLET_OVERRIDE: Optional[float] = None
+FORCE_RERUN_TODAY: bool = True
 
-# Risk & Execution Constants
-LIQUIDITY_FLOOR_INR = 0.0
-TRANCHE_FLOOR_INR = 10_000.0
-DEFAULT_MAX_CONCURRENT_TRANCHES = 8
-MAX_POSITION_EQUITY_PCT = 0.25
-MAX_ADV_PARTICIPATION = 0.015
-WL_MAX_AGE_BARS = 15
+# --- MANUAL POSITION INJECTIONS & FORCED EXITS ---
+# Example: [{"coin": "RELIANCE", "units": 15, "entry_price": 2980.50, "entry_date": "2026-09-24"}]
+MANUAL_POSITIONS_ADD: List[Dict[str, Any]] = []
 
-BASE_SLIPPAGE_BPS = 5.0
-IMPACT_COEF_BPS = 80.0
+# Force-exit positions immediately (Paper state exits, proceeds return to cash):
+# Example: ["INFY", "TCS"]
+MANUAL_POSITIONS_REMOVE: List[str] = []
 
-BROKERAGE_MODE = "ZERO_DELIVERY"
-FLAT_BROKERAGE_INR = 20.0
-STT_RATE = 0.0010
-EXCHANGE_TXN_RATE = 0.0000322
-STAMP_DUTY_RATE = 0.00015
-SEBI_CHARGE_RATE = 0.000001
-GST_RATE = 0.18
-DP_CHARGE_INR = 15.0
-DP_CHARGE_GST = DP_CHARGE_INR * GST_RATE
-EFFECTIVE_BUY_FEE_RATE = (
+# Force-remove specific tickers from the candidate watchlist:
+# Example: ["HDFCBANK"]
+MANUAL_WATCHLIST_REMOVE: List[str] = []
+
+# --- CORE UNIVERSE & EXECUTION PARAMETERS ---
+ENGINE_VERSION: str = "V10.1"
+UNIVERSE_NAME: str = "NIFTY50"
+
+UNIVERSE_CONSTITUENT_FILES: Dict[str, str] = {
+    "NIFTY50":     "constituents/ind_nifty50list.csv",
+    "NIFTY100":    "constituents/ind_nifty100list.csv",
+    "MIDCAP150":   "constituents/ind_niftymidcap150list.csv",
+    "SMALLCAP250": "constituents/ind_niftysmallcap250list.csv",
+}
+
+UNIVERSE_CONSTITUENT_URLS: Dict[str, List[str]] = {
+    "NIFTY50": [
+        "https://www.niftyindices.com/IndexConstituent/ind_nifty50list.csv",
+        "https://archives.nseindia.com/content/indices/ind_nifty50list.csv",
+    ],
+    "NIFTY100": [
+        "https://www.niftyindices.com/IndexConstituent/ind_nifty100list.csv",
+        "https://archives.nseindia.com/content/indices/ind_nifty100list.csv",
+    ],
+    "MIDCAP150": [
+        "https://www.niftyindices.com/IndexConstituent/ind_niftymidcap150list.csv",
+        "https://archives.nseindia.com/content/indices/ind_niftymidcap150list.csv",
+    ],
+    "SMALLCAP250": [
+        "https://www.niftyindices.com/IndexConstituent/ind_niftysmallcap250list.csv",
+        "https://archives.nseindia.com/content/indices/ind_niftysmallcap250list.csv",
+    ],
+}
+
+MACRO_INDEX_NAME: str = "NIFTY50"
+MACRO_INDEX_TICKER: str = "^NSEI"
+
+START_YEAR: int = 2015
+QUOTE_CURRENCY: str = "INR"
+INITIAL_CAPITAL: float = 100_000.0
+MIN_HISTORY_DAYS: int = 300
+PARALLEL_DOWNLOAD_WORKERS: int = 8
+CACHE_MAX_AGE_HOURS: float = 12.0
+WL_MAX_AGE_BARS: int = 15
+
+UNIVERSE_LIQUIDITY_FLOOR_INR: Dict[str, float] = {
+    "NIFTY50":      0.0,
+    "NIFTY100":     0.0,
+    "MIDCAP150":    5_000_000.0,
+    "SMALLCAP250":  1_000_000.0,
+}
+LIQUIDITY_FLOOR_INR: float = UNIVERSE_LIQUIDITY_FLOOR_INR.get(UNIVERSE_NAME, 0.0)
+
+TRANCHE_FLOOR_INR: float = 10_000.0
+DEFAULT_MAX_CONCURRENT_TRANCHES: int = 8
+MAX_POSITION_EQUITY_PCT: float = 0.25
+MAX_ADV_PARTICIPATION: float = 0.015
+
+UNIVERSE_SLIPPAGE_BPS: Dict[str, float] = {
+    "NIFTY50": 5.0, "NIFTY100": 8.0, "MIDCAP150": 15.0, "SMALLCAP250": 25.0,
+}
+UNIVERSE_IMPACT_COEF_BPS: Dict[str, float] = {
+    "NIFTY50": 80.0, "NIFTY100": 120.0, "MIDCAP150": 200.0, "SMALLCAP250": 320.0,
+}
+BASE_SLIPPAGE_BPS: float = UNIVERSE_SLIPPAGE_BPS.get(UNIVERSE_NAME, 5.0)
+IMPACT_COEF_BPS: float = UNIVERSE_IMPACT_COEF_BPS.get(UNIVERSE_NAME, 80.0)
+
+# Statutory Charges (NSE Delivery Rates Card)
+BROKERAGE_MODE: str = "ZERO_DELIVERY"
+FLAT_BROKERAGE_INR: float = 20.0
+STT_RATE: float = 0.0010
+EXCHANGE_TXN_RATE: float = 0.0000322
+STAMP_DUTY_RATE: float = 0.00015
+SEBI_CHARGE_RATE: float = 0.000001
+GST_RATE: float = 0.18
+DP_CHARGE_INR: float = 15.0
+DP_CHARGE_GST: float = DP_CHARGE_INR * GST_RATE
+
+EFFECTIVE_BUY_FEE_RATE: float = (
     STT_RATE + EXCHANGE_TXN_RATE + STAMP_DUTY_RATE + SEBI_CHARGE_RATE
     + GST_RATE * (EXCHANGE_TXN_RATE + SEBI_CHARGE_RATE)
 )
+EFFECTIVE_SELL_FEE_RATE: float = (
+    STT_RATE + EXCHANGE_TXN_RATE + SEBI_CHARGE_RATE
+    + GST_RATE * (EXCHANGE_TXN_RATE + SEBI_CHARGE_RATE)
+)
 
-LIVE_QUOTE_MAX_AGE_MINUTES = 10.0
-LIVE_INTRADAY_INTERVAL = "1m"
-MACRO_INDEX_TICKER = "^NSEI"
-START_YEAR = 2008
-MIN_HISTORY_DAYS = 300
-FETCH_BATCH_SIZE = 40
+# --- DIRECTORY & STORAGE PATHS ---
+DATA_DIR = Path("data_cache")
+OUTPUT_DIR = Path("output") / UNIVERSE_NAME
+DATA_DIR.mkdir(parents=True, exist_ok=True)
+OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+
+STATE_FILE = OUTPUT_DIR / "live_paper_state.json"
+WINNER_CONFIG_FILE = OUTPUT_DIR / "winner.json"
+CURRENT_WINNER_FILE = OUTPUT_DIR / "current_winner.json"
+
+DEFAULT_CONFIG: Dict[str, Any] = {
+    "entry_type": 3,
+    "adx_thresh": 15.0,
+    "vol_ma_len": 20,
+    "vol_mult": 2.5,
+    "price_lookback": 20,
+    "body_atr_mult": 0.8,
+    "use_market_macro_system": True,
+    "macro_ma_len": 100,
+    "macro_ma_type": 0,
+    "macro_active_exit": False,
+    "max_concurrent_tranches": 8,
+    "max_pyramid_layers": 1,
+    "wl_mode": "WL_NONE",
+    "use_global_tp": False,
+    "be_trigger_atr": 0.0,
+    "max_holding_bars": 20,
+    "sl_mult": 3.0,
+    "exit_type": 6,
+    "trail_atr_mult": 0.0,
+    "exit_vol_ma_len": 20,
+    "exit_vol_mult": 1.5,
+}
+
+
+def format_price(px: float) -> str:
+    """Signed INR currency formatter."""
+    if not np.isfinite(px):
+        return "₹0.00"
+    sign = "-" if px < 0 else ""
+    return f"{sign}₹{abs(px):,.2f}"
+
 
 # ==============================================================================
-# LOGGING & MAILER
+# 2. FAST NUMPY INDICATOR KERNELS (UNTOUCHED)
 # ==============================================================================
-logger = logging.getLogger("nse_live")
-logger.setLevel(logging.INFO)
-if not logger.handlers:
-    formatter = logging.Formatter("%(asctime)s | %(levelname)-7s | %(message)s", "%H:%M:%S")
-    stream = logging.StreamHandler(sys.stdout)
-    stream.setFormatter(formatter)
-    logger.addHandler(stream)
-    fh = logging.FileHandler(LOG_FILE)
-    fh.setFormatter(formatter)
-    logger.addHandler(fh)
+
+def shift_1d(arr: np.ndarray, fill_value: float = np.nan) -> np.ndarray:
+    res = np.empty_like(arr)
+    res[0] = fill_value
+    res[1:] = arr[:-1]
+    return res
 
 
-def send_email(subject: str, body: str) -> None:
-    user = os.environ.get("GMAIL_USER")
-    pw = os.environ.get("GMAIL_APP_PASSWORD")
-    to = os.environ.get("RECIPIENT_EMAIL")
-    if not user or not pw or not to:
-        logger.warning("Missing Gmail credentials in environment; email skipped.")
-        return
-    from email.mime.multipart import MIMEMultipart
-    from email.mime.text import MIMEText
-    mime = MIMEMultipart("alternative")
-    mime["Subject"], mime["From"], mime["To"] = subject, user, to
-    mime.attach(MIMEText(body, "html"))
+def np_rolling_mean(arr: np.ndarray, window: int) -> np.ndarray:
+    w = max(1, int(window))
+    out = np.full_like(arr, np.nan, dtype=np.float64)
+    if len(arr) < w:
+        return out
+    valid_mask = ~np.isnan(arr)
+    if not np.any(valid_mask):
+        return out
+    first_valid = int(np.argmax(valid_mask))
+    clean = np.where(valid_mask, arr, 0.0)
+    cumsum = np.cumsum(clean)
+    cumsum = np.insert(cumsum, 0, 0.0)
+    vals = (cumsum[w:] - cumsum[:-w]) / float(w)
+    out[w - 1:] = vals
+    out[:first_valid + w - 1] = np.nan
+    return out
+
+
+def np_rolling_max(arr: np.ndarray, window: int) -> np.ndarray:
+    w = max(1, int(window))
+    out = np.full_like(arr, np.nan, dtype=np.float64)
+    n = len(arr)
+    if n < w:
+        return out
+    from numpy.lib.stride_tricks import sliding_window_view
+    valid_mask = ~np.isnan(arr)
+    if not np.any(valid_mask):
+        return out
+    first_valid = int(np.argmax(valid_mask))
+    windows = sliding_window_view(arr, window_shape=w)
+    out[w - 1:] = np.max(windows, axis=-1)
+    out[:first_valid + w - 1] = np.nan
+    return out
+
+
+def np_rolling_std(arr: np.ndarray, window: int) -> np.ndarray:
+    w = max(1, int(window))
+    out = np.full_like(arr, np.nan, dtype=np.float64)
+    if len(arr) < w:
+        return out
+    from numpy.lib.stride_tricks import sliding_window_view
+    valid_mask = ~np.isnan(arr)
+    if not np.any(valid_mask):
+        return out
+    first_valid = int(np.argmax(valid_mask))
+    windows = sliding_window_view(arr, window_shape=w)
+    out[w - 1:] = np.std(windows, axis=-1, ddof=0)
+    out[:first_valid + w - 1] = np.nan
+    return out
+
+
+def np_ewm_mean(arr: np.ndarray, span: int) -> np.ndarray:
+    span = max(1, int(span))
+    alpha = 2.0 / (span + 1.0)
+    n = len(arr)
+    out = np.full(n, np.nan, dtype=np.float64)
+    if n == 0:
+        return out
+    valid_mask = ~np.isnan(arr)
+    if not np.any(valid_mask):
+        return out
+    first_valid = int(np.argmax(valid_mask))
+    out[first_valid] = arr[first_valid]
+    for i in range(first_valid + 1, n):
+        val = arr[i]
+        out[i] = out[i - 1] if np.isnan(val) else alpha * val + (1.0 - alpha) * out[i - 1]
+    return out
+
+
+class FastIndicators:
+    @staticmethod
+    def moving_average(arr: np.ndarray, length: int, kind: int) -> np.ndarray:
+        length = max(2, int(length))
+        if kind == 0:   return np_rolling_mean(arr, length)
+        elif kind == 1: return np_ewm_mean(arr, length)
+        elif kind == 2:
+            e1 = np_ewm_mean(arr, length)
+            e2 = np_ewm_mean(e1, length)
+            return 2.0 * e1 - e2
+        elif kind == 3:
+            valid_mask = ~np.isnan(arr)
+            out = np.full_like(arr, np.nan, dtype=np.float64)
+            if not np.any(valid_mask):
+                return out
+            first_valid = int(np.argmax(valid_mask))
+            n_valid = len(arr) - first_valid
+            if n_valid < length:
+                return out
+            w = np.arange(1, length + 1, dtype=float)
+            w_norm = w / w.sum()
+            clean_tail = arr[first_valid:]
+            conv = np.convolve(clean_tail, w_norm[::-1], mode='full')[:n_valid]
+            conv[:length - 1] = np.nan
+            out[first_valid:] = conv
+            return out
+        elif kind == 4:
+            alpha = 1.0 / length
+            span = int(round((2.0 / alpha) - 1.0))
+            return np_ewm_mean(arr, span)
+        return np_rolling_mean(arr, length)
+
+    @staticmethod
+    def atr_1d(h: np.ndarray, l: np.ndarray, c: np.ndarray, length: int = 14) -> np.ndarray:
+        cp = shift_1d(c, fill_value=c[0])
+        tr1 = h - l
+        tr2 = np.abs(h - cp)
+        tr3 = np.abs(l - cp)
+        tr = np.fmax(tr1, np.fmax(tr2, tr3))
+        alpha = 1.0 / max(2, length)
+        span = int(round((2.0 / alpha) - 1.0))
+        return np_ewm_mean(tr, span)
+
+    @staticmethod
+    def adx_1d(h: np.ndarray, l: np.ndarray, c: np.ndarray, length: int = 14) -> np.ndarray:
+        length = max(2, int(length))
+        span = int(round((2.0 * length) - 1.0))
+        up = h - shift_1d(h, fill_value=h[0])
+        down = shift_1d(l, fill_value=l[0]) - l
+        p_dm = np.where((up > down) & (up > 0.0), up, 0.0)
+        m_dm = np.where((down > up) & (down > 0.0), down, 0.0)
+        atr_arr = FastIndicators.atr_1d(h, l, c, length)
+        p_di = 100.0 * np_ewm_mean(p_dm, span) / (atr_arr + 1e-9)
+        m_di = 100.0 * np_ewm_mean(m_dm, span) / (atr_arr + 1e-9)
+        dx = 100.0 * np.abs(p_di - m_di) / (p_di + m_di + 1e-9)
+        return np_ewm_mean(dx, span)
+
+    @staticmethod
+    def rsi_smoothed(c: np.ndarray, length: int, smooth: int) -> np.ndarray:
+        length, smooth = max(2, int(length)), max(1, int(smooth))
+        delta = np.diff(c, prepend=c[0])
+        gain = np.where(delta > 0, delta, 0.0)
+        loss = np.where(delta < 0, -delta, 0.0)
+        span = int(round((2.0 * length) - 1.0))
+        avg_gain = np_ewm_mean(gain, span)
+        avg_loss = np_ewm_mean(loss, span)
+        rs = avg_gain / (avg_loss + 1e-9)
+        rsi = 100.0 - (100.0 / (1.0 + rs))
+        return np_rolling_mean(rsi, smooth)
+
+    @staticmethod
+    def bollinger_bands(c: np.ndarray, length: int, std_mult: float) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+        length = max(2, int(length))
+        mid = np_rolling_mean(c, length)
+        std = np_rolling_std(c, length)
+        return mid + (std_mult * std), mid, mid - (std_mult * std)
+
+
+# ==============================================================================
+# 3. NSE CONSTITUENTS & YFINANCE DATA INGESTION
+# ==============================================================================
+
+def load_universe_constituents(universe_name: str) -> List[str]:
+    path = Path(UNIVERSE_CONSTITUENT_FILES[universe_name])
+    if path.exists():
+        df = pd.read_csv(path)
+        sym_col = next((c for c in ("Symbol", "SYMBOL", "symbol") if c in df.columns), None)
+        if sym_col:
+            return sorted({str(s).strip().upper() for s in df[sym_col].tolist() if str(s).strip()})
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    urls = UNIVERSE_CONSTITUENT_URLS.get(universe_name, [])
+    headers = {"User-Agent": "Mozilla/5.0", "Accept": "*/*"}
+    df = None
+    for url in urls:
+        try:
+            req = urllib.request.Request(url, headers=headers)
+            with urllib.request.urlopen(req, timeout=15) as resp:
+                content = resp.read()
+                path.write_bytes(content)
+                df = pd.read_csv(io.BytesIO(content))
+                break
+        except Exception:
+            continue
+
+    if (df is None or df.empty) and universe_name == "NIFTY50":
+        try:
+            wiki_tables = pd.read_html("https://en.wikipedia.org/wiki/NIFTY_50")
+            for table in wiki_tables:
+                sym_col = next((c for c in ("Symbol", "SYMBOL", "symbol") if c in table.columns), None)
+                if sym_col:
+                    symbols = sorted({str(s).strip().upper() for s in table[sym_col].tolist() if str(s).strip()})
+                    pd.DataFrame({"Symbol": symbols}).to_csv(path, index=False)
+                    return symbols
+        except Exception:
+            pass
+
+    if df is None or df.empty:
+        raise RuntimeError(f"Could not load constituent list for {universe_name}.")
+    sym_col = next((c for c in ("Symbol", "SYMBOL", "symbol") if c in df.columns), None)
+    return sorted({str(s).strip().upper() for s in df[sym_col].tolist() if str(s).strip()})
+
+
+def _yf_ticker(symbol: str) -> str:
+    return symbol if symbol.startswith("^") else f"{symbol}.NS"
+
+
+def fetch_from_yfinance(symbol: str, start_year: int) -> Optional[pd.DataFrame]:
+    ticker = _yf_ticker(symbol)
+    start = f"{start_year}-01-01"
     try:
-        with smtplib.SMTP_SSL("smtp.gmail.com", 465, context=ssl.create_default_context()) as server:
-            server.login(user, pw)
-            server.sendmail(user, to, mime.as_string())
-        logger.info("Email delivered: %s", subject)
-    except Exception as e:
-        logger.error("Email send failed: %s", e)
+        raw = yf.download(ticker, start=start, progress=False, auto_adjust=True, threads=False)
+    except Exception:
+        return None
+    if raw is None or raw.empty:
+        return None
+    raw = raw.reset_index()
+    raw.columns = [c if isinstance(c, str) else c[0] for c in raw.columns]
+    raw = raw.rename(columns={"Date": "date", "Open": "open", "High": "high", "Low": "low", "Close": "close", "Volume": "volume"})
+    if not {"date", "open", "high", "low", "close", "volume"}.issubset(raw.columns):
+        return None
+    raw["quote_volume"] = raw["close"] * raw["volume"]
+    raw["date"] = pd.to_datetime(raw["date"]).dt.tz_localize(None).dt.normalize()
+    raw = raw.drop_duplicates(subset=["date"]).sort_values("date").reset_index(drop=True)
+    today = pd.Timestamp.now().normalize()
+    raw = raw[raw["date"] < today]
+    for col in ["open", "high", "low", "close", "volume", "quote_volume"]:
+        raw[col] = pd.to_numeric(raw[col], errors="coerce")
+    raw = raw.dropna(subset=["open", "high", "low", "close"])
+    raw = raw[
+        (raw["open"] > 0) &
+        (raw["close"] > 0) &
+        (raw["high"] >= raw["low"]) &
+        (raw["high"] / np.maximum(1e-8, raw["low"]) < 50.0)
+    ]
+    if len(raw) < MIN_HISTORY_DAYS:
+        return None
+    return raw.set_index("date")
+
+
+def fetch_single_stock(symbol: str, start_year: int, refresh: bool) -> Tuple[str, Optional[pd.DataFrame], str]:
+    safe_name = symbol.replace("^", "IDX_")
+    cache_file = DATA_DIR / f"{safe_name}_1d_from{start_year}.parquet"
+    meta_file = DATA_DIR / f"{safe_name}_1d_from{start_year}.meta.json"
+
+    if not refresh and cache_file.exists() and meta_file.exists():
+        age_hours = (time.time() - os.path.getmtime(cache_file)) / 3600.0
+        if age_hours < CACHE_MAX_AGE_HOURS:
+            try:
+                with open(meta_file, "r") as mf:
+                    meta = json.load(mf)
+                if meta.get("start_year") == start_year:
+                    df = pd.read_parquet(cache_file)
+                    if len(df) >= MIN_HISTORY_DAYS:
+                        return symbol, df, "cache"
+            except Exception:
+                pass
+
+    df = fetch_from_yfinance(symbol, start_year)
+    if df is not None and len(df) >= MIN_HISTORY_DAYS:
+        try:
+            df.to_parquet(cache_file)
+            with open(meta_file, "w") as mf:
+                json.dump({"provider": "yfinance", "timestamp": time.time(), "bars": len(df), "start_year": start_year}, mf)
+        except Exception:
+            pass
+        return symbol, df, "yfinance"
+    return symbol, None, "none"
+
+
+def fetch_live_ltp(symbol: str) -> Optional[float]:
+    """Gets real-time Last Traded Price (LTP) via yfinance fast_info."""
+    ticker = _yf_ticker(symbol)
+    try:
+        t = yf.Ticker(ticker)
+        fast_px = getattr(t, "fast_info", {}).get("lastPrice", None)
+        if fast_px is not None and np.isfinite(fast_px) and fast_px > 0:
+            return float(fast_px)
+    except Exception:
+        pass
+    return None
 
 
 # ==============================================================================
-# AUDITED FEE & FILL ENGINE
+# 4. STATIC MARKET GRID & SIGNAL COMPILATION (UNTOUCHED LOGIC)
 # ==============================================================================
-def _fee_dict() -> Dict[str, float]:
-    return {
-        "brokerage": 0.0, "stt": 0.0, "exchange_charges": 0.0,
-        "stamp_duty": 0.0, "sebi_charges": 0.0, "gst": 0.0,
-        "dp_charges": 0.0, "slippage_cost": 0.0
-    }
+
+@dataclass
+class MarketGrid:
+    symbols: List[str]
+    dates: pd.DatetimeIndex
+    open_mat: np.ndarray
+    high_mat: np.ndarray
+    low_mat: np.ndarray
+    close_mat: np.ndarray
+    volume_mat: np.ndarray
+    atr14_mat: np.ndarray
+    dvol30_mat: np.ndarray
+    adx14_mat: np.ndarray
+    delist_mat: np.ndarray
+    alive_mat: np.ndarray
+    macro_close: np.ndarray
+    macro_open: np.ndarray
 
 
-def _merge_fees(acc: Dict[str, float], inc: Dict[str, float]) -> None:
-    for k, v in inc.items():
-        acc[k] = float(acc.get(k, 0.0) + v)
+def build_live_market_grid(universe_name: str = UNIVERSE_NAME) -> Tuple[MarketGrid, Dict[str, pd.DataFrame]]:
+    symbols = load_universe_constituents(universe_name)
+    for p in MANUAL_POSITIONS_ADD:
+        sym = p.get("coin", p.get("symbol", "")).upper().strip()
+        if sym and sym not in symbols:
+            symbols.append(sym)
+
+    _, macro_df, _ = fetch_single_stock(MACRO_INDEX_TICKER, START_YEAR, refresh=False)
+    if macro_df is None:
+        raise RuntimeError(f"Unable to load macro benchmark: {MACRO_INDEX_TICKER}")
+
+    raw_universe: Dict[str, pd.DataFrame] = {}
+    fetch_symbols = [s for s in symbols if s != MACRO_INDEX_TICKER]
+
+    with ThreadPoolExecutor(max_workers=PARALLEL_DOWNLOAD_WORKERS) as executor:
+        future_map = {executor.submit(fetch_single_stock, sym, START_YEAR, False): sym for sym in fetch_symbols}
+        for future in as_completed(future_map):
+            sym, df, _ = future.result()
+            if df is not None and len(df) >= MIN_HISTORY_DAYS:
+                raw_universe[sym] = df
+
+    master_dates = pd.DatetimeIndex(sorted(macro_df.index.unique())).normalize()
+    macro_df = macro_df.reindex(master_dates).ffill().dropna(subset=["close"])
+
+    valid_symbols = sorted(raw_universe.keys())
+    n_syms, n_bars = len(valid_symbols), len(master_dates)
+
+    open_mat = np.full((n_syms, n_bars), np.nan, dtype=np.float64)
+    high_mat = np.full((n_syms, n_bars), np.nan, dtype=np.float64)
+    low_mat = np.full((n_syms, n_bars), np.nan, dtype=np.float64)
+    close_mat = np.full((n_syms, n_bars), np.nan, dtype=np.float64)
+    vol_mat = np.zeros((n_syms, n_bars), dtype=np.float64)
+    atr14_mat = np.zeros((n_syms, n_bars), dtype=np.float64)
+    adx14_mat = np.zeros((n_syms, n_bars), dtype=np.float64)
+    dvol30_mat = np.zeros((n_syms, n_bars), dtype=np.float64)
+    delist_mat = np.zeros((n_syms, n_bars), dtype=bool)
+    alive_mat = np.zeros((n_syms, n_bars), dtype=bool)
+
+    universe: Dict[str, pd.DataFrame] = {}
+    for i, sym in enumerate(valid_symbols):
+        df = raw_universe[sym].reindex(master_dates)
+        raw_close = df["close"].copy()
+        is_missing = raw_close.isna()
+        trailing_missing_count = int((is_missing[::-1].cumprod()[::-1]).astype(int).sum())
+        has_ever_traded = (~is_missing).cumsum() > 0
+        is_delisted_perm = (is_missing[::-1].cumprod()[::-1].astype(bool) & has_ever_traded & (trailing_missing_count >= 20)).values
+
+        df["alive"] = ~is_missing
+        df["close"] = df["close"].ffill()
+        df["open"] = df["open"].ffill()
+        df["high"] = df["high"].ffill()
+        df["low"] = df["low"].ffill()
+        df["volume"] = df["volume"].fillna(0.0)
+
+        h_arr = df["high"].values
+        l_arr = df["low"].values
+        c_arr = df["close"].values
+
+        atr14 = FastIndicators.atr_1d(h_arr, l_arr, c_arr, 14)
+        adx14 = FastIndicators.adx_1d(h_arr, l_arr, c_arr, 14)
+        qv = df["quote_volume"].values if "quote_volume" in df else (c_arr * df["volume"].values)
+        dvol30 = np_rolling_mean(qv, 30)
+
+        open_mat[i, :] = df["open"].values
+        high_mat[i, :] = h_arr
+        low_mat[i, :] = l_arr
+        close_mat[i, :] = c_arr
+        vol_mat[i, :] = df["volume"].values
+        atr14_mat[i, :] = np.nan_to_num(atr14, nan=0.0)
+        adx14_mat[i, :] = np.nan_to_num(adx14, nan=0.0)
+        dvol30_mat[i, :] = np.nan_to_num(dvol30, nan=1_000_000.0)
+        delist_mat[i, :] = is_delisted_perm
+        alive_mat[i, :] = (~is_missing).values
+        universe[sym] = df
+
+    grid = MarketGrid(
+        symbols=valid_symbols, dates=master_dates,
+        open_mat=open_mat, high_mat=high_mat, low_mat=low_mat, close_mat=close_mat,
+        volume_mat=vol_mat, atr14_mat=atr14_mat, dvol30_mat=dvol30_mat,
+        adx14_mat=adx14_mat, delist_mat=delist_mat, alive_mat=alive_mat,
+        macro_close=macro_df["close"].values, macro_open=macro_df["open"].values
+    )
+    return grid, universe
 
 
-def compute_buy_cost_audited(gross_inr: float, slip_cost: float) -> Tuple[float, Dict[str, float]]:
+def compile_signals_fast(grid: MarketGrid, p: Dict[str, Any]) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    n_syms, n_bars = grid.close_mat.shape
+    use_macro = p.get("use_market_macro_system", False)
+    if use_macro:
+        macro_ma = FastIndicators.moving_average(grid.macro_close, p["macro_ma_len"], p["macro_ma_type"])
+        macro_ok = (~np.isnan(macro_ma)) & (grid.macro_close > macro_ma)
+    else:
+        macro_ok = np.ones(n_bars, dtype=bool)
+
+    raw_signal_mat = np.zeros((n_syms, n_bars), dtype=bool)
+    entry_mat = np.zeros((n_syms, n_bars), dtype=bool)
+    exit_mat = np.zeros((n_syms, n_bars), dtype=bool)
+    state_mat = np.zeros((n_syms, n_bars), dtype=bool)
+
+    et, xt = p["entry_type"], p["exit_type"]
+    adx_t = p.get("adx_thresh", 0.0)
+
+    for i in range(n_syms):
+        c_arr = grid.close_mat[i, :]
+        o_arr = grid.open_mat[i, :]
+        h_arr = grid.high_mat[i, :]
+        v_arr = grid.volume_mat[i, :]
+        raw_entry = np.zeros(n_bars, dtype=bool)
+        state_entry = np.zeros(n_bars, dtype=bool)
+
+        if et == 0:
+            ma = FastIndicators.moving_average(c_arr, p["entry_ma_len"], p["entry_ma_type"])
+            raw_entry = (~np.isnan(ma)) & (c_arr > ma)
+            state_entry = raw_entry
+        elif et == 1:
+            rf = FastIndicators.rsi_smoothed(c_arr, p["rsi_f_len"], p["rsi_f_smt"])
+            rs = FastIndicators.rsi_smoothed(c_arr, p["rsi_s_len"], p["rsi_s_smt"])
+            raw_entry = (~np.isnan(rf)) & (~np.isnan(rs)) & (rf > rs) & (shift_1d(rf) <= shift_1d(rs))
+            if p.get("use_rsi_trend_filter", False):
+                rma = FastIndicators.moving_average(c_arr, p["rsi_trend_ma_len"], p["rsi_trend_ma_type"])
+                raw_entry = raw_entry & (~np.isnan(rma)) & (c_arr > rma)
+                state_entry = (~np.isnan(rf)) & (~np.isnan(rs)) & (rf > rs) & (~np.isnan(rma)) & (c_arr > rma)
+            else:
+                state_entry = (~np.isnan(rf)) & (~np.isnan(rs)) & (rf > rs)
+        elif et == 2:
+            s_ma = FastIndicators.moving_average(c_arr, p["xover_short_len"], p["xover_short_type"])
+            l_ma = FastIndicators.moving_average(c_arr, p["xover_long_len"], p["xover_long_type"])
+            raw_entry = (~np.isnan(s_ma)) & (~np.isnan(l_ma)) & (s_ma > l_ma) & (shift_1d(s_ma) <= shift_1d(l_ma))
+            state_entry = (~np.isnan(s_ma)) & (~np.isnan(l_ma)) & (s_ma > l_ma)
+        elif et == 3:
+            vma = np_rolling_mean(shift_1d(v_arr), int(p["vol_ma_len"]))
+            hhv = np_rolling_max(shift_1d(h_arr), int(p["price_lookback"]))
+            body = c_arr - o_arr
+            raw_entry = (~np.isnan(vma)) & (~np.isnan(hhv)) & (v_arr > (p["vol_mult"] * vma)) & (c_arr > hhv) & (body >= (p["body_atr_mult"] * grid.atr14_mat[i, :]))
+            base_ma = FastIndicators.moving_average(c_arr, int(p["price_lookback"]), 0)
+            state_entry = (~np.isnan(base_ma)) & (c_arr > base_ma)
+        elif et == 4:
+            b_up, b_mid, _ = FastIndicators.bollinger_bands(c_arr, p["bb_entry_len"], p["bb_entry_std"])
+            raw_entry = (~np.isnan(b_up)) & (c_arr > b_up) & (shift_1d(c_arr) <= shift_1d(b_up))
+            state_entry = (~np.isnan(b_mid)) & (c_arr > b_mid)
+
+        raw_signal_mat[i, :] = raw_entry & grid.alive_mat[i, :]
+        liq_ok = grid.dvol30_mat[i, :] >= LIQUIDITY_FLOOR_INR
+        adx_ok = (grid.adx14_mat[i, :] >= adx_t) if adx_t > 0.0 else True
+
+        entry_mat[i, :] = raw_entry & liq_ok & macro_ok & adx_ok & grid.alive_mat[i, :]
+        state_mat[i, :] = state_entry & liq_ok & macro_ok & adx_ok & grid.alive_mat[i, :]
+
+        if xt == 3:
+            ma_val = FastIndicators.moving_average(c_arr, p["exit_ma_len"], p["exit_ma_type"])
+            exit_mat[i, :] = (~np.isnan(ma_val)) & (c_arr < ma_val)
+        elif xt == 4:
+            rf = FastIndicators.rsi_smoothed(c_arr, p["exit_rsi_f_len"], p["exit_rsi_f_smt"])
+            rs = FastIndicators.rsi_smoothed(c_arr, p["exit_rsi_s_len"], p["exit_rsi_s_smt"])
+            exit_mat[i, :] = (~np.isnan(rf)) & (~np.isnan(rs)) & (rf < rs)
+        elif xt == 5:
+            s_ma = FastIndicators.moving_average(c_arr, p["exit_xover_short_len"], p["exit_xover_short_type"])
+            l_ma = FastIndicators.moving_average(c_arr, p["exit_xover_long_len"], p["exit_xover_long_type"])
+            exit_mat[i, :] = (~np.isnan(s_ma)) & (~np.isnan(l_ma)) & (s_ma < l_ma)
+        elif xt == 6:
+            vma = np_rolling_mean(shift_1d(v_arr), int(p["exit_vol_ma_len"]))
+            exit_mat[i, :] = (~np.isnan(vma)) & (v_arr > (p["exit_vol_mult"] * vma)) & (c_arr < o_arr)
+        elif xt == 7:
+            _, b_mid, _ = FastIndicators.bollinger_bands(c_arr, p["bb_exit_len"], 2.0)
+            exit_mat[i, :] = (~np.isnan(b_mid)) & (c_arr < b_mid)
+
+    return raw_signal_mat, entry_mat, exit_mat, macro_ok, state_mat
+
+
+# ==============================================================================
+# 5. AUDITED STATUTORY FEES & SIZING ENGINE (MATCHING bt_nse_103.py)
+# ==============================================================================
+
+@dataclass
+class FeeBreakdown:
+    brokerage: float = 0.0
+    stt: float = 0.0
+    exchange_charges: float = 0.0
+    stamp_duty: float = 0.0
+    sebi_charges: float = 0.0
+    gst: float = 0.0
+    dp_charges: float = 0.0
+    slippage_cost: float = 0.0
+
+    @property
+    def total_frictions(self) -> float:
+        return (self.brokerage + self.stt + self.exchange_charges +
+                self.stamp_duty + self.sebi_charges + self.gst +
+                self.dp_charges + self.slippage_cost)
+
+
+def compute_buy_cost_audited(gross_inr: float, slip_cost: float) -> Tuple[float, FeeBreakdown]:
     if gross_inr <= 0:
-        return 0.0, _fee_dict()
+        return 0.0, FeeBreakdown()
     brokerage = FLAT_BROKERAGE_INR if BROKERAGE_MODE == "FLAT" else 0.0
     stt = gross_inr * STT_RATE
     exch = gross_inr * EXCHANGE_TXN_RATE
     stamp = gross_inr * STAMP_DUTY_RATE
     sebi = gross_inr * SEBI_CHARGE_RATE
     gst = (brokerage + exch + sebi) * GST_RATE
-    f = {
-        "brokerage": brokerage, "stt": stt, "exchange_charges": exch,
-        "stamp_duty": stamp, "sebi_charges": sebi, "gst": gst,
-        "dp_charges": 0.0, "slippage_cost": slip_cost
-    }
-    return gross_inr + brokerage + stt + exch + stamp + sebi + gst, f
+    breakdown = FeeBreakdown(
+        brokerage=brokerage, stt=stt, exchange_charges=exch,
+        stamp_duty=stamp, sebi_charges=sebi, gst=gst,
+        dp_charges=0.0, slippage_cost=slip_cost
+    )
+    return gross_inr + brokerage + stt + exch + stamp + sebi + gst, breakdown
 
 
-def compute_sell_proceeds_audited(gross_inr: float, slip_cost: float, apply_dp: bool = True) -> Tuple[float, Dict[str, float]]:
+def compute_sell_proceeds_audited(gross_inr: float, slip_cost: float, apply_dp: bool = True) -> Tuple[float, FeeBreakdown]:
     if gross_inr <= 0:
-        return 0.0, _fee_dict()
+        return 0.0, FeeBreakdown()
     brokerage = FLAT_BROKERAGE_INR if BROKERAGE_MODE == "FLAT" else 0.0
     stt = gross_inr * STT_RATE
     exch = gross_inr * EXCHANGE_TXN_RATE
     sebi = gross_inr * SEBI_CHARGE_RATE
     gst = (brokerage + exch + sebi) * GST_RATE
     dp = (DP_CHARGE_INR + DP_CHARGE_GST) if apply_dp else 0.0
-    f = {
-        "brokerage": brokerage, "stt": stt, "exchange_charges": exch,
-        "stamp_duty": 0.0, "sebi_charges": sebi, "gst": gst,
-        "dp_charges": dp, "slippage_cost": slip_cost
-    }
-    return max(0.0, gross_inr - brokerage - stt - exch - sebi - gst - dp), f
+    breakdown = FeeBreakdown(
+        brokerage=brokerage, stt=stt, exchange_charges=exch,
+        stamp_duty=0.0, sebi_charges=sebi, gst=gst,
+        dp_charges=dp, slippage_cost=slip_cost
+    )
+    proceeds = max(0.0, gross_inr - brokerage - stt - exch - sebi - gst - dp)
+    return proceeds, breakdown
 
 
 def compute_max_affordable_tranche(cash: float, adv_30d: float) -> float:
     clean_adv = adv_30d if np.isfinite(adv_30d) else 1_000_000.0
     adv = max(clean_adv, 1_000_000.0)
-    usable_cash = max(0.0, cash)
+    flat_buy_charge = (FLAT_BROKERAGE_INR * (1.0 + GST_RATE)) if BROKERAGE_MODE == "FLAT" else 0.0
+    usable_cash = max(0.0, cash - flat_buy_charge)
     tranche_guess = usable_cash / (1.0 + EFFECTIVE_BUY_FEE_RATE + BASE_SLIPPAGE_BPS / 10000.0)
     for _ in range(3):
         part_rate = min(1.0, max(0.0, tranche_guess / adv))
@@ -181,783 +731,820 @@ def compute_max_affordable_tranche(cash: float, adv_30d: float) -> float:
     return float(np.nan_to_num(tranche_guess * (1.0 - 1e-6), nan=0.0))
 
 
-def _sell_fill_audited(units: float, ref_price: float, slip_mult: float) -> Tuple[float, float, Dict[str, float]]:
+def _buy_fill_audited(tranche_inr: float, ref_open_price: float, slip_mult: float) -> Tuple[float, float, float, FeeBreakdown]:
+    fill_px = ref_open_price * (1.0 + slip_mult)
+    units = tranche_inr / ref_open_price if ref_open_price > 0 else 0.0
+    gross_at_slip = units * fill_px
+    slip_cost = units * (fill_px - ref_open_price)
+    total_cash_cost, fees = compute_buy_cost_audited(gross_at_slip, slip_cost)
+    return fill_px, units, total_cash_cost, fees
+
+
+def _sell_fill_audited(units: float, ref_price: float, slip_mult: float, apply_dp: bool = True) -> Tuple[float, float, FeeBreakdown]:
     fill_px = ref_price * (1.0 - slip_mult)
     gross = units * fill_px
     slip_cost = units * (ref_price - fill_px)
-    return (fill_px, *compute_sell_proceeds_audited(gross, slip_cost, apply_dp=True))
+    net_proceeds, fees = compute_sell_proceeds_audited(gross, slip_cost, apply_dp=apply_dp)
+    return fill_px, net_proceeds, fees
 
 
-def _whole_share_buy(cash: float, target_inr: float, ref_open: float, adv_30d: float):
-    if not np.isfinite(cash) or cash <= 0 or not np.isfinite(target_inr) or target_inr < TRANCHE_FLOOR_INR:
-        return None
-    if not np.isfinite(ref_open) or ref_open <= 0:
-        return None
-    adv = max(float(adv_30d) if np.isfinite(adv_30d) else 1_000_000.0, 1_000_000.0)
-    tranche = min(compute_max_affordable_tranche(cash, adv), target_inr)
-    if tranche < TRANCHE_FLOOR_INR:
-        return None
-    slip_mult = (BASE_SLIPPAGE_BPS + IMPACT_COEF_BPS * np.sqrt(min(1.0, max(0.0, tranche / adv)))) / 10000.0
-    units = int(tranche // (ref_open * (1.0 + slip_mult)))
-    if units <= 0:
-        return None
-    for _ in range(10):
-        fill_px = ref_open * (1.0 + slip_mult)
-        gross = units * fill_px
-        slip_cost = units * (fill_px - ref_open)
-        total_cost, fees = compute_buy_cost_audited(gross, slip_cost)
-        if total_cost <= cash + 1e-9 and total_cost <= target_inr + 1e-9:
-            return fill_px, units, total_cost, fees, tranche
-        units -= 1
-        if units <= 0:
-            return None
-    return None
+# ==============================================================================
+# 6. PERSISTENCE ENGINE & DATA STRUCTURES
+# ==============================================================================
+
+@dataclass
+class Position:
+    tid: int
+    coin: str
+    coin_idx: int
+    entry_date: str
+    entry_price: float
+    initial_units: float
+    units: float
+    cost_inr: float
+    entry_atr: float
+    current_sl: float
+    stop_reason: str
+    highest_high: float
+    lowest_low: float
+    layer: int
+    days_held: int = 0
+    tp_done: bool = False
+    tp_proceeds: float = 0.0
+    from_watchlist: bool = False
 
 
-FALLBACK_PARAMS: Dict[str, Any] = {
-    "entry_type": 1, "adx_thresh": 35.0, "rsi_f_len": 76, "rsi_f_smt": 10,
-    "rsi_s_len": 74, "rsi_s_smt": 6, "use_rsi_trend_filter": False,
-    "use_market_macro_system": True, "macro_ma_len": 167, "macro_ma_type": 2,
-    "macro_active_exit": False, "max_concurrent_tranches": 5, "wl_mode": "WL_STRONGEST_MOMENTUM",
-    "use_global_tp": False, "be_trigger_atr": 3.5, "max_holding_bars": 55, "sl_mult": 5.6,
-    "exit_type": 0, "trail_atr_mult": 0.0, "max_pyramid_layers": 1,
-}
+@dataclass
+class WatchlistItem:
+    sig_id: int
+    coin: str
+    coin_idx: int
+    signal_date: str
+    trigger_price: float
+    shadow_stop: float
+    highest_high: float
+    breakout_quality: float
+    entry_atr: float
+    bars_in_watchlist: int = 0
 
 
-def load_strategy_params() -> Tuple[Dict[str, Any], Dict[str, Any]]:
-    if WINNER_PATH.exists():
+@dataclass
+class ActionItem:
+    action_type: str        # "BUY", "FULL_EXIT", "PARTIAL_TP", "UPDATE_SL"
+    coin: str
+    inr_amount: float
+    units: float
+    estimated_price: float
+    stop_loss: float
+    reason: str
+    notes: str = ""
+
+
+def load_or_init_state() -> Dict[str, Any]:
+    if STATE_FILE.exists():
         try:
-            with WINNER_PATH.open("r", encoding="utf-8") as f:
-                data = json.load(f)
-            p = data.get("best_params") or data.get("params")
-            if p:
-                p = reconstitute_params(p, max_xover_long=200, max_exit_xover_long=200)
-                logger.info("Loaded NSE champion from %s", WINNER_PATH)
-                return p, data
+            with open(STATE_FILE, "r") as f:
+                state = json.load(f)
+                return state
         except Exception as e:
-            logger.warning("Winner load failed: %s", e)
-    logger.warning("No NSE winner.json found at %s; using fallback.", WINNER_PATH)
-    return reconstitute_params(FALLBACK_PARAMS), {}
-
-
-def _blank_state() -> Dict[str, Any]:
-    return {"cash_inr": 0.0, "positions": {}, "watchlist": [], "consumed_signal_keys": [], "last_processed_date": None}
-
-
-def _normalize_position(t: str, pos: Dict[str, Any], dates: pd.DatetimeIndex) -> Dict[str, Any]:
-    p = dict(pos)
-    entry_price = float(p.get("entry_price", 0.0))
-    invested = float(p.get("cost_inr", 0.0))
-    units = int(p.get("units", 0))
-    if units <= 0 and entry_price > 0 and invested > 0:
-        units = max(1, int(invested // entry_price))
-    entry_date = str(p.get("entry_date", dates[0].date()))[:10]
-    matches = np.where(dates.strftime("%Y-%m-%d") == entry_date)[0]
-    entry_bar = int(p.get("entry_bar", matches[0] if len(matches) else 0))
+            print(f"[WARN] Failed to read existing state file ({e}). Starting fresh ledger.")
     return {
-        "ticker": t, "entry_bar": entry_bar, "entry_date": entry_date,
-        "entry_price": entry_price, "initial_units": int(p.get("initial_units", units)),
-        "units": units, "cost_inr": invested if invested > 0 else units * entry_price,
-        "entry_atr": float(p.get("entry_atr", max(entry_price * 0.02, 0.01))),
-        "current_sl": float(p.get("current_sl", entry_price * 0.9)),
-        "stop_reason": p.get("stop_reason", "STOP_LOSS"),
-        "highest_high": float(p.get("highest_high", entry_price)),
-        "lowest_low": float(p.get("lowest_low", entry_price)),
-        "peak_bar": int(p.get("peak_bar", entry_bar)), "trough_bar": int(p.get("trough_bar", entry_bar)),
-        "layer": int(p.get("layer", 1)), "tp_done": bool(p.get("tp_done", False)),
-        "tp_proceeds": float(p.get("tp_proceeds", 0.0)), "proceeds": float(p.get("proceeds", 0.0)),
-        "fee_acc": {k: float(v) for k, v in p.get("fee_acc", _fee_dict()).items()},
+        "last_processed_date": None,
+        "wallet_cash": INITIAL_CAPITAL,
+        "positions": {},
+        "watchlist": [],
+        "closed_trades": [],
+        "manual_add_history": []
     }
 
 
-def load_state(dates: pd.DatetimeIndex) -> Dict[str, Any]:
-    state = _blank_state()
-    if STATE_PATH.exists():
-        try:
-            with STATE_PATH.open("r", encoding="utf-8") as f:
-                old = json.load(f)
-            state["cash_inr"] = float(old.get("cash_inr", 0.0))
-            state["positions"] = {t: [_normalize_position(t, x, dates) for x in xs] for t, xs in old.get("positions", {}).items()}
-            wl = old.get("watchlist", [])
-            state["watchlist"] = list(wl.values()) if isinstance(wl, dict) else list(wl)
-            state["consumed_signal_keys"] = list(old.get("consumed_signal_keys", []))
-            state["last_processed_date"] = old.get("last_processed_date")
-        except Exception as e:
-            logger.warning("NSE state load failed: %s", e)
-    return state
-
-
-def save_state(state: Dict[str, Any]) -> None:
-    tmp = STATE_PATH.with_suffix(".tmp")
-    with tmp.open("w", encoding="utf-8") as f:
-        json.dump(state, f, indent=2, default=str)
-    tmp.replace(STATE_PATH)
+def save_state(state: Dict[str, Any]):
+    with open(STATE_FILE, "w") as f:
+        json.dump(state, f, indent=4, default=str)
 
 
 # ==============================================================================
-# DATA & INTRADAY SNAPSHOT
+# 7. SEQUENTIAL DAILY CATCH-UP & SIGNAL SIMULATION ENGINE
 # ==============================================================================
-def fetch_stock_universe() -> List[str]:
-    url = "https://www.niftyindices.com/IndexConstituent/ind_nifty50list.csv"
-    try:
-        s = requests.Session()
-        s.headers.update({"User-Agent": "Mozilla/5.0"})
-        r = s.get(url, timeout=15)
-        df = pd.read_csv(io.StringIO(r.text))
-        col = next(c for c in ("Symbol", "SYMBOL", "symbol") if c in df.columns)
-        return sorted({f"{str(x).strip().upper()}.NS" for x in df[col] if str(x).strip()})
-    except Exception:
-        return [
-            "RELIANCE.NS", "TCS.NS", "HDFCBANK.NS", "INFY.NS", "ICICIBANK.NS",
-            "HINDUNILVR.NS", "ITC.NS", "SBIN.NS", "BHARTIARTL.NS", "LICI.NS",
-            "KOTAKBANK.NS", "LT.NS", "AXISBANK.NS", "HCLTECH.NS", "ASIANPAINT.NS"
-        ]
 
+class LiveNSEExecutionEngine:
+    def __init__(self, config: Dict[str, Any]):
+        self.p = copy.deepcopy(config)
+        self.state = load_or_init_state()
+        self.action_feed: List[ActionItem] = []
+        self.missed_alerts: List[str] = []
 
-def fetch_live_nse_snapshot(tickers: List[str]) -> Dict[str, Dict[str, Any]]:
-    if not tickers:
-        return {}
-    out: Dict[str, Dict[str, Any]] = {}
-    try:
-        raw = yf.download(
-            tickers, period="1d", interval="1m", progress=False, threads=False, group_by="ticker"
-        )
-    except Exception as e:
-        logger.warning("NSE live 1m download failed: %s", e)
-        return {}
+    def run_daily_cycle(self, grid: MarketGrid) -> Tuple[List[ActionItem], Dict[str, Any]]:
+        p = self.p
+        dates = grid.dates
+        n_bars = len(dates)
+        if n_bars < 50:
+            raise RuntimeError("Insufficient historical bars in MarketGrid.")
 
-    now = datetime.now(IST)
-    for ticker in tickers:
-        try:
-            frame = raw[ticker].dropna(subset=["Open", "Close"]) if isinstance(raw.columns, pd.MultiIndex) and ticker in raw.columns.levels[0] else raw.dropna(subset=["Open", "Close"])
-            if frame.empty:
-                continue
-            out[ticker] = {
-                "open": float(frame["Open"].iloc[0]),
-                "high": float(frame["High"].max()),
-                "low": float(frame["Low"].min()),
-                "price": float(frame["Close"].iloc[-1]),
-                "volume": float(frame["Volume"].fillna(0.0).sum()),
-                "quote_time": now.isoformat(),
-            }
-        except Exception:
-            continue
-    return out
+        last_date_str = self.state.get("last_processed_date")
+        if last_date_str is None:
+            start_bar = max(30, n_bars - 2)
+        else:
+            last_ts = pd.Timestamp(last_date_str).normalize()
+            matching_idx = np.where(dates == last_ts)[0]
+            if len(matching_idx) == 0:
+                print(f"[WARN] Last processed date {last_date_str} not in grid. Defaulting to recent history.")
+                start_bar = max(30, n_bars - 5)
+            else:
+                start_bar = int(matching_idx[0]) + 1
 
+        if MANUAL_WALLET_OVERRIDE is not None:
+            self.state["wallet_cash"] = float(MANUAL_WALLET_OVERRIDE)
 
-def append_nse_live_snapshot(raw_data: Dict[str, pd.DataFrame], macro_df: pd.DataFrame, snapshot: Dict[str, Dict[str, Any]]) -> Tuple[pd.Timestamp, pd.DataFrame]:
-    live_date = pd.Timestamp(datetime.now(IST).date()).normalize()
+        if start_bar >= n_bars:
+            if not FORCE_RERUN_TODAY:
+                print(f"[INFO] Engine already current. Latest completed bar was processed.")
+                self._evaluate_current_positions_telemetry(grid, n_bars - 1)
+                return self.action_feed, self.state
+            else:
+                print(f"[INFO] Same-day rerun active. Recalculating allocations for bar {n_bars - 1}...")
+                start_bar = n_bars - 1
 
-    def add_row(df: pd.DataFrame, q: Optional[Dict[str, Any]]) -> pd.DataFrame:
-        row = {
-            "open": np.nan if q is None else q["open"],
-            "high": np.nan if q is None else q["high"],
-            "low": np.nan if q is None else q["low"],
-            "close": np.nan if q is None else q["price"],
-            "volume": 0.0 if q is None else q["volume"],
-        }
-        x = pd.DataFrame(row, index=pd.DatetimeIndex([live_date]))
-        z = df[df.index < live_date]
-        return pd.concat([z, x]).sort_index()
+        raw_signal_mat, entry_mat, exit_mat, macro_ok, state_mat = compile_signals_fast(grid, p)
 
-    for ticker in list(raw_data):
-        raw_data[ticker] = add_row(raw_data[ticker], snapshot.get(ticker))
-    macro_df = add_row(macro_df, snapshot.get(MACRO_INDEX_TICKER))
-    return live_date, macro_df
+        print(f"[INFO] Catch-up sync from bar {start_bar} ({dates[start_bar].date()}) to terminal bar {n_bars - 1} ({dates[-1].date()})...")
 
+        for t in range(start_bar, n_bars):
+            curr_date = dates[t]
+            curr_date_str = str(curr_date.date())
+            is_decision_day = (t == n_bars - 1)
 
-def fetch_price_data(tickers: List[str]) -> Dict[str, pd.DataFrame]:
-    results = {}
-    cutoff = (datetime.now(IST) - timedelta(days=1)).date()
-    for t in tickers:
-        p = DATA_DIR / f"{t.replace('^','IDX_')}.parquet"
-        if p.exists():
-            try:
-                df = pd.read_parquet(p)
-                if df.index.max().date() >= cutoff:
-                    results[t] = df
+            # A. Delisting Protection
+            for coin, pos_dict in list(self.state["positions"].items()):
+                c_i = pos_dict["coin_idx"]
+                if grid.delist_mat[c_i, t]:
+                    self.state["wallet_cash"] += pos_dict["tp_proceeds"]
+                    self.state["closed_trades"].append({
+                        "coin": coin, "entry_date": pos_dict["entry_date"], "exit_date": curr_date_str,
+                        "pnl": pos_dict["tp_proceeds"] - pos_dict.get("cost_inr", pos_dict.get("cost_usd", 0.0)),
+                        "reason": "DELISTED"
+                    })
+                    del self.state["positions"][coin]
+                    if is_decision_day:
+                        self.action_feed.append(ActionItem(
+                            action_type="FULL_EXIT", coin=coin, inr_amount=0.0, units=pos_dict["units"],
+                            estimated_price=0.0, stop_loss=0.0, reason="DELISTED",
+                            notes="Asset delisted from universe. Close any remaining broker exposure immediately."
+                        ))
+
+            # B. Daily Position Evaluation & Trailing Stop Updates
+            max_holding_bars = p.get("max_holding_bars", 20)
+            use_tp = p.get("use_global_tp", False)
+            tp_mult = p.get("tp_mult", 4.0)
+            tp_size_pct = p.get("tp_size_pct", 50.0) / 100.0
+            tp_move_sl_be = p.get("tp_move_sl_be", False)
+            be_trigger_mult = p.get("be_trigger_atr", 0.0)
+            trail_mult = p.get("trail_atr_mult", 0.0)
+            trail_pct_mult = (1.0 - (p.get("trail_pct", 10.0) / 100.0))
+            xt = p["exit_type"]
+
+            macro_bear_confirmed = False
+            if p.get("macro_active_exit", False) and t >= 3:
+                macro_bear_confirmed = (not macro_ok[t - 1]) and (not macro_ok[t - 2]) and (not macro_ok[t - 3])
+
+            for coin, pos_dict in list(self.state["positions"].items()):
+                c_i = pos_dict["coin_idx"]
+                pos_cost = pos_dict.get("cost_inr", pos_dict.get("cost_usd", 0.0))
+                pos_dict_clean = {k: v for k, v in pos_dict.items() if k not in ("cost_usd", "cost_inr")}
+                pos = Position(cost_inr=pos_cost, **pos_dict_clean)
+
+                if pos.entry_date == curr_date_str:
+                    self.state["positions"][coin] = asdict(pos)
                     continue
+
+                pos.days_held += 1
+
+                if not grid.alive_mat[c_i, t]:
+                    self.state["positions"][coin] = asdict(pos)
+                    continue
+
+                adv_30d = max(grid.dvol30_mat[c_i, t - 1], 1_000_000.0)
+                o_bar = grid.open_mat[c_i, t]
+                h_bar = grid.high_mat[c_i, t]
+                l_bar = grid.low_mat[c_i, t]
+                c_bar = grid.close_mat[c_i, t]
+
+                exit_triggered = False
+                exit_reason = ""
+                raw_exit_px = o_bar
+
+                if macro_bear_confirmed:
+                    exit_triggered = True
+                    exit_reason = "MACRO_REGIME_EXIT"
+                elif pos.days_held >= max_holding_bars:
+                    exit_triggered = True
+                    exit_reason = "MAX_HOLDING_TIME"
+                elif xt in (3, 4, 5, 6, 7) and exit_mat[c_i, t - 1]:
+                    if pos.days_held >= 3 or (pos.highest_high - pos.entry_price) >= (1.0 * pos.entry_atr):
+                        exit_triggered = True
+                        exit_reason = f"SIGNAL_EXIT_TYPE_{xt}"
+
+                if not exit_triggered:
+                    # EOD Close stop loss check strictly matches bt_nse_103.py
+                    sl_breached = (c_bar <= pos.current_sl)
+                    tp_price = pos.entry_price + (tp_mult * pos.entry_atr)
+                    tp_breached = (use_tp and not pos.tp_done and (h_bar >= tp_price))
+
+                    if sl_breached:
+                        exit_triggered = True
+                        exit_reason = pos.stop_reason
+                        raw_exit_px = c_bar
+                    elif tp_breached:
+                        close_units = pos.units * tp_size_pct
+                        part_rate_tp = min(1.0, max(0.0, (close_units * tp_price) / adv_30d))
+                        slip_tp = (BASE_SLIPPAGE_BPS + IMPACT_COEF_BPS * np.sqrt(part_rate_tp)) / 10000.0
+                        fill_px, credit, _ = _sell_fill_audited(close_units, max(o_bar, tp_price), slip_tp, apply_dp=True)
+                        self.state["wallet_cash"] += credit
+                        pos.units -= close_units
+                        pos.tp_proceeds += credit
+                        pos.tp_done = True
+
+                        if tp_move_sl_be and pos.current_sl < (pos.entry_price * 1.002):
+                            pos.current_sl = pos.entry_price * 1.002
+                            pos.stop_reason = "BREAKEVEN_SL"
+
+                        if is_decision_day:
+                            self.action_feed.append(ActionItem(
+                                action_type="PARTIAL_TP", coin=coin, inr_amount=credit, units=close_units,
+                                estimated_price=fill_px, stop_loss=pos.current_sl, reason="GLOBAL_TAKE_PROFIT",
+                                notes=f"Take Profit triggered: Sell {tp_size_pct*100:.0f}% of {coin}. Stop loss raised to Breakeven ({format_price(pos.current_sl)})."
+                            ))
+                        else:
+                            self.missed_alerts.append(f"[{curr_date_str}] MISSED TAKE PROFIT: {coin} reached TP target {format_price(tp_price)}. Executed 50% partial exit in paper ledger.")
+
+                if exit_triggered:
+                    part_rate_exit = min(1.0, max(0.0, (pos.units * raw_exit_px) / adv_30d))
+                    slip_exit = (BASE_SLIPPAGE_BPS + IMPACT_COEF_BPS * np.sqrt(part_rate_exit)) / 10000.0
+                    fill_px, proceeds, _ = _sell_fill_audited(pos.units, raw_exit_px, slip_exit, apply_dp=True)
+                    self.state["wallet_cash"] += proceeds
+                    total_proceeds = pos.tp_proceeds + proceeds
+                    pnl = total_proceeds - pos.cost_inr
+
+                    self.state["closed_trades"].append({
+                        "coin": coin, "entry_date": pos.entry_date, "exit_date": curr_date_str,
+                        "entry_price": pos.entry_price, "exit_price": fill_px, "pnl": pnl,
+                        "return_pct": (pnl / pos.cost_inr) * 100.0 if pos.cost_inr > 0 else 0.0,
+                        "reason": exit_reason
+                    })
+                    del self.state["positions"][coin]
+
+                    if is_decision_day:
+                        self.action_feed.append(ActionItem(
+                            action_type="FULL_EXIT", coin=coin, inr_amount=proceeds, units=pos.units,
+                            estimated_price=fill_px, stop_loss=0.0, reason=exit_reason,
+                            notes=f"EXIT POSITION: Close 100% of {coin} immediately on broker at market price."
+                        ))
+                    else:
+                        self.missed_alerts.append(f"[{curr_date_str}] MISSED EXIT: {coin} closed due to {exit_reason} at approx {format_price(fill_px)}. Paper position closed; close immediately on broker if still held!")
+                else:
+                    if h_bar > pos.highest_high:
+                        pos.highest_high = h_bar
+                    if l_bar < pos.lowest_low:
+                        pos.lowest_low = l_bar
+
+                    prev_sl = pos.current_sl
+                    if be_trigger_mult > 0.0 and pos.current_sl < (pos.entry_price * 1.002):
+                        if pos.highest_high >= (pos.entry_price + be_trigger_mult * pos.entry_atr):
+                            pos.current_sl = max(pos.current_sl, pos.entry_price * 1.002)
+                            pos.stop_reason = "BREAKEVEN_SL"
+
+                    if xt == 1 and p.get("trail_pct", 0.0) > 0.0:
+                        pct_floor = pos.highest_high * trail_pct_mult
+                        if pct_floor > pos.current_sl:
+                            pos.current_sl = pct_floor
+                            pos.stop_reason = "TRAIL_PCT_STOP"
+                    elif trail_mult > 0.0:
+                        atr_recent = grid.atr14_mat[c_i, t - 1]
+                        atr_floor = pos.highest_high - (trail_mult * atr_recent)
+                        if atr_floor > pos.current_sl:
+                            pos.current_sl = atr_floor
+                            pos.stop_reason = "TRAIL_ATR_STOP"
+
+                    if is_decision_day and pos.current_sl > prev_sl:
+                        self.action_feed.append(ActionItem(
+                            action_type="UPDATE_SL", coin=coin, inr_amount=0.0, units=pos.units,
+                            estimated_price=c_bar, stop_loss=pos.current_sl, reason=pos.stop_reason,
+                            notes=f"Update Stop Loss order for {coin} to {format_price(pos.current_sl)} (was {format_price(prev_sl)})."
+                        ))
+
+                    self.state["positions"][coin] = asdict(pos)
+
+            # C. Watchlist Lifecycle Evaluation
+            wl_mode = p.get("wl_mode", "WL_NONE")
+            surviving_watchlist = []
+            for w_dict in self.state["watchlist"]:
+                w_item = WatchlistItem(**w_dict)
+                w_item.bars_in_watchlist += 1
+                c_i = w_item.coin_idx
+
+                l_bar = grid.low_mat[c_i, t]
+                h_bar = grid.high_mat[c_i, t]
+
+                shadow_stopped = (l_bar <= w_item.shadow_stop)
+                shadow_exited = (xt in (3, 4, 5, 6, 7)) and exit_mat[c_i, t]
+                shadow_expired = w_item.bars_in_watchlist >= WL_MAX_AGE_BARS
+
+                if not (shadow_stopped or shadow_exited or shadow_expired):
+                    if h_bar > w_item.highest_high:
+                        w_item.highest_high = h_bar
+                    if trail_mult > 0.0:
+                        w_item.shadow_stop = max(w_item.shadow_stop, w_item.highest_high - (trail_mult * grid.atr14_mat[c_i, t]))
+                    surviving_watchlist.append(asdict(w_item))
+            self.state["watchlist"] = surviving_watchlist
+
+            # D. Evaluate New Technical Triggers from Day t - 1
+            max_slots = p.get("max_concurrent_tranches", DEFAULT_MAX_CONCURRENT_TRANCHES)
+            max_pyramid = p.get("max_pyramid_layers", 1)
+            active_coins = {c: p_d["layer"] for c, p_d in self.state["positions"].items()}
+
+            new_candidates = []
+            existing_wl_coins = {item["coin"] for item in self.state["watchlist"]}
+            for c_i in range(len(grid.symbols)):
+                coin = grid.symbols[c_i]
+                if coin in self.state["positions"] or coin in existing_wl_coins:
+                    continue
+                if raw_signal_mat[c_i, t - 1]:
+                    if not macro_ok[t - 1]:
+                        continue
+                    if grid.dvol30_mat[c_i, t - 1] < LIQUIDITY_FLOOR_INR:
+                        continue
+                    if not entry_mat[c_i, t - 1]:
+                        continue
+                    if active_coins.get(coin, 0) >= max_pyramid:
+                        continue
+
+                    o_today = grid.open_mat[c_i, t]
+                    a_yesterday = grid.atr14_mat[c_i, t - 1]
+                    init_stop = o_today - (p.get("sl_mult", 3.0) * a_yesterday)
+                    breakout_strength = (grid.close_mat[c_i, t - 1] - grid.open_mat[c_i, t - 1]) / max(1e-6, a_yesterday)
+
+                    new_candidates.append(asdict(WatchlistItem(
+                        sig_id=int(time.time() * 1000) % 1000000 + c_i,
+                        coin=coin, coin_idx=c_i, signal_date=curr_date_str,
+                        trigger_price=grid.close_mat[c_i, t - 1], shadow_stop=init_stop,
+                        highest_high=o_today, breakout_quality=breakout_strength,
+                        entry_atr=a_yesterday, bars_in_watchlist=0
+                    )))
+
+            new_candidates.sort(key=lambda x: x["breakout_quality"], reverse=True)
+            self.state["watchlist"].extend(new_candidates)
+
+            # E. Order Fill Evaluation
+            if not is_decision_day:
+                if wl_mode == "WL_NONE":
+                    self.state["watchlist"] = []
+                continue
+
+            # ------------------------------------------------------------------
+            # TODAY'S LIVE DECISION DAY LOGIC
+            # ------------------------------------------------------------------
+            if MANUAL_WALLET_OVERRIDE is not None:
+                print(f"[OVERRIDE] Resetting wallet balance to manual override: {format_price(MANUAL_WALLET_OVERRIDE)}")
+                self.state["wallet_cash"] = float(MANUAL_WALLET_OVERRIDE)
+
+            for coin_rm in MANUAL_POSITIONS_REMOVE:
+                clean_rm = coin_rm.upper().strip()
+                if clean_rm in self.state["positions"]:
+                    p_rm = self.state["positions"][clean_rm]
+                    c_i = p_rm["coin_idx"]
+                    adv_30d = max(grid.dvol30_mat[c_i, t], 1_000_000.0)
+                    part_rate = min(1.0, max(0.0, (p_rm["units"] * grid.close_mat[c_i, t]) / adv_30d))
+                    slip_mult = (BASE_SLIPPAGE_BPS + IMPACT_COEF_BPS * np.sqrt(part_rate)) / 10000.0
+                    fill_px, credit, _ = _sell_fill_audited(p_rm["units"], grid.close_mat[c_i, t], slip_mult, apply_dp=True)
+                    self.state["wallet_cash"] += credit
+                    del self.state["positions"][clean_rm]
+                    self.action_feed.append(ActionItem(
+                        action_type="FULL_EXIT", coin=clean_rm, inr_amount=credit, units=p_rm["units"],
+                        estimated_price=fill_px, stop_loss=0.0, reason="MANUAL_OVERRIDE_EXIT",
+                        notes=f"Manually forced exit for {clean_rm}. Order executed in paper portfolio."
+                    ))
+
+            for coin_wl_rm in MANUAL_WATCHLIST_REMOVE:
+                clean_wl_rm = coin_wl_rm.upper().strip()
+                self.state["watchlist"] = [item for item in self.state["watchlist"] if item["coin"] != clean_wl_rm]
+
+            for man_pos in MANUAL_POSITIONS_ADD:
+                m_coin = man_pos.get("coin", man_pos.get("symbol", "")).upper().strip()
+                if m_coin in grid.symbols and m_coin not in self.state["positions"]:
+                    m_idx = grid.symbols.index(m_coin)
+                    m_units = float(man_pos.get("units", 0.0))
+                    m_px = float(man_pos.get("entry_price", man_pos.get("entry_price_inr", grid.close_mat[m_idx, t])))
+                    m_atr = float(grid.atr14_mat[m_idx, t])
+                    m_sl = m_px - (p.get("sl_mult", 3.0) * m_atr)
+                    m_cost = m_units * m_px
+
+                    injected_pos = Position(
+                        tid=int(time.time() * 1000) % 1000000, coin=m_coin, coin_idx=m_idx,
+                        entry_date=man_pos.get("entry_date", curr_date_str), entry_price=m_px,
+                        initial_units=m_units, units=m_units, cost_inr=m_cost, entry_atr=m_atr,
+                        current_sl=m_sl, stop_reason="MANUAL_INJECTION_STOP",
+                        highest_high=max(m_px, grid.high_mat[m_idx, t]),
+                        lowest_low=min(m_px, grid.low_mat[m_idx, t]),
+                        layer=1, days_held=0, tp_done=False
+                    )
+                    self.state["positions"][m_coin] = asdict(injected_pos)
+                    print(f"[OVERRIDE] Successfully injected manual position: {m_coin} ({m_units} units @ {format_price(m_px)})")
+
+            if self.state["watchlist"] and self.state["wallet_cash"] >= TRANCHE_FLOOR_INR and len(self.state["positions"]) < max_slots:
+                if wl_mode == "WL_DEEPEST_DISCOUNT":
+                    self.state["watchlist"].sort(key=lambda x: (x["trigger_price"] - grid.close_mat[x["coin_idx"], t]) / max(1e-6, x["trigger_price"]), reverse=True)
+                elif wl_mode == "WL_STRONGEST_MOMENTUM":
+                    self.state["watchlist"].sort(key=lambda x: x["breakout_quality"], reverse=True)
+
+                unfilled = []
+                for item_dict in self.state["watchlist"]:
+                    c_i = item_dict["coin_idx"]
+                    coin = item_dict["coin"]
+
+                    if not grid.alive_mat[c_i, t]:
+                        continue
+                    if not macro_ok[t]:
+                        continue
+                    if p.get("adx_thresh", 0.0) > 0.0 and grid.adx14_mat[c_i, t] < p["adx_thresh"]:
+                        continue
+                    if not state_mat[c_i, t]:
+                        continue
+
+                    coin_layers = sum(1 for c, p_d in self.state["positions"].items() if c == coin)
+                    live_px = fetch_live_ltp(coin) if is_decision_day else None
+                    today_open = live_px if (live_px is not None and live_px > 0) else grid.open_mat[c_i, t]
+
+                    if coin_layers > 0:
+                        highest_prior_entry = max(p_d["entry_price"] for c, p_d in self.state["positions"].items() if c == coin)
+                        if today_open <= highest_prior_entry * 1.005:
+                            unfilled.append(item_dict)
+                            continue
+
+                    open_slots = max(1, max_slots - len(self.state["positions"]))
+                    if len(self.state["positions"]) >= max_slots or self.state["wallet_cash"] < TRANCHE_FLOOR_INR:
+                        unfilled.append(item_dict)
+                        continue
+
+                    open_active_cap = sum(p_d["units"] * grid.close_mat[p_d["coin_idx"], t] for p_d in self.state["positions"].values())
+                    current_equity = self.state["wallet_cash"] + open_active_cap
+                    max_pos_cap = current_equity * MAX_POSITION_EQUITY_PCT
+                    dynamic_slot_target = min(max_pos_cap, self.state["wallet_cash"] / float(open_slots))
+
+                    current_scrip_exposure = sum(p_d["units"] * today_open for p_d in self.state["positions"].values() if p_d["coin"] == coin)
+                    remaining_scrip_capacity = max(0.0, max_pos_cap - current_scrip_exposure)
+                    if remaining_scrip_capacity < TRANCHE_FLOOR_INR:
+                        unfilled.append(item_dict)
+                        continue
+
+                    adv_30d = max(grid.dvol30_mat[c_i, t], 1_000_000.0)
+                    liquidity_cap_inr = adv_30d * MAX_ADV_PARTICIPATION
+                    scaled_tranche_ceiling = max(500_000.0, current_equity * 0.35)
+                    target_inr = min(dynamic_slot_target, scaled_tranche_ceiling, liquidity_cap_inr, remaining_scrip_capacity)
+
+                    max_affordable = compute_max_affordable_tranche(self.state["wallet_cash"], adv_30d)
+                    tranche_inr = min(max_affordable, max(TRANCHE_FLOOR_INR, target_inr))
+
+                    part_rate = min(1.0, max(0.0, tranche_inr / adv_30d))
+                    slip_mult = (BASE_SLIPPAGE_BPS + IMPACT_COEF_BPS * np.sqrt(part_rate)) / 10000.0
+
+                    fill_px, units, total_cost, fee_buy = _buy_fill_audited(tranche_inr, today_open, slip_mult)
+
+                    if (self.state["wallet_cash"] >= total_cost and tranche_inr >= TRANCHE_FLOOR_INR and
+                            units > 0 and len(self.state["positions"]) < max_slots and coin_layers < max_pyramid):
+
+                        sl_price = fill_px - (p.get("sl_mult", 3.0) * item_dict["entry_atr"])
+                        self.state["wallet_cash"] -= total_cost
+
+                        new_pos = Position(
+                            tid=int(time.time() * 1000) % 1000000, coin=coin, coin_idx=c_i,
+                            entry_date=curr_date_str, entry_price=fill_px, initial_units=units,
+                            units=units, cost_inr=total_cost, entry_atr=item_dict["entry_atr"],
+                            current_sl=sl_price, stop_reason="STOP_LOSS",
+                            highest_high=fill_px,
+                            lowest_low=fill_px,
+                            layer=coin_layers + 1, days_held=0, tp_done=False
+                        )
+                        self.state["positions"][coin] = asdict(new_pos)
+
+                        self.action_feed.append(ActionItem(
+                            action_type="BUY", coin=coin, inr_amount=total_cost, units=units,
+                            estimated_price=fill_px, stop_loss=sl_price, reason="SIGNAL_QUALIFIED",
+                            notes=f"BUY SIGNAL: Allocate {format_price(total_cost)} into {coin} (~{units:.2f} units @ {format_price(fill_px)}). Set Initial Stop Loss at {format_price(sl_price)}."
+                        ))
+                    else:
+                        unfilled.append(item_dict)
+
+                self.state["watchlist"] = unfilled
+
+            if wl_mode == "WL_NONE":
+                self.state["watchlist"] = []
+
+        self.state["last_processed_date"] = str(dates[-1].date())
+        save_state(self.state)
+        return self.action_feed, self.state
+
+    def _evaluate_current_positions_telemetry(self, grid: MarketGrid, t: int):
+        """Read-only evaluation when already up-to-date."""
+        for coin, p_dict in self.state["positions"].items():
+            c_i = p_dict["coin_idx"]
+            curr_px = grid.close_mat[c_i, t]
+            sl_px = p_dict["current_sl"]
+            if curr_px <= sl_px:
+                self.action_feed.append(ActionItem(
+                    action_type="FULL_EXIT", coin=coin, inr_amount=0.0, units=p_dict["units"],
+                    estimated_price=curr_px, stop_loss=sl_px, reason="STOP_LOSS_BREACHED",
+                    notes=f"CRITICAL: {coin} price ({format_price(curr_px)}) breached stop loss ({format_price(sl_px)}). Exit on broker!"
+                ))
+
+
+# ==============================================================================
+# 8. EXECUTIVE HTML EMAIL REPORT & DISPATCHER (UNTOUCHED SMTP / FORMATTED TO INR)
+# ==============================================================================
+
+def generate_executive_html_email(actions: List[ActionItem], state: Dict[str, Any],
+                                  grid: MarketGrid, config: Dict[str, Any],
+                                  missed_alerts: List[str]) -> str:
+    now_ist = pd.Timestamp.now("Asia/Kolkata").strftime("%A, %d %B %Y | %I:%M %p IST")
+    latest_bar_date = state.get("last_processed_date", "N/A")
+
+    cash = state.get("wallet_cash", 0.0)
+    positions = state.get("positions", {})
+    t = len(grid.dates) - 1
+
+    active_equity = 0.0
+    pos_rows_html = ""
+    for coin, p_dict in positions.items():
+        c_i = p_dict["coin_idx"]
+        cur_px = grid.close_mat[c_i, t]
+        val = p_dict["units"] * cur_px
+        active_equity += val
+        cost = p_dict.get("cost_inr", p_dict.get("cost_usd", 0.0))
+        pnl = val - cost
+        pnl_pct = (pnl / cost) * 100.0 if cost > 0 else 0.0
+        pnl_color = "#10b981" if pnl >= 0 else "#ef4444"
+        pnl_sign = "+" if pnl >= 0 else ""
+
+        sl = p_dict["current_sl"]
+        dist_sl = ((cur_px - sl) / cur_px) * 100.0 if cur_px > 0 else 0.0
+
+        pos_rows_html += f"""
+        <tr style="border-bottom: 1px solid #1e293b; font-size: 13px;">
+            <td style="padding: 10px; font-weight: 700; color: #f8fafc;">{coin}</td>
+            <td style="padding: 10px; color: #94a3b8;">{format_price(p_dict['entry_price'])}</td>
+            <td style="padding: 10px; color: #f8fafc; font-weight: 600;">{format_price(cur_px)}</td>
+            <td style="padding: 10px; color: {pnl_color}; font-weight: 700;">{pnl_sign}{format_price(pnl)} ({pnl_sign}{pnl_pct:.2f}%)</td>
+            <td style="padding: 10px; color: #f59e0b;">{format_price(sl)} <span style="font-size: 11px; color: #64748b;">({dist_sl:.1f}%)</span></td>
+            <td style="padding: 10px; color: #94a3b8;">{p_dict['days_held']} / {config.get('max_holding_bars', 20)}d</td>
+            <td style="padding: 10px; text-align: center;">{'<span style="color:#10b981;">&#10004; Taken</span>' if p_dict.get('tp_done') else '<span style="color:#64748b;">Pending</span>'}</td>
+        </tr>
+        """
+
+    total_equity = cash + active_equity
+    macro_px = grid.macro_close[-1]
+    macro_ma_len = config.get("macro_ma_len", 100)
+    macro_ma = FastIndicators.moving_average(grid.macro_close, macro_ma_len, config.get("macro_ma_type", 0))[-1]
+    macro_bullish = macro_px > macro_ma if not np.isnan(macro_ma) else True
+    macro_badge = f'<span style="background-color: {"#065f46" if macro_bullish else "#7f1d1d"}; color: {"#34d399" if macro_bullish else "#f87171"}; padding: 4px 8px; border-radius: 4px; font-weight: 700;">{"BULLISH REGIME" if macro_bullish else "BEARISH REGIME"} (NIFTY50 > {macro_ma_len}MA)</span>'
+
+    action_rows_html = ""
+    if not actions:
+        action_rows_html = """
+        <tr>
+            <td colspan="5" style="padding: 20px; text-align: center; color: #94a3b8; font-style: italic;">
+                No immediate manual broker actions required for today. Portfolio allocation is fully optimized.
+            </td>
+        </tr>
+        """
+    else:
+        for a in actions:
+            badge_color = "#10b981" if a.action_type == "BUY" else ("#ef4444" if a.action_type == "FULL_EXIT" else "#f59e0b")
+            action_rows_html += f"""
+            <tr style="border-bottom: 1px solid #1e293b; font-size: 13px;">
+                <td style="padding: 12px;"><span style="background-color: {badge_color}22; color: {badge_color}; border: 1px solid {badge_color}55; padding: 4px 8px; border-radius: 4px; font-weight: 700;">{a.action_type}</span></td>
+                <td style="padding: 12px; font-weight: 700; color: #f8fafc;">{a.coin}</td>
+                <td style="padding: 12px; color: #38bdf8; font-weight: 600;">{format_price(a.inr_amount) if a.inr_amount > 0 else "-"}</td>
+                <td style="padding: 12px; color: #e2e8f0;">{f"{a.units:.2f}" if a.units > 0 else "-"}</td>
+                <td style="padding: 12px; color: #cbd5e1;">{a.notes}</td>
+            </tr>
+            """
+
+    wl_rows_html = ""
+    watchlist = state.get("watchlist", [])
+    if not watchlist:
+        wl_rows_html = "<tr><td colspan='4' style='padding: 15px; text-align: center; color: #64748b;'>Watchlist is currently empty.</td></tr>"
+    else:
+        for w in watchlist[:8]:
+            wl_rows_html += f"""
+            <tr style="border-bottom: 1px solid #1e293b; font-size: 12px; color: #94a3b8;">
+                <td style="padding: 8px; font-weight: 600; color: #f8fafc;">{w['coin']}</td>
+                <td style="padding: 8px;">{format_price(w['trigger_price'])}</td>
+                <td style="padding: 8px; color: #f59e0b;">{format_price(w['shadow_stop'])}</td>
+                <td style="padding: 8px;">{w['bars_in_watchlist']}d / {WL_MAX_AGE_BARS}d</td>
+            </tr>
+            """
+
+    missed_html = ""
+    if missed_alerts:
+        alerts_li = "".join([f"<li style='margin-bottom: 4px;'>{alert}</li>" for alert in missed_alerts])
+        missed_html = f"""
+        <div style="background-color: #451a03; border-left: 4px solid #f59e0b; padding: 14px; margin-bottom: 24px; border-radius: 4px;">
+            <h4 style="margin: 0 0 6px 0; color: #fbbf24; font-size: 14px;">⚠️ Missed Sessions Catch-Up Audit</h4>
+            <ul style="margin: 0; padding-left: 20px; color: #fde68a; font-size: 12px;">{alerts_li}</ul>
+        </div>
+        """
+
+    return f"""
+    <!DOCTYPE html>
+    <html>
+    <head><meta charset="utf-8"></head>
+    <body style="background-color: #090d16; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif; color: #e2e8f0; margin: 0; padding: 24px;">
+        <div style="max-width: 860px; margin: 0 auto; background-color: #0f172a; border: 1px solid #1e293b; border-radius: 12px; overflow: hidden; box-shadow: 0 10px 25px rgba(0,0,0,0.5);">
+            
+            <div style="background: linear-gradient(135deg, #1e293b, #0f172a); padding: 24px 30px; border-bottom: 1px solid #334155;">
+                <div style="display: flex; justify-content: space-between; align-items: center;">
+                    <div>
+                        <h1 style="margin: 0; font-size: 22px; color: #f8fafc; font-weight: 800; letter-spacing: -0.5px;">NSE QUANT {ENGINE_VERSION} · LIVE DISPATCH ({UNIVERSE_NAME})</h1>
+                        <p style="margin: 4px 0 0 0; font-size: 12px; color: #94a3b8;">Executed at {now_ist} · Evaluated closed session: <strong style="color: #38bdf8;">{latest_bar_date}</strong></p>
+                    </div>
+                    <div style="text-align: right;">{macro_badge}</div>
+                </div>
+            </div>
+
+            <div style="padding: 24px 30px;">
+                {missed_html}
+
+                <div style="display: grid; grid-template-columns: repeat(4, 1fr); gap: 12px; margin-bottom: 24px;">
+                    <div style="background-color: #1e293b; padding: 14px; border-radius: 8px; border: 1px solid #334155;">
+                        <span style="font-size: 11px; color: #94a3b8; text-transform: uppercase; letter-spacing: 0.5px;">Total Net Equity</span>
+                        <div style="font-size: 20px; font-weight: 800; color: #f8fafc; margin-top: 4px;">{format_price(total_equity)}</div>
+                    </div>
+                    <div style="background-color: #1e293b; padding: 14px; border-radius: 8px; border: 1px solid #334155;">
+                        <span style="font-size: 11px; color: #94a3b8; text-transform: uppercase; letter-spacing: 0.5px;">Liquid Cash</span>
+                        <div style="font-size: 20px; font-weight: 800; color: #38bdf8; margin-top: 4px;">{format_price(cash)}</div>
+                    </div>
+                    <div style="background-color: #1e293b; padding: 14px; border-radius: 8px; border: 1px solid #334155;">
+                        <span style="font-size: 11px; color: #94a3b8; text-transform: uppercase; letter-spacing: 0.5px;">Active Exposure</span>
+                        <div style="font-size: 20px; font-weight: 800; color: #f8fafc; margin-top: 4px;">{format_price(active_equity)}</div>
+                    </div>
+                    <div style="background-color: #1e293b; padding: 14px; border-radius: 8px; border: 1px solid #334155;">
+                        <span style="font-size: 11px; color: #94a3b8; text-transform: uppercase; letter-spacing: 0.5px;">Portfolio Slots</span>
+                        <div style="font-size: 20px; font-weight: 800; color: #f59e0b; margin-top: 4px;">{len(positions)} / {config.get('max_concurrent_tranches', DEFAULT_MAX_CONCURRENT_TRANCHES)}</div>
+                    </div>
+                </div>
+
+                <h3 style="font-size: 15px; text-transform: uppercase; letter-spacing: 0.5px; color: #f8fafc; margin: 24px 0 10px 0; display: flex; align-items: center;">
+                    <span style="color: #38bdf8; margin-right: 8px;">⚡</span> Immediate Broker Actions to Mirror
+                </h3>
+                <div style="background-color: #141d2f; border: 1px solid #1e293b; border-radius: 8px; overflow: hidden; margin-bottom: 24px;">
+                    <table style="width: 100%; border-collapse: collapse; text-align: left;">
+                        <thead>
+                            <tr style="background-color: #1a2438; border-bottom: 1px solid #334155; font-size: 11px; color: #94a3b8; text-transform: uppercase;">
+                                <th style="padding: 10px 12px;">Action</th>
+                                <th style="padding: 10px 12px;">Symbol</th>
+                                <th style="padding: 10px 12px;">Target INR</th>
+                                <th style="padding: 10px 12px;">Est. Units</th>
+                                <th style="padding: 10px 12px;">Instructions</th>
+                            </tr>
+                        </thead>
+                        <tbody>{action_rows_html}</tbody>
+                    </table>
+                </div>
+
+                <h3 style="font-size: 15px; text-transform: uppercase; letter-spacing: 0.5px; color: #f8fafc; margin: 24px 0 10px 0;">
+                    📊 Active Paper Portfolio ({len(positions)} Positions)
+                </h3>
+                <div style="background-color: #141d2f; border: 1px solid #1e293b; border-radius: 8px; overflow: hidden; margin-bottom: 24px;">
+                    <table style="width: 100%; border-collapse: collapse; text-align: left;">
+                        <thead>
+                            <tr style="background-color: #1a2438; border-bottom: 1px solid #334155; font-size: 11px; color: #94a3b8; text-transform: uppercase;">
+                                <th style="padding: 10px;">Symbol</th>
+                                <th style="padding: 10px;">Entry</th>
+                                <th style="padding: 10px;">Current</th>
+                                <th style="padding: 10px;">Unrealized PnL</th>
+                                <th style="padding: 10px;">Stop Loss</th>
+                                <th style="padding: 10px;">Holding Time</th>
+                                <th style="padding: 10px; text-align: center;">50% TP</th>
+                            </tr>
+                        </thead>
+                        <tbody>{pos_rows_html if pos_rows_html else "<tr><td colspan='7' style='padding: 15px; text-align: center; color: #64748b;'>No active open positions.</td></tr>"}</tbody>
+                    </table>
+                </div>
+
+                <h3 style="font-size: 15px; text-transform: uppercase; letter-spacing: 0.5px; color: #f8fafc; margin: 24px 0 10px 0;">
+                    🎯 Active Watchlist Candidates ({len(watchlist)})
+                </h3>
+                <div style="background-color: #141d2f; border: 1px solid #1e293b; border-radius: 8px; overflow: hidden;">
+                    <table style="width: 100%; border-collapse: collapse; text-align: left;">
+                        <thead>
+                            <tr style="background-color: #1a2438; border-bottom: 1px solid #334155; font-size: 11px; color: #94a3b8; text-transform: uppercase;">
+                                <th style="padding: 8px;">Symbol</th>
+                                <th style="padding: 8px;">Trigger Price</th>
+                                <th style="padding: 8px;">Shadow Stop</th>
+                                <th style="padding: 8px;">Watchlist Age</th>
+                            </tr>
+                        </thead>
+                        <tbody>{wl_rows_html}</tbody>
+                    </table>
+                </div>
+
+                <div style="margin-top: 30px; padding-top: 15px; border-top: 1px solid #1e293b; font-size: 11px; color: #64748b; text-align: center;">
+                    NSE Swing Engine {ENGINE_VERSION} · Automated Paper Portfolio Ledger
+                </div>
+
+            </div>
+        </div>
+    </body>
+    </html>
+    """
+
+
+def dispatch_gmail_notification(subject: str, html_body: str):
+    if not (GMAIL_USER and GMAIL_APP_PASSWORD and RECIPIENT_EMAIL):
+        print("[INFO] Gmail credentials not set or incomplete. Skipping email dispatch.")
+        return
+
+    if "your_email" in GMAIL_USER or "your_app_password" in GMAIL_APP_PASSWORD:
+        print("[INFO] Placeholder credentials detected. Configure valid Gmail App Password to receive emails.")
+        return
+
+    try:
+        msg = MIMEMultipart("alternative")
+        msg["Subject"] = subject
+        msg["From"] = f"NSE Quant Engine <{GMAIL_USER}>"
+        msg["To"] = RECIPIENT_EMAIL
+        msg.attach(MIMEText(html_body, "html"))
+
+        context = ssl.create_default_context()
+        with smtplib.SMTP_SSL("smtp.gmail.com", 465, context=context) as server:
+            server.login(GMAIL_USER, GMAIL_APP_PASSWORD)
+            server.sendmail(GMAIL_USER, RECIPIENT_EMAIL, msg.as_string())
+        print(f"[SUCCESS] Executive HTML report dispatched to {RECIPIENT_EMAIL}")
+    except Exception as e:
+        print(f"[ERROR] Failed to send email via Gmail SMTP: {e}")
+
+
+# ==============================================================================
+# 9. MAIN ORCHESTRATION PIPELINE
+# ==============================================================================
+
+def load_active_config() -> Dict[str, Any]:
+    """Loads winner.json generated by bt_nse_103.py if present; otherwise uses DEFAULT_CONFIG."""
+    for cand_file in [WINNER_CONFIG_FILE, CURRENT_WINNER_FILE]:
+        if cand_file.exists():
+            try:
+                with open(cand_file, "r") as f:
+                    data = json.load(f)
+                    best_params = data.get("best_params", {})
+                    if best_params:
+                        print(f"[CONFIG] Loaded champion parameters from {cand_file.name}")
+                        return {**DEFAULT_CONFIG, **best_params}
             except Exception:
                 pass
-        try:
-            d = yf.download(t, start=f"{START_YEAR}-01-01", progress=False, auto_adjust=True)
-            if not d.empty and len(d) >= MIN_HISTORY_DAYS:
-                d = d.rename(columns={"Open": "open", "High": "high", "Low": "low", "Close": "close", "Volume": "volume"})
-                d.index = pd.to_datetime(d.index).tz_localize(None).normalize()
-                d = d[d.index.date <= cutoff]
-                d.to_parquet(p)
-                results[t] = d
-        except Exception:
-            continue
-    return results
-
-
-def build_live_matrix(raw_data, macro_df):
-    master_dates = pd.DatetimeIndex(sorted(pd.to_datetime(macro_df.index).unique())).normalize()
-    market = {}
-    for ticker, df in raw_data.items():
-        re = df.reindex(master_dates)
-        alive = (~re["close"].isna()).to_numpy(bool)
-        re = re.ffill()
-        c, o, h, l, v = re["close"].to_numpy(float), re["open"].to_numpy(float), re["high"].to_numpy(float), re["low"].to_numpy(float), re["volume"].fillna(0.0).to_numpy(float)
-        dvol = np.nan_to_num(np_rolling_mean(c * v, 30), nan=1_000_000.0)
-        market[ticker] = {"alive": alive, "open": o, "high": h, "low": l, "close": c, "volume": v, "dvol": dvol}
-    return master_dates, market
-
-
-# ==============================================================================
-# PREMIUM REPORTING UI (MATCHING CRYPTO INTELLIGENCE FORMAT)
-# ==============================================================================
-def _money_inr(v: float, decimals: int = 2) -> str:
-    try: return f"₹{float(v):,.{decimals}f}"
-    except Exception: return "₹0.00"
-
-def _pct(v: float, decimals: int = 2) -> str:
-    try: return f"{float(v):+,.{decimals}f}%"
-    except Exception: return "0.00%"
-
-def _safe_pct(numerator: float, denominator: float) -> float:
-    if not np.isfinite(denominator) or abs(denominator) < 1e-12:
-        return 0.0
-    return float(numerator / denominator * 100.0)
-
-def _pnl_color(v: float) -> str:
-    if v > 0: return "#22c55e"
-    if v < 0: return "#ef4444"
-    return "#94a3b8"
-
-def _signal_badge(active: bool, yes_text: str = "ACTIVE", no_text: str = "INACTIVE") -> str:
-    if active:
-        return f"<span class='badge badge-green'><span class='dot'></span>{html.escape(yes_text)}</span>"
-    return f"<span class='badge badge-gray'><span class='dot'></span>{html.escape(no_text)}</span>"
-
-def _risk_badge(cushion_pct: float) -> str:
-    if cushion_pct <= 0: cls, label = "badge-red", "AT / BELOW EXIT"
-    elif cushion_pct < 3: cls, label = "badge-orange", "TIGHT"
-    elif cushion_pct < 7: cls, label = "badge-yellow", "WATCH"
-    else: cls, label = "badge-green", "HEALTHY"
-    return f"<span class='badge {cls}'>{label}</span>"
-
-def _holding_bar(bars_held: int, max_bars: int) -> str:
-    if max_bars <= 0: return ""
-    pct = min(100.0, max(0.0, bars_held / max_bars * 100.0))
-    cls = "bar-red" if pct >= 90 else ("bar-orange" if pct >= 70 else "bar-green")
-    return f"""<div class="holding-wrap"><div class="holding-track"><div class="holding-fill {cls}" style="width:{pct:.1f}%"></div></div><span>{bars_held}/{max_bars} bars</span></div>"""
-
-def _explain_entry_signal(p: Dict[str, Any]) -> str:
-    parts = [f"Entry type {p.get('entry_type', 'configured')}"]
-    if p.get("adx_thresh") is not None: parts.append(f"ADX threshold {p['adx_thresh']}")
-    if p.get("vol_ma_len") is not None and p.get("vol_mult") is not None:
-        parts.append(f"Volume confirmation: {p['vol_ma_len']}-bar avg × {p['vol_mult']}")
-    if p.get("price_lookback") is not None: parts.append(f"Price lookback: {p['price_lookback']} bars")
-    if p.get("body_atr_mult") is not None: parts.append(f"Body ≥ {p['body_atr_mult']}× ATR")
-    parts.append("Macro filter enabled" if p.get("use_market_macro_system", False) else "Macro filter disabled")
-    return "; ".join(parts)
-
-def _explain_exit_signal(p: Dict[str, Any]) -> str:
-    parts = [f"Exit type {p.get('exit_type', 'configured')}"]
-    if p.get("max_holding_bars") is not None: parts.append(f"Max hold {p['max_holding_bars']} bars")
-    if p.get("sl_mult") is not None: parts.append(f"Protective stop {p['sl_mult']}× ATR")
-    if p.get("trail_atr_mult", 0): parts.append(f"Trailing component {p['trail_atr_mult']}× ATR")
-    if p.get("use_global_tp", False): parts.append("Global TP enabled")
-    return "; ".join(parts)
-
-
-def render_report(p, state, market, snapshot, idx, today, buys, exits, signals, macro_ok):
-    now_ist = datetime.now(IST)
-    free_cash = float(state.get("cash_inr", 0.0))
-    max_slots = int(p.get("max_concurrent_tranches", DEFAULT_MAX_CONCURRENT_TRANCHES))
-    
-    invested_inr = 0.0
-    market_val_inr = 0.0
-    unrealized_pnl = 0.0
-    position_count = 0
-    portfolio_rows = []
-
-    for ticker in sorted(state.get("positions", {})):
-        q = snapshot.get(ticker)
-        m = market.get(ticker)
-        px = float(q.get("price", 0.0)) if q else 0.0
-
-        for pos in state["positions"][ticker]:
-            position_count += 1
-            cost = float(pos.get("cost_inr", 0.0))
-            units = int(pos.get("units", 0))
-
-            if px > 0:
-                cur_val = units * px
-                pnl = (float(pos.get("proceeds", 0.0)) + cur_val) - cost
-                invested_inr += cost
-                market_val_inr += cur_val
-                unrealized_pnl += pnl
-                pnl_pct = _safe_pct(pnl, cost)
-                stop_px = float(pos.get("current_sl", 0.0))
-                cushion_inr = px - stop_px
-                cushion_pct = _safe_pct(cushion_inr, px)
-                bars_held = max(0, idx - int(pos.get("entry_bar", idx)))
-                max_hold = int(p.get("max_holding_bars", 55))
-
-                strategy_exit_active = False
-                if m is not None:
-                    try: strategy_exit_active = bool(m["sig"].exit_sig[idx])
-                    except Exception: pass
-
-                alloc_pct = _safe_pct(cur_val, max(1e-9, free_cash + market_val_inr))
-                pnl_html = f"<span style='color:{_pnl_color(pnl_pct)};font-weight:800'>{_pct(pnl_pct)}</span>"
-                strategy_exit_html = _signal_badge(strategy_exit_active, "EXIT SIGNAL", "HOLD")
-                cushion_html = f"<div class='cushion-value'>{_money_inr(cushion_inr)}</div><div class='muted'>{cushion_pct:+.2f}% from exit</div>{_risk_badge(cushion_pct)}"
-                exit_dist_text = "Price at/below protective exit" if cushion_pct <= 0 else f"{_money_inr(cushion_inr)} above protective exit"
-
-                portfolio_rows.append(f"""
-                <tr>
-                    <td><div class="coin-name">{html.escape(ticker)}</div><div class="muted">Layer {pos.get('layer', 1)}</div></td>
-                    <td><div>{_money_inr(pos.get('entry_price', 0.0))}</div><div class="muted">{html.escape(str(pos.get('entry_date', '-')))}</div></td>
-                    <td><div>{_money_inr(px)}</div><div class="muted">3:15 Snapshot</div></td>
-                    <td><div>{_money_inr(cost)}</div><div class="muted">{units:,} shares</div></td>
-                    <td><div>{_money_inr(cur_val)}</div><div>{pnl_html}</div></td>
-                    <td><div class="exit-price">{_money_inr(stop_px)}</div><div class="muted">{html.escape(str(pos.get('stop_reason', 'Protective exit')))}</div></td>
-                    <td>{cushion_html}<div class="muted exit-distance">{html.escape(exit_dist_text)}</div></td>
-                    <td>{strategy_exit_html}<div style="margin-top:7px">{_holding_bar(bars_held, max_hold)}</div></td>
-                    <td><div>{alloc_pct:.1f}%</div><div class="muted">of portfolio</div></td>
-                </tr>""")
-            else:
-                portfolio_rows.append(f"""
-                <tr>
-                    <td><div class="coin-name">{html.escape(ticker)}</div><div class="muted">Layer {pos.get('layer', 1)}</div></td>
-                    <td colspan="8"><span class="badge badge-orange">LIVE PRICE UNAVAILABLE</span><div class="muted">Position remains open; current quote was missing during snapshot.</div></td>
-                </tr>""")
-
-    total_equity = free_cash + market_val_inr
-    cash_pct = _safe_pct(free_cash, max(1e-9, total_equity))
-    invested_pct = _safe_pct(invested_inr, max(1e-9, total_equity))
-    free_slots = max(0, max_slots - position_count)
-    macro_pass = bool(macro_ok[idx]) if len(macro_ok) > idx else False
-
-    buy_cards = "".join(f"""
-        <div class="action-card buy-card">
-            <div class="action-icon">↗</div>
-            <div class="action-content">
-                <div class="action-title">BUY <span>{html.escape(b['ticker'])}</span> · Layer {b.get('layer', 1)}</div>
-                <div class="action-main">{_money_inr(b['price'])}</div>
-                <div class="action-meta">Fill: {_money_inr(b['effective_price'])} &nbsp;·&nbsp; Units: {b['units']:,} &nbsp;·&nbsp; Cost: {_money_inr(b['cost'])}</div>
-            </div>
-        </div>""" for b in buys) or "<div class='empty-card'>No new buy executions in this cycle.</div>"
-
-    exit_cards = "".join(f"""
-        <div class="action-card exit-card">
-            <div class="action-icon">↘</div>
-            <div class="action-content">
-                <div class="action-title">EXIT <span>{html.escape(e['ticker'])}</span> · Layer {e.get('layer', 1)}</div>
-                <div class="action-main">{_money_inr(e['exit_price'])}</div>
-                <div class="action-meta">Reason: <strong>{html.escape(e['reason'])}</strong> &nbsp;·&nbsp; P&L: <strong>{_pct(e.get('ret_pct', 0))}</strong></div>
-            </div>
-        </div>""" for e in exits) or "<div class='empty-card'>No new exits in this cycle.</div>"
-
-    signal_rows = "".join(f"""
-        <tr>
-            <td><div class="coin-name">{html.escape(str(ev.get('ticker', '')))}</div><div class="muted">{ev.get('signal_date', today)}</div></td>
-            <td>{_signal_badge(ev.get('status') == 'EXECUTED', 'EXECUTED', ev.get('status', 'BLOCKED'))}</td>
-            <td>{_money_inr(ev.get('signal_price', 0.0))}</td>
-            <td>{_money_inr(ev.get('live_price', 0.0))}</td>
-            <td><strong>{html.escape(str(ev.get('status', 'DETECTED')))}</strong></td>
-            <td>{html.escape(str(ev.get('reason', 'Strategy trigger')))}</td>
-        </tr>""" for ev in signals) or "<tr><td colspan='6' class='empty-table'>No new entry signals detected on today's 3:15 PM snapshot.</td></tr>"
-
-    entry_explanation = _explain_entry_signal(p)
-    exit_explanation = _explain_exit_signal(p)
-
-    body = f"""<!DOCTYPE html>
-<html>
-<head>
-<meta charset="UTF-8">
-<style>
-* {{ box-sizing: border-box; }}
-body {{ margin: 0; padding: 0; background: #070b14; color: #e5e7eb; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; }}
-.wrapper {{ max-width: 1180px; margin: 0 auto; padding: 24px; }}
-.header {{ background: linear-gradient(135deg, #111827 0%, #0f172a 60%, #111827 100%); border: 1px solid #263244; border-radius: 18px; padding: 26px; margin-bottom: 18px; }}
-.brand {{ font-size: 12px; letter-spacing: 2px; color: #94a3b8; font-weight: 700; text-transform: uppercase; }}
-.title {{ font-size: 30px; font-weight: 800; margin-top: 5px; color: #f8fafc; }}
-.subtitle {{ color: #94a3b8; margin-top: 7px; font-size: 13px; }}
-.status-row {{ margin-top: 18px; }}
-.badge {{ display: inline-block; padding: 5px 9px; border-radius: 999px; font-size: 10px; font-weight: 800; letter-spacing: .4px; white-space: nowrap; }}
-.badge-green {{ background: #052e1b; color: #4ade80; border: 1px solid #166534; }}
-.badge-red {{ background: #3f0d0d; color: #f87171; border: 1px solid #991b1b; }}
-.badge-orange {{ background: #431407; color: #fb923c; border: 1px solid #9a3412; }}
-.badge-yellow {{ background: #422006; color: #facc15; border: 1px solid #854d0e; }}
-.badge-gray {{ background: #1e293b; color: #94a3b8; border: 1px solid #334155; }}
-.dot {{ display: inline-block; width: 6px; height: 6px; border-radius: 50%; background: currentColor; margin-right: 5px; }}
-.grid {{ display: grid; grid-template-columns: repeat(4, 1fr); gap: 12px; margin-bottom: 18px; }}
-.card {{ background: #0f172a; border: 1px solid #263244; border-radius: 14px; padding: 17px; }}
-.card-label {{ color: #64748b; font-size: 11px; text-transform: uppercase; letter-spacing: .7px; font-weight: 700; }}
-.card-value {{ color: #f8fafc; font-size: 21px; font-weight: 800; margin-top: 7px; }}
-.card-sub {{ color: #64748b; font-size: 11px; margin-top: 4px; }}
-.section {{ background: #0f172a; border: 1px solid #263244; border-radius: 16px; padding: 20px; margin-bottom: 18px; }}
-.section-title {{ font-size: 16px; font-weight: 800; color: #f8fafc; margin-bottom: 4px; }}
-.section-description {{ color: #64748b; font-size: 12px; margin-bottom: 15px; }}
-.two-col {{ display: grid; grid-template-columns: 1fr 1fr; gap: 14px; }}
-.info-box {{ background: #111827; border: 1px solid #253044; border-radius: 12px; padding: 15px; }}
-.info-label {{ color: #64748b; font-size: 10px; text-transform: uppercase; font-weight: 800; letter-spacing: .7px; }}
-.info-value {{ margin-top: 7px; color: #e2e8f0; font-size: 13px; line-height: 1.55; }}
-.action-card {{ display: flex; gap: 14px; padding: 14px; border-radius: 12px; margin-bottom: 9px; }}
-.buy-card {{ background: linear-gradient(90deg, #052e1b, #071f18); border: 1px solid #166534; }}
-.exit-card {{ background: linear-gradient(90deg, #3f0d0d, #211015); border: 1px solid #991b1b; }}
-.action-icon {{ font-size: 22px; width: 30px; }}
-.action-title {{ font-weight: 800; font-size: 13px; }}
-.action-title span {{ color: #f8fafc; }}
-.action-main {{ font-size: 20px; font-weight: 800; margin-top: 4px; }}
-.action-meta {{ color: #94a3b8; font-size: 11px; margin-top: 5px; }}
-.empty-card {{ background: #111827; border: 1px dashed #334155; color: #64748b; padding: 14px; border-radius: 12px; font-size: 12px; }}
-table {{ width: 100%; border-collapse: collapse; }}
-th {{ background: #111827; color: #64748b; font-size: 9px; text-transform: uppercase; letter-spacing: .7px; text-align: left; padding: 11px 9px; border-bottom: 1px solid #263244; }}
-td {{ padding: 13px 9px; border-bottom: 1px solid #1e293b; font-size: 11px; vertical-align: middle; }}
-tr:last-child td {{ border-bottom: none; }}
-.coin-name {{ color: #f8fafc; font-weight: 800; font-size: 13px; }}
-.muted {{ color: #64748b; font-size: 10px; margin-top: 3px; }}
-.exit-price {{ color: #fbbf24; font-weight: 800; }}
-.cushion-value {{ font-weight: 800; color: #e2e8f0; }}
-.exit-distance {{ max-width: 160px; line-height: 1.4; }}
-.holding-wrap {{ min-width: 100px; }}
-.holding-track {{ height: 5px; background: #1e293b; border-radius: 99px; overflow: hidden; margin-bottom: 4px; }}
-.holding-fill {{ height: 100%; border-radius: 99px; }}
-.bar-green {{ background: #22c55e; }}
-.bar-orange {{ background: #f97316; }}
-.bar-red {{ background: #ef4444; }}
-.summary-line {{ display: flex; justify-content: space-between; border-bottom: 1px solid #1e293b; padding: 9px 0; font-size: 12px; }}
-.summary-line:last-child {{ border-bottom: none; }}
-.summary-label {{ color: #94a3b8; }}
-.summary-value {{ color: #f8fafc; font-weight: 700; }}
-.empty-table {{ text-align: center; color: #64748b; padding: 25px; }}
-.footer {{ color: #475569; font-size: 10px; text-align: center; padding: 8px 0 20px; line-height: 1.6; }}
-@media only screen and (max-width: 850px) {{
-    .grid {{ grid-template-columns: repeat(2, 1fr); }}
-    .two-col {{ grid-template-columns: 1fr; }}
-    .wrapper {{ padding: 10px; }}
-    .section {{ overflow-x: auto; }}
-    table {{ min-width: 1000px; }}
-}}
-</style>
-</head>
-<body>
-<div class="wrapper">
-    <div class="header">
-        <div class="brand">UNIFIED SWING BOT · NSE EQUITY</div>
-        <div class="title">📈 NIFTY50 Daily Intelligence</div>
-        <div class="subtitle">Snapshot bar: <strong>{html.escape(today)} 3:15 PM IST</strong> &nbsp;·&nbsp; Execution: <strong>{now_ist:%d %b %Y %H:%M:%S IST}</strong></div>
-        <div class="status-row">
-            {_signal_badge(position_count > 0, f"{position_count} OPEN POSITIONS", "NO OPEN POSITIONS")} &nbsp;
-            {_signal_badge(len(buys) > 0, f"{len(buys)} BUY EXECUTED", "NO NEW BUY")} &nbsp;
-            {_signal_badge(len(exits) > 0, f"{len(exits)} EXIT EXECUTED", "NO NEW EXIT")}
-        </div>
-    </div>
-    <div class="grid">
-        <div class="card"><div class="card-label">Total Equity</div><div class="card-value">{_money_inr(total_equity)}</div><div class="card-sub">Free cash + positions mark-to-market</div></div>
-        <div class="card"><div class="card-label">Free Cash</div><div class="card-value">{_money_inr(free_cash)}</div><div class="card-sub">{cash_pct:.1f}% of equity · immediately deployable</div></div>
-        <div class="card"><div class="card-label">Invested Capital</div><div class="card-value">{_money_inr(invested_inr)}</div><div class="card-sub">{invested_pct:.1f}% of portfolio cost basis</div></div>
-        <div class="card"><div class="card-label">Active P&L</div><div class="card-value" style="color:{_pnl_color(_safe_pct(unrealized_pnl, invested_inr))}">{_money_inr(unrealized_pnl)}</div><div class="card-sub">{_pct(_safe_pct(unrealized_pnl, invested_inr))} across open tranches</div></div>
-    </div>
-    <div class="section">
-        <div class="section-title">Market & Engine Status</div>
-        <div class="section-description">Macro benchmark context used during this 3:15 PM snapshot pass.</div>
-        <div class="grid">
-            <div class="card"><div class="card-label">^NSEI LTP</div><div class="card-value">{_money_inr(float(snapshot.get(MACRO_INDEX_TICKER, {}).get('price', 0.0)))}</div><div class="card-sub">Nifty 50 Index</div></div>
-            <div class="card"><div class="card-label">Macro Regime</div><div class="card-value">{'RISK-ON' if macro_pass else 'RISK-OFF'}</div><div class="card-sub">{'Enabled' if p.get('use_market_macro_system') else 'Disabled'}</div></div>
-            <div class="card"><div class="card-label">Open Slots</div><div class="card-value">{free_slots} <span style="font-size:13px;color:#64748b">/ {max_slots}</span></div><div class="card-sub">{position_count} active tranche(s)</div></div>
-            <div class="card"><div class="card-label">Universe</div><div class="card-value">NIFTY 50</div><div class="card-sub">Audited institutional sizing</div></div>
-        </div>
-    </div>
-    <div class="section">
-        <div class="section-title">Signal Engine</div>
-        <div class="section-description">Strategy parameters governing entry qualification and risk management.</div>
-        <div class="two-col">
-            <div class="info-box"><div class="info-label">ENTRY SIGNAL</div><div class="info-value"><strong>Evaluated on the 3:15 PM LTP snapshot treated as today's close.</strong><br><br>{html.escape(entry_explanation)}</div></div>
-            <div class="info-box"><div class="info-label">EXIT SIGNAL</div><div class="info-value"><strong>Exits execute dynamically on strategy signals, time stops, or protective stops.</strong><br><br>{html.escape(exit_explanation)}</div></div>
-        </div>
-    </div>
-    <div class="section">
-        <div class="section-title">Today's Executed Actions</div>
-        <div class="section-description">Trades generated during this 3:15 PM snapshot cycle.</div>
-        <h4 style="color:#4ade80;margin-bottom:8px">BUY ACTIVITY</h4>
-        {buy_cards}
-        <h4 style="color:#f87171;margin-top:20px;margin-bottom:8px">EXIT ACTIVITY</h4>
-        {exit_cards}
-    </div>
-    <div class="section">
-        <div class="section-title">Open Portfolio</div>
-        <div class="section-description">Live valuation, dynamic cushions, and protective stops for held positions.</div>
-        <table>
-            <thead>
-                <tr>
-                    <th>Symbol</th><th>Buy Price</th><th>3:15 LTP</th><th>Invested</th><th>Market Value / P&L</th><th>Protective Exit</th><th>Cushion</th><th>Risk / Hold</th><th>Allocation</th>
-                </tr>
-            </thead>
-            <tbody>
-                {''.join(portfolio_rows) if portfolio_rows else '<tr><td colspan="9" class="empty-table">No open positions.</td></tr>'}
-            </tbody>
-        </table>
-    </div>
-    <div class="section">
-        <div class="section-title">Signal Decisions</div>
-        <div class="section-description">Audit log of qualifying setups and execution decisions today.</div>
-        <table>
-            <thead>
-                <tr><th>Symbol</th><th>Status</th><th>Signal Price</th><th>Live Price</th><th>Decision</th><th>Reason</th></tr>
-            </thead>
-            <tbody>{signal_rows}</tbody>
-        </table>
-    </div>
-    <div class="section">
-        <div class="section-title">Capital Allocation Summary</div>
-        <div class="two-col">
-            <div class="info-box">
-                <div class="info-label">CAPITAL SUMMARY</div>
-                <div class="summary-line"><span class="summary-label">Total Equity</span><span class="summary-value">{_money_inr(total_equity)}</span></div>
-                <div class="summary-line"><span class="summary-label">Free Cash</span><span class="summary-value">{_money_inr(free_cash)}</span></div>
-                <div class="summary-line"><span class="summary-label">Invested Capital</span><span class="summary-value">{_money_inr(invested_inr)}</span></div>
-                <div class="summary-line"><span class="summary-label">Unrealized P&L</span><span class="summary-value" style="color:{_pnl_color(_safe_pct(unrealized_pnl, invested_inr))}">{_money_inr(unrealized_pnl)}</span></div>
-            </div>
-            <div class="info-box">
-                <div class="info-label">CAPACITY</div>
-                <div class="summary-line"><span class="summary-label">Max Allowed Tranches</span><span class="summary-value">{max_slots}</span></div>
-                <div class="summary-line"><span class="summary-label">Active Tranches</span><span class="summary-value">{position_count}</span></div>
-                <div class="summary-line"><span class="summary-label">Available Slots</span><span class="summary-value">{free_slots}</span></div>
-                <div class="summary-line"><span class="summary-label">Cash Allocation</span><span class="summary-value">{cash_pct:.1f}%</span></div>
-            </div>
-        </div>
-    </div>
-    <div class="footer">UnifiedSwingBot · NSE Live Companion<br>Decision-support snapshot only. No exchange order API is called.</div>
-</div>
-</body>
-</html>"""
-    return body, total_equity
-
-
-# ==============================================================================
-# MAIN CYCLE (RUNS AT 3:15 PM IST)
-# ==============================================================================
-def run_cycle():
-    p, meta = load_strategy_params()
-    tickers = fetch_stock_universe()
-    if not tickers:
-        raise RuntimeError("NIFTY50 universe is empty.")
-
-    raw = fetch_price_data(tickers + [MACRO_INDEX_TICKER])
-    macro_df = raw.pop(MACRO_INDEX_TICKER, None)
-    if macro_df is None or macro_df.empty:
-        raise RuntimeError("Missing ^NSEI benchmark data.")
-
-    snapshot = fetch_live_nse_snapshot(tickers + [MACRO_INDEX_TICKER])
-    if MACRO_INDEX_TICKER not in snapshot:
-        raise RuntimeError("Live ^NSEI quote not found. Aborting before state mutation.")
-
-    live_date, macro_df = append_nse_live_snapshot(raw, macro_df, snapshot)
-    dates, market = build_live_matrix(raw, macro_df)
-    if len(dates) < 2:
-        raise RuntimeError("Insufficient NSE matrix history.")
-
-    idx = len(dates) - 1
-    today = str(live_date.date())
-    mc = macro_df.reindex(dates).ffill()["close"].to_numpy(float)
-
-    if p.get("use_market_macro_system", False):
-        mma = FastIndicators.moving_average(mc, p["macro_ma_len"], p["macro_ma_type"])
-        macro_ok = (~np.isnan(mma)) & (mc > mma)
-    else:
-        macro_ok = np.ones(len(dates), dtype=bool)
-
-    for t, m in market.items():
-        m["sig"] = compile_single_symbol(
-            m["open"], m["high"], m["low"], m["close"], m["volume"], m["dvol"],
-            m["alive"], macro_ok, p, LIQUIDITY_FLOOR_INR
-        )
-
-    state = load_state(dates)
-    state.setdefault("positions", {})
-    state.setdefault("consumed_signal_keys", [])
-    consumed = set(state["consumed_signal_keys"])
-
-    buys, exits, signals = [], [], []
-    maxslots = int(p.get("max_concurrent_tranches", DEFAULT_MAX_CONCURRENT_TRANCHES))
-    maxlayers = int(p.get("max_pyramid_layers", 1))
-
-    # PASS A: Existing-position exits & dynamic trailing updates
-    for t in list(state["positions"]):
-        m = market.get(t)
-        q = snapshot.get(t)
-        if not m or not q:
-            logger.warning("Skipping %s risk evaluation: live quote unavailable.", t)
-            continue
-        px = float(q.get("price", 0.0))
-        if not np.isfinite(px) or px <= 0:
-            continue
-
-        adv = max(float(m["dvol"][max(0, idx - 1)]), 1_000_000.0)
-        prev_atr = float(m["sig"].atr[max(0, idx - 1)]) if np.isfinite(m["sig"].atr[max(0, idx - 1)]) else float(m["sig"].atr[idx])
-
-        for pos in list(state["positions"][t]):
-            held = max(0, idx - int(pos["entry_bar"]))
-            stop = float(pos.get("current_sl", 0.0))
-            reason = None
-
-            if held >= int(p.get("max_holding_bars", 55)):
-                reason = "MAX_HOLDING_TIME"
-            elif int(p["exit_type"]) in (3, 4, 5, 6, 7) and bool(m["sig"].exit_sig[idx]):
-                reason = f"STRATEGY_EXIT_{p['exit_type']}"
-            elif not np.isfinite(stop) or stop <= 0:
-                reason = "INVALID_PROTECTIVE_STOP"
-            elif px <= stop:
-                reason = pos.get("stop_reason", "STOP_LOSS")
-
-            if reason:
-                units = int(pos.get("units", 0))
-                if units <= 0:
-                    continue
-                slip = (BASE_SLIPPAGE_BPS + IMPACT_COEF_BPS * np.sqrt(min(1.0, (units * px) / adv))) / 10000.0
-                fill, proceeds, fee = _sell_fill_audited(units, px, slip)
-                state["cash_inr"] += proceeds
-                pos["proceeds"] += proceeds
-                _merge_fees(pos["fee_acc"], fee)
-                pnl = pos["proceeds"] - pos["cost_inr"]
-                exits.append({
-                    "ticker": t, "layer": pos["layer"], "reason": reason,
-                    "exit_price": px, "pnl": pnl, "ret_pct": _safe_pct(pnl, pos["cost_inr"])
-                })
-                state["positions"][t].remove(pos)
-                continue
-
-            # Update highest high & ratcheting stop loss
-            if px > pos.get("highest_high", px):
-                pos["highest_high"] = px
-                pos["peak_bar"] = idx
-            if px < pos.get("lowest_low", px):
-                pos["lowest_low"] = px
-                pos["trough_bar"] = idx
-
-            be = p.get("be_trigger_atr", 0.0)
-            if be > 0.0 and pos["current_sl"] < pos["entry_price"] * 1.002:
-                if pos["highest_high"] >= pos["entry_price"] + be * pos["entry_atr"]:
-                    pos["current_sl"] = max(pos["current_sl"], pos["entry_price"] * 1.002)
-                    pos["stop_reason"] = "BREAKEVEN_SL"
-
-            if p.get("trail_atr_mult", 0.0) > 0.0 and np.isfinite(prev_atr):
-                floor = pos["highest_high"] - p["trail_atr_mult"] * prev_atr
-                if floor > pos["current_sl"]:
-                    pos["current_sl"], pos["stop_reason"] = floor, "TRAIL_ATR_STOP"
-
-    state["positions"] = {t: v for t, v in state["positions"].items() if v}
-
-    # PASS B & C: Signal evaluation & sizing against total portfolio equity
-    count = lambda: sum(len(v) for v in state["positions"].values())
-
-    for t, m in market.items():
-        q = snapshot.get(t)
-        if not q:
-            continue
-        px = float(q.get("price", 0.0))
-        if not np.isfinite(px) or px <= 0 or not bool(m["sig"].entry[idx]):
-            continue
-
-        key = f"{t}|{today}"
-        ev = {
-            "ticker": t, "signal_type": "ENTRY", "signal_date": today,
-            "signal_price": float(m["close"][idx]), "live_price": px,
-            "status": "DETECTED", "reason": "Strategy entry signal detected"
-        }
-
-        if not bool(macro_ok[idx]):
-            ev.update(status="BLOCKED_MACRO", reason="Market macro filter is risk-off")
-            signals.append(ev)
-            continue
-        if key in consumed:
-            ev.update(status="ALREADY_CONSUMED", reason="Signal was already executed")
-            signals.append(ev)
-            continue
-        if count() >= maxslots:
-            ev.update(status="BLOCKED_MAX_SLOTS", reason=f"Maximum {maxslots} open tranches reached")
-            signals.append(ev)
-            continue
-
-        layers = len(state["positions"].get(t, []))
-        if layers >= maxlayers:
-            ev.update(status="BLOCKED_MAX_LAYERS", reason=f"Maximum {maxlayers} layer(s) allowed")
-            signals.append(ev)
-            continue
-
-        # Anti-averaging-down guard for pyramid layers
-        if layers > 0:
-            highest_entry = max(x["entry_price"] for x in state["positions"][t])
-            if px <= highest_entry * 1.005:
-                ev.update(status="BLOCKED_PYRAMID_PRICE", reason="Current price is not above previous entry by 0.5%")
-                signals.append(ev)
-                continue
-
-        # Dynamic slot target based on TOTAL portfolio equity
-        current_active = sum(
-            pos["units"] * float(snapshot.get(t_sym, {}).get("price", 0.0))
-            for t_sym, pos_list in state["positions"].items()
-            for pos in pos_list
-        )
-        total_equity = state["cash_inr"] + current_active
-        max_pos_cap = total_equity * MAX_POSITION_EQUITY_PCT
-        slots = max(1, maxslots - count())
-        dynamic_target = min(max_pos_cap, state["cash_inr"] / float(slots))
-        adv = max(float(m["dvol"][max(0, idx - 1)]), 1_000_000.0)
-
-        if dynamic_target < TRANCHE_FLOOR_INR:
-            ev.update(status="BLOCKED_POSITION_CAP", reason=f"Capped allocation {_money_inr(dynamic_target)} is below floor {_money_inr(TRANCHE_FLOOR_INR)}")
-            signals.append(ev)
-            continue
-
-        fill = _whole_share_buy(state["cash_inr"], dynamic_target, px, adv)
-        if not fill:
-            ev.update(status="BLOCKED_AFFORDABILITY", reason="No whole-share fill fits cash, fees, and allocation cap")
-            signals.append(ev)
-            continue
-
-        eff, units, cost, fees, _ = fill
-        atr = float(m["sig"].atr[idx])
-        stop = eff - float(p.get("sl_mult", 3.0)) * atr
-        if not np.isfinite(atr) or atr <= 0 or not np.isfinite(stop) or stop <= 0:
-            ev.update(status="BLOCKED_INVALID_STOP", reason="Computed protective stop is invalid")
-            signals.append(ev)
-            continue
-
-        state["cash_inr"] -= cost
-        layer = layers + 1
-        pos = {
-            "ticker": t, "entry_bar": idx, "entry_date": today, "entry_price": eff,
-            "initial_units": units, "units": units, "cost_inr": cost, "entry_atr": atr,
-            "current_sl": stop, "stop_reason": "STOP_LOSS", "highest_high": px, "lowest_low": px,
-            "layer": layer, "fee_acc": fees, "tp_done": False, "tp_proceeds": 0.0, "proceeds": 0.0
-        }
-        state["positions"].setdefault(t, []).append(pos)
-        consumed.add(key)
-        buys.append({
-            "ticker": t, "price": px, "effective_price": eff, "units": units,
-            "cost": cost, "layer": layer, "signal_date": today
-        })
-        ev.update(status="EXECUTED", reason=f"Bought {units:,} shares; allocated {_money_inr(cost)}")
-        signals.append(ev)
-
-    state["consumed_signal_keys"] = sorted(consumed)[-500:]
-    state["last_processed_date"] = today
-    save_state(state)
-
-    body, final_equity = render_report(p, state, market, snapshot, idx, today, buys, exits, signals, macro_ok)
-    send_email(
-        f"📈 NSE Intelligence | {len(buys)} BUY · {len(exits)} EXIT · {_money_inr(final_equity, 0)} Equity",
-        body
-    )
-    return {"buys": buys, "exits": exits, "signals": signals, "equity": final_equity}
+    print("[CONFIG] Using default built-in strategy configuration.")
+    return copy.deepcopy(DEFAULT_CONFIG)
 
 
 def main():
-    try:
-        run_cycle()
-    except Exception:
-        tb = traceback.format_exc()
-        logger.error("Fatal NSE companion crash:\n%s", tb)
-        send_email(f"⚠️ NSE Bot CRASHED — {datetime.now(IST):%Y-%m-%d}", f"<pre>{html.escape(tb)}</pre>")
-        raise
+    print("=" * 80)
+    print(f"NSE QUANTITATIVE LIVE PAPER TRADING ENGINE ({ENGINE_VERSION}) — {UNIVERSE_NAME}")
+    print(f"Execution Time: {pd.Timestamp.now('Asia/Kolkata').strftime('%Y-%m-%d %H:%M:%S IST')}")
+    print("=" * 80)
+
+    config = load_active_config()
+
+    print("[INIT] Fetching clean NSE market grid...")
+    grid, _ = build_live_market_grid(universe_name=UNIVERSE_NAME)
+    print(f"[INIT] Market grid loaded: {len(grid.symbols)} scrips across {len(grid.dates)} sessions up to {grid.dates[-1].date()}.")
+
+    engine = LiveNSEExecutionEngine(config=config)
+    actions, state = engine.run_daily_cycle(grid)
+
+    print("\n" + "=" * 80)
+    print("BROKER ACTION FEED (MIRROR THESE ON YOUR BROKER TERMINAL)")
+    print("=" * 80)
+    if not actions:
+        print(">> No orders required today. Portfolio is active and holding.")
+    else:
+        for idx, a in enumerate(actions, 1):
+            print(f"{idx}. [{a.action_type}] {a.coin}: {a.notes}")
+    print("=" * 80 + "\n")
+
+    cash = state.get("wallet_cash", 0.0)
+    positions = state.get("positions", {})
+    t = len(grid.dates) - 1
+    active_equity = sum(p_d["units"] * grid.close_mat[p_d["coin_idx"], t] for p_d in positions.values())
+    print(f"Current Portfolio Valuation:")
+    print(f"  Available Cash:   {format_price(cash)}")
+    print(f"  Invested Equity:  {format_price(active_equity)}")
+    print(f"  Total Net Worth:  {format_price(cash + active_equity)}")
+    print(f"  Open Positions:   {len(positions)} / {config.get('max_concurrent_tranches', DEFAULT_MAX_CONCURRENT_TRANCHES)}\n")
+
+    if SEND_EMAIL_NOTIFICATION:
+        html_report = generate_executive_html_email(actions, state, grid, config, engine.missed_alerts)
+        subject = f"NSE Quant Dispatch ({UNIVERSE_NAME}): {len(actions)} Actions · Net Worth: {format_price(cash + active_equity)}"
+        dispatch_gmail_notification(subject, html_report)
+
+    print("[DONE] Daily cycle completed successfully.")
 
 
 if __name__ == "__main__":
