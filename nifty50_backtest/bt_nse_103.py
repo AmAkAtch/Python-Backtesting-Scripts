@@ -85,12 +85,12 @@ FORCE_TRAIL_STOP: Optional[bool] = None  # Set True to lock trailing stops off (
 
 START_YEAR: int = 2015
 QUOTE_CURRENCY: str = "INR"
-INITIAL_CAPITAL: float = 10000.0
-MONTHLY_CONTRIBUTION: float = 10000.0
+INITIAL_CAPITAL: float = 5000.0
+MONTHLY_CONTRIBUTION: float = 5000.0
 CASH_ANNUAL_YIELD: float = 0.0              # Strictly 0.0% cash yield (pure trade alpha)
 MIN_HISTORY_DAYS: int = 300
 WARMUP_BARS: int = 300
-N_TRIALS: int = 1000
+N_TRIALS: int = 2000
 PARALLEL_DOWNLOAD_WORKERS: int = 8
 FORCE_REFRESH: bool = False
 CACHE_MAX_AGE_HOURS: float = 72.0
@@ -1728,13 +1728,13 @@ def sample_hyperparameters(trial: optuna.Trial) -> Dict[str, Any]:
         p["use_market_macro_system"] = trial.suggest_categorical("use_market_macro_system", [True, False])
 
     if p["use_market_macro_system"]:
-        p["macro_ma_len"] = trial.suggest_int("macro_ma_len", 50, 300, step=10)
+        p["macro_ma_len"] = trial.suggest_int("macro_ma_len", 50, 250, step=10)
         p["macro_ma_type"] = trial.suggest_categorical("macro_ma_type", [0, 1, 2, 3, 4])
         p["macro_active_exit"] = trial.suggest_categorical("macro_active_exit", [True, False])
     else:
         p["macro_active_exit"] = False
 
-    p["max_concurrent_tranches"] = trial.suggest_int("max_concurrent_tranches", 4, 12, step=1)
+    p["max_concurrent_tranches"] = trial.suggest_int("max_concurrent_tranches", 4, 20, step=1)
     if p["entry_type"] in (0, 3, 4):
         p["max_pyramid_layers"] = trial.suggest_categorical("max_pyramid_layers", [1, 2])
     else:

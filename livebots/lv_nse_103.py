@@ -38,12 +38,20 @@ import yfinance as yf
 # 1. USER CONTROL PANEL, CREDENTIALS & MANUAL OVERRIDES
 # ==============================================================================
 
-# Loads variables from .env into os.environ
-load_dotenv()
-# --- EMAIL NOTIFICATION CREDENTIALS (SET VIA ENV VARS OR UPDATE BELOW) ---
-GMAIL_USER: str = os.getenv("GMAIL_USER", "your_email@gmail.com")
-GMAIL_APP_PASSWORD: str = os.getenv("GMAIL_APP_PASSWORD", "your_app_password_here")
-RECIPIENT_EMAIL: str = os.getenv("RECIPIENT_EMAIL", "recipient_email@gmail.com")
+# Loads variables from .env if present
+load_dotenv(override=True)
+
+# --- EMAIL NOTIFICATION CREDENTIALS ---
+try:
+    from google.colab import userdata
+    GMAIL_USER = userdata.get("GMAIL_USER") or os.environ.get("GMAIL_USER", "your_email@gmail.com")
+    GMAIL_APP_PASSWORD = userdata.get("GMAIL_APP_PASSWORD") or os.environ.get("GMAIL_APP_PASSWORD", "your_app_password_here")
+    RECIPIENT_EMAIL = userdata.get("RECIPIENT_EMAIL") or os.environ.get("RECIPIENT_EMAIL", "recipient_email@gmail.com")
+except Exception:
+    GMAIL_USER = os.environ.get("GMAIL_USER", "your_email@gmail.com")
+    GMAIL_APP_PASSWORD = os.environ.get("GMAIL_APP_PASSWORD", "your_app_password_here")
+    RECIPIENT_EMAIL = os.environ.get("RECIPIENT_EMAIL", "recipient_email@gmail.com")
+
 SEND_EMAIL_NOTIFICATION: bool = True     # Set False to disable email dispatch
 
 # --- MANUAL WALLET OVERRIDE ---
@@ -176,29 +184,29 @@ WINNER_CONFIG_FILE = OUTPUT_DIR / "winner.json"
 CURRENT_WINNER_FILE = OUTPUT_DIR / "current_winner.json"
 
 DEFAULT_CONFIG: Dict[str, Any] = {
-        "entry_type": 3,
-        "adx_thresh": 20.0,
-        "vol_ma_len": 14,
-        "vol_mult": 2.5,
-        "price_lookback": 44,
-        "body_atr_mult": 1.0,
-        "use_market_macro_system": False,
-        "macro_ma_len": 210,
-        "macro_ma_type": 4,
-        "macro_active_exit": True,
-        "max_concurrent_tranches": 11,
-        "max_pyramid_layers": 2,
-        "wl_mode": "WL_DEEPEST_DISCOUNT",
-        "use_global_tp": True,
-        "tp_mult": 5.5,
-        "tp_size_pct": 35.0,
-        "tp_move_sl_be": False,
-        "be_trigger_atr": 2.5,
-        "max_holding_bars": 60,
-        "sl_mult": 6.0,
-        "exit_type": 0,
-        "trail_atr_mult": 0.0
-    }
+    "entry_type": 3,
+    "adx_thresh": 20.0,
+    "vol_ma_len": 14,
+    "vol_mult": 2.5,
+    "price_lookback": 44,
+    "body_atr_mult": 1.0,
+    "use_market_macro_system": False,
+    "macro_ma_len": 210,
+    "macro_ma_type": 4,
+    "macro_active_exit": True,
+    "max_concurrent_tranches": 11,
+    "max_pyramid_layers": 2,
+    "wl_mode": "WL_DEEPEST_DISCOUNT",
+    "use_global_tp": True,
+    "tp_mult": 5.5,
+    "tp_size_pct": 35.0,
+    "tp_move_sl_be": False,
+    "be_trigger_atr": 2.5,
+    "max_holding_bars": 60,
+    "sl_mult": 6.0,
+    "exit_type": 0,
+    "trail_atr_mult": 0.0
+}
 
 
 def format_price(px: float) -> str:
@@ -425,18 +433,40 @@ def fetch_from_yfinance(symbol: str, start_year: int) -> Optional[pd.DataFrame]:
         return None
     if raw is None or raw.empty:
         return None
+
+    # Unpack MultiIndex columns returned by modern yfinance
+    if isinstance(raw.columns, pd.MultiIndex):
+        lvl0 = [str(c).strip().title() for c in raw.columns.get_level_values(0)]
+        if "Close" in lvl0 or "Open" in lvl0:
+            raw.columns = raw.columns.get_level_values(0)
+        else:
+            raw.columns = raw.columns.get_level_values(1)
+
     raw = raw.reset_index()
-    raw.columns = [c if isinstance(c, str) else c[0] for c in raw.columns]
-    raw = raw.rename(columns={"Date": "date", "Open": "open", "High": "high", "Low": "low", "Close": "close", "Volume": "volume"})
+
+    # Flatten tuples and normalize headers to lowercase strings
+    raw.columns = [c[0] if isinstance(c, tuple) else str(c) for c in raw.columns]
+    raw.columns = [str(c).strip().lower() for c in raw.columns]
+
+    # Deduplicate columns (fixes duplicate 'close' created by auto_adjust)
+    raw = raw.loc[:, ~raw.columns.duplicated(keep="first")]
+
     if not {"date", "open", "high", "low", "close", "volume"}.issubset(raw.columns):
         return None
+
+    # Guarantee 1D Series types before mathematical operations
+    for col in ["open", "high", "low", "close", "volume"]:
+        if isinstance(raw[col], pd.DataFrame):
+            raw[col] = raw[col].iloc[:, 0]
+        raw[col] = pd.to_numeric(raw[col], errors="coerce")
+
     raw["quote_volume"] = raw["close"] * raw["volume"]
     raw["date"] = pd.to_datetime(raw["date"]).dt.tz_localize(None).dt.normalize()
     raw = raw.drop_duplicates(subset=["date"]).sort_values("date").reset_index(drop=True)
     today = pd.Timestamp.now().normalize()
     raw = raw[raw["date"] < today]
-    for col in ["open", "high", "low", "close", "volume", "quote_volume"]:
-        raw[col] = pd.to_numeric(raw[col], errors="coerce")
+
+    raw["quote_volume"] = pd.to_numeric(raw["quote_volume"], errors="coerce")
     raw = raw.dropna(subset=["open", "high", "low", "close"])
     raw = raw[
         (raw["open"] > 0) &
@@ -484,9 +514,16 @@ def fetch_live_ltp(symbol: str) -> Optional[float]:
     ticker = _yf_ticker(symbol)
     try:
         t = yf.Ticker(ticker)
-        fast_px = getattr(t, "fast_info", {}).get("lastPrice", None)
-        if fast_px is not None and np.isfinite(fast_px) and fast_px > 0:
-            return float(fast_px)
+        fast = getattr(t, "fast_info", None)
+        if fast is not None:
+            fast_px = getattr(fast, "last_price", None) or getattr(fast, "lastPrice", None)
+            if fast_px is None and hasattr(fast, "__getitem__"):
+                try:
+                    fast_px = fast["lastPrice"]
+                except Exception:
+                    pass
+            if fast_px is not None and np.isfinite(fast_px) and fast_px > 0:
+                return float(fast_px)
     except Exception:
         pass
     return None
@@ -516,6 +553,15 @@ class MarketGrid:
 
 def build_live_market_grid(universe_name: str = UNIVERSE_NAME) -> Tuple[MarketGrid, Dict[str, pd.DataFrame]]:
     symbols = load_universe_constituents(universe_name)
+    
+    # Ensure active positions already tracked in the ledger are fetched & represented in grid
+    saved_state = load_or_init_state()
+    for held_sym in saved_state.get("positions", {}).keys():
+        clean_held = str(held_sym).upper().strip()
+        if clean_held and clean_held not in symbols:
+            symbols.append(clean_held)
+
+    # Include manual positions
     for p in MANUAL_POSITIONS_ADD:
         sym = p.get("coin", p.get("symbol", "")).upper().strip()
         if sym and sym not in symbols:
@@ -776,7 +822,7 @@ def _buy_fill_audited(
         total_cash_cost, fees = compute_buy_cost_audited(gross_at_slip, slip_cost)
         if total_cash_cost <= cash_limit:
             return fill_px, units, total_cash_cost, fees
-        units -= 1  # Decrement if statutory fees push cost over cash
+        units -= 1
 
     return fill_px, 0, 0.0, FeeBreakdown()
 
@@ -917,6 +963,18 @@ class LiveNSEExecutionEngine:
 
         raw_signal_mat, entry_mat, exit_mat, macro_ok, state_mat = compile_signals_fast(grid, p)
 
+        # --- DYNAMIC RE-INDEXING GUARD (Eliminates IndexError on any symbol mismatch) ---
+        sym_map = {sym: idx for idx, sym in enumerate(grid.symbols)}
+
+        # Re-sync coin_idx for all existing positions against current grid
+        for coin, pos_dict in list(self.state["positions"].items()):
+            pos_dict["coin_idx"] = sym_map.get(coin, -1)
+
+        # Re-sync and prune watchlist candidates whose symbols are not in the current grid
+        for w_dict in list(self.state["watchlist"]):
+            w_dict["coin_idx"] = sym_map.get(w_dict["coin"], -1)
+        self.state["watchlist"] = [w for w in self.state["watchlist"] if w["coin_idx"] >= 0]
+
         print(f"[INFO] Catch-up sync from bar {start_bar} ({dates[start_bar].date()}) to terminal bar {n_bars - 1} ({dates[-1].date()})...")
 
         for t in range(start_bar, n_bars):
@@ -926,7 +984,10 @@ class LiveNSEExecutionEngine:
 
             # A. Delisting Protection
             for coin, pos_dict in list(self.state["positions"].items()):
-                c_i = pos_dict["coin_idx"]
+                c_i = pos_dict.get("coin_idx", -1)
+                if c_i < 0 or c_i >= len(grid.symbols):
+                    continue
+
                 if grid.delist_mat[c_i, t]:
                     self.state["wallet_cash"] += pos_dict["tp_proceeds"]
                     self.state["closed_trades"].append({
@@ -958,7 +1019,7 @@ class LiveNSEExecutionEngine:
                 macro_bear_confirmed = (not macro_ok[t - 1]) and (not macro_ok[t - 2]) and (not macro_ok[t - 3])
 
             for coin, pos_dict in list(self.state["positions"].items()):
-                c_i = pos_dict["coin_idx"]
+                c_i = pos_dict.get("coin_idx", -1)
                 pos_cost = pos_dict.get("cost_inr", pos_dict.get("cost_usd", 0.0))
                 pos_dict_clean = {k: v for k, v in pos_dict.items() if k not in ("cost_usd", "cost_inr")}
                 pos = Position(cost_inr=pos_cost, **pos_dict_clean)
@@ -968,6 +1029,10 @@ class LiveNSEExecutionEngine:
                     continue
 
                 pos.days_held += 1
+
+                if c_i < 0 or c_i >= len(grid.symbols):
+                    self.state["positions"][coin] = asdict(pos)
+                    continue
 
                 if not grid.alive_mat[c_i, t]:
                     self.state["positions"][coin] = asdict(pos)
@@ -979,9 +1044,13 @@ class LiveNSEExecutionEngine:
                 l_bar = grid.low_mat[c_i, t]
                 c_bar = grid.close_mat[c_i, t]
 
+                # Resolve live price reference on decision day to prevent execution drift
+                live_px = fetch_live_ltp(coin) if is_decision_day else None
+                cur_eval_px = live_px if (live_px is not None and live_px > 0) else c_bar
+
                 exit_triggered = False
                 exit_reason = ""
-                raw_exit_px = o_bar
+                raw_exit_px = cur_eval_px if is_decision_day else o_bar
 
                 if macro_bear_confirmed:
                     exit_triggered = True
@@ -989,29 +1058,26 @@ class LiveNSEExecutionEngine:
                 elif pos.days_held >= max_holding_bars:
                     exit_triggered = True
                     exit_reason = "MAX_HOLDING_TIME"
-                elif xt in (3, 4, 5, 6, 7) and exit_mat[c_i, t - 1]:
+                elif xt in (3, 4, 5, 6, 7) and (exit_mat[c_i, t] if is_decision_day else exit_mat[c_i, t - 1]):
                     if pos.days_held >= 3 or (pos.highest_high - pos.entry_price) >= (1.0 * pos.entry_atr):
                         exit_triggered = True
                         exit_reason = f"SIGNAL_EXIT_TYPE_{xt}"
 
                 if not exit_triggered:
-                    # EOD Close stop loss check strictly matches bt_nse_103.py
-                    sl_breached = (c_bar <= pos.current_sl)
+                    sl_breached = (cur_eval_px <= pos.current_sl) if is_decision_day else (c_bar <= pos.current_sl)
                     tp_price = pos.entry_price + (tp_mult * pos.entry_atr)
-                    tp_breached = (use_tp and not pos.tp_done and (h_bar >= tp_price))
+                    tp_breached = (use_tp and not pos.tp_done and ((cur_eval_px >= tp_price) if is_decision_day else (h_bar >= tp_price)))
 
                     if sl_breached:
                         exit_triggered = True
                         exit_reason = pos.stop_reason
-                        raw_exit_px = c_bar
+                        raw_exit_px = cur_eval_px if is_decision_day else c_bar
                     elif tp_breached:
-                        # Floor partial exit shares; cannot sell < 1 share
                         close_units = int(np.floor(pos.units * tp_size_pct))
-                        
                         if close_units >= 1 and (pos.units - close_units) >= 1:
                             part_rate_tp = min(1.0, max(0.0, (close_units * tp_price) / adv_30d))
                             slip_tp = (BASE_SLIPPAGE_BPS + IMPACT_COEF_BPS * np.sqrt(part_rate_tp)) / 10000.0
-                            fill_px, credit, _ = _sell_fill_audited(close_units, max(o_bar, tp_price), slip_tp, apply_dp=True)
+                            fill_px, credit, _ = _sell_fill_audited(close_units, max(cur_eval_px if is_decision_day else o_bar, tp_price), slip_tp, apply_dp=True)
                             
                             self.state["wallet_cash"] += credit
                             pos.units -= close_units
@@ -1031,7 +1097,6 @@ class LiveNSEExecutionEngine:
                             else:
                                 self.missed_alerts.append(f"[{curr_date_str}] MISSED TAKE PROFIT: {coin} reached TP target {format_price(tp_price)}. Sold {close_units} shares in paper ledger.")
                         elif pos.units == 1:
-                            # If holding only 1 share, do not partially sell; leave full share to trail
                             pass
 
                 if exit_triggered:
@@ -1061,6 +1126,8 @@ class LiveNSEExecutionEngine:
                 else:
                     if h_bar > pos.highest_high:
                         pos.highest_high = h_bar
+                    if is_decision_day and cur_eval_px > pos.highest_high:
+                        pos.highest_high = cur_eval_px
                     if l_bar < pos.lowest_low:
                         pos.lowest_low = l_bar
 
@@ -1085,7 +1152,7 @@ class LiveNSEExecutionEngine:
                     if is_decision_day and pos.current_sl > prev_sl:
                         self.action_feed.append(ActionItem(
                             action_type="UPDATE_SL", coin=coin, inr_amount=0.0, units=pos.units,
-                            estimated_price=c_bar, stop_loss=pos.current_sl, reason=pos.stop_reason,
+                            estimated_price=cur_eval_px, stop_loss=pos.current_sl, reason=pos.stop_reason,
                             notes=f"Update Stop Loss order for {coin} to {format_price(pos.current_sl)} (was {format_price(prev_sl)})."
                         ))
 
@@ -1095,9 +1162,11 @@ class LiveNSEExecutionEngine:
             wl_mode = p.get("wl_mode", "WL_NONE")
             surviving_watchlist = []
             for w_dict in self.state["watchlist"]:
+                c_i = w_dict.get("coin_idx", -1)
+                if c_i < 0 or c_i >= len(grid.symbols):
+                    continue
                 w_item = WatchlistItem(**w_dict)
                 w_item.bars_in_watchlist += 1
-                c_i = w_item.coin_idx
 
                 l_bar = grid.low_mat[c_i, t]
                 h_bar = grid.high_mat[c_i, t]
@@ -1114,36 +1183,38 @@ class LiveNSEExecutionEngine:
                     surviving_watchlist.append(asdict(w_item))
             self.state["watchlist"] = surviving_watchlist
 
-            # D. Evaluate New Technical Triggers from Day t - 1
+            # D. Evaluate New Technical Triggers
             max_slots = p.get("max_concurrent_tranches", DEFAULT_MAX_CONCURRENT_TRANCHES)
             max_pyramid = p.get("max_pyramid_layers", 1)
             active_coins = {c: p_d["layer"] for c, p_d in self.state["positions"].items()}
 
             new_candidates = []
             existing_wl_coins = {item["coin"] for item in self.state["watchlist"]}
+            sig_t = t if is_decision_day else (t - 1)
             for c_i in range(len(grid.symbols)):
                 coin = grid.symbols[c_i]
                 if coin in self.state["positions"] or coin in existing_wl_coins:
                     continue
-                if raw_signal_mat[c_i, t - 1]:
-                    if not macro_ok[t - 1]:
+                if raw_signal_mat[c_i, sig_t]:
+                    if not macro_ok[sig_t]:
                         continue
-                    if grid.dvol30_mat[c_i, t - 1] < LIQUIDITY_FLOOR_INR:
+                    if grid.dvol30_mat[c_i, sig_t] < LIQUIDITY_FLOOR_INR:
                         continue
-                    if not entry_mat[c_i, t - 1]:
+                    if not entry_mat[c_i, sig_t]:
                         continue
                     if active_coins.get(coin, 0) >= max_pyramid:
                         continue
 
-                    o_today = grid.open_mat[c_i, t]
-                    a_yesterday = grid.atr14_mat[c_i, t - 1]
+                    a_yesterday = grid.atr14_mat[c_i, sig_t]
+                    live_c_px = fetch_live_ltp(coin) if is_decision_day else None
+                    o_today = live_c_px if (live_c_px is not None and live_c_px > 0) else (grid.close_mat[c_i, t] if is_decision_day else grid.open_mat[c_i, t])
                     init_stop = o_today - (p.get("sl_mult", 3.0) * a_yesterday)
-                    breakout_strength = (grid.close_mat[c_i, t - 1] - grid.open_mat[c_i, t - 1]) / max(1e-6, a_yesterday)
+                    breakout_strength = (grid.close_mat[c_i, sig_t] - grid.open_mat[c_i, sig_t]) / max(1e-6, a_yesterday)
 
                     new_candidates.append(asdict(WatchlistItem(
                         sig_id=int(time.time() * 1000) % 1000000 + c_i,
                         coin=coin, coin_idx=c_i, signal_date=curr_date_str,
-                        trigger_price=grid.close_mat[c_i, t - 1], shadow_stop=init_stop,
+                        trigger_price=grid.close_mat[c_i, sig_t], shadow_stop=init_stop,
                         highest_high=o_today, breakout_quality=breakout_strength,
                         entry_atr=a_yesterday, bars_in_watchlist=0
                     )))
@@ -1168,11 +1239,12 @@ class LiveNSEExecutionEngine:
                 clean_rm = coin_rm.upper().strip()
                 if clean_rm in self.state["positions"]:
                     p_rm = self.state["positions"][clean_rm]
-                    c_i = p_rm["coin_idx"]
-                    adv_30d = max(grid.dvol30_mat[c_i, t], 1_000_000.0)
-                    part_rate = min(1.0, max(0.0, (p_rm["units"] * grid.close_mat[c_i, t]) / adv_30d))
+                    c_i = sym_map.get(clean_rm, p_rm.get("coin_idx", -1))
+                    adv_30d = max(grid.dvol30_mat[c_i, t], 1_000_000.0) if (0 <= c_i < len(grid.symbols)) else 1_000_000.0
+                    cur_px = grid.close_mat[c_i, t] if (0 <= c_i < len(grid.symbols)) else (fetch_live_ltp(clean_rm) or p_rm.get("entry_price", 0.0))
+                    part_rate = min(1.0, max(0.0, (p_rm["units"] * cur_px) / adv_30d))
                     slip_mult = (BASE_SLIPPAGE_BPS + IMPACT_COEF_BPS * np.sqrt(part_rate)) / 10000.0
-                    fill_px, credit, _ = _sell_fill_audited(p_rm["units"], grid.close_mat[c_i, t], slip_mult, apply_dp=True)
+                    fill_px, credit, _ = _sell_fill_audited(p_rm["units"], cur_px, slip_mult, apply_dp=True)
                     self.state["wallet_cash"] += credit
                     del self.state["positions"][clean_rm]
                     self.action_feed.append(ActionItem(
@@ -1187,8 +1259,8 @@ class LiveNSEExecutionEngine:
 
             for man_pos in MANUAL_POSITIONS_ADD:
                 m_coin = man_pos.get("coin", man_pos.get("symbol", "")).upper().strip()
-                if m_coin in grid.symbols and m_coin not in self.state["positions"]:
-                    m_idx = grid.symbols.index(m_coin)
+                if m_coin in sym_map and m_coin not in self.state["positions"]:
+                    m_idx = sym_map[m_coin]
                     m_units = int(np.floor(float(man_pos.get("units", 0.0))))
                     if m_units <= 0:
                         continue
@@ -1244,7 +1316,10 @@ class LiveNSEExecutionEngine:
                         unfilled.append(item_dict)
                         continue
 
-                    open_active_cap = sum(p_d["units"] * grid.close_mat[p_d["coin_idx"], t] for p_d in self.state["positions"].values())
+                    open_active_cap = sum(
+                        p_d["units"] * (grid.close_mat[p_d["coin_idx"], t] if 0 <= p_d.get("coin_idx", -1) < len(grid.symbols) else p_d.get("entry_price", 0.0))
+                        for p_d in self.state["positions"].values()
+                    )
                     current_equity = self.state["wallet_cash"] + open_active_cap
                     max_pos_cap = current_equity * MAX_POSITION_EQUITY_PCT
                     dynamic_slot_target = min(max_pos_cap, self.state["wallet_cash"] / float(open_slots))
@@ -1307,9 +1382,13 @@ class LiveNSEExecutionEngine:
 
     def _evaluate_current_positions_telemetry(self, grid: MarketGrid, t: int):
         """Read-only evaluation when already up-to-date."""
+        sym_map = {sym: idx for idx, sym in enumerate(grid.symbols)}
         for coin, p_dict in self.state["positions"].items():
-            c_i = p_dict["coin_idx"]
-            curr_px = grid.close_mat[c_i, t]
+            c_i = sym_map.get(coin, -1)
+            if 0 <= c_i < len(grid.symbols):
+                curr_px = grid.close_mat[c_i, t]
+            else:
+                curr_px = fetch_live_ltp(coin) or p_dict.get("entry_price", 0.0)
             sl_px = p_dict["current_sl"]
             if curr_px <= sl_px:
                 self.action_feed.append(ActionItem(
@@ -1336,8 +1415,12 @@ def generate_executive_html_email(actions: List[ActionItem], state: Dict[str, An
     active_equity = 0.0
     pos_rows_html = ""
     for coin, p_dict in positions.items():
-        c_i = p_dict["coin_idx"]
-        cur_px = grid.close_mat[c_i, t]
+        c_i = p_dict.get("coin_idx", -1)
+        if 0 <= c_i < len(grid.symbols):
+            cur_px = grid.close_mat[c_i, t]
+        else:
+            cur_px = fetch_live_ltp(coin) or p_dict.get("entry_price", 0.0)
+            
         val = p_dict["units"] * cur_px
         active_equity += val
         cost = p_dict.get("cost_inr", p_dict.get("cost_usd", 0.0))
@@ -1351,7 +1434,7 @@ def generate_executive_html_email(actions: List[ActionItem], state: Dict[str, An
 
         pos_rows_html += f"""
         <tr style="border-bottom: 1px solid #1e293b; font-size: 13px;">
-            <td style="padding: 10px; font-weight: 700; color: #f8fafc;">{coin}({int(p_dict['units'])} sh)</td>
+            <td style="padding: 10px; font-weight: 700; color: #f8fafc;">{coin} ({int(p_dict['units'])} sh)</td>
             <td style="padding: 10px; color: #94a3b8;">{format_price(p_dict['entry_price'])}</td>
             <td style="padding: 10px; color: #f8fafc; font-weight: 600;">{format_price(cur_px)}</td>
             <td style="padding: 10px; color: {pnl_color}; font-weight: 700;">{pnl_sign}{format_price(pnl)} ({pnl_sign}{pnl_pct:.2f}%)</td>
@@ -1594,7 +1677,10 @@ def main():
     cash = state.get("wallet_cash", 0.0)
     positions = state.get("positions", {})
     t = len(grid.dates) - 1
-    active_equity = sum(p_d["units"] * grid.close_mat[p_d["coin_idx"], t] for p_d in positions.values())
+    active_equity = sum(
+        p_d["units"] * (grid.close_mat[p_d["coin_idx"], t] if 0 <= p_d.get("coin_idx", -1) < len(grid.symbols) else p_d.get("entry_price", 0.0))
+        for p_d in positions.values()
+    )
     print(f"Current Portfolio Valuation:")
     print(f"  Available Cash:   {format_price(cash)}")
     print(f"  Invested Equity:  {format_price(active_equity)}")

@@ -31,15 +31,21 @@ import numpy as np
 import pandas as pd
 import requests
 
-# ==============================================================================
+## ==============================================================================
 # 1. USER CONTROL PANEL, CREDENTIALS & MANUAL OVERRIDES
 # ==============================================================================
 
-# --- EMAIL NOTIFICATION CREDENTIALS (SET VIA ENV VARS OR UNCOMMENT BELOW) ---
-# To use Gmail: generate a 16-character App Password via Google Account -> Security -> 2-Step Verification -> App Passwords
-GMAIL_USER: str = os.getenv("GMAIL_USER", "your_email@gmail.com")
-GMAIL_APP_PASSWORD: str = os.getenv("GMAIL_APP_PASSWORD", "your_app_password_here")
-RECIPIENT_EMAIL: str = os.getenv("RECIPIENT_EMAIL", "recipient_email@gmail.com")
+# --- EMAIL NOTIFICATION CREDENTIALS ---
+try:
+    from google.colab import userdata
+    GMAIL_USER = userdata.get("GMAIL_USER")
+    GMAIL_APP_PASSWORD = userdata.get("GMAIL_APP_PASSWORD")
+    RECIPIENT_EMAIL = userdata.get("RECIPIENT_EMAIL")
+except Exception as e:
+    GMAIL_USER = os.environ.get("GMAIL_USER")
+    GMAIL_APP_PASSWORD = os.environ.get("GMAIL_APP_PASSWORD")
+    RECIPIENT_EMAIL = os.environ.get("RECIPIENT_EMAIL")
+
 SEND_EMAIL_NOTIFICATION: bool = True     # Set False to disable email dispatch
 
 # --- MANUAL WALLET OVERRIDE ---
@@ -55,10 +61,7 @@ FORCE_RERUN_TODAY: bool = True
 # --- MANUAL POSITION INJECTIONS & FORCED EXITS ---
 # Enter your holdings directly in INR using "entry_price_inr"
 MANUAL_POSITIONS_ADD: List[Dict[str, Any]] = [
-    {"coin": "ONDO", "units": 43.1,  "entry_price_inr": 43.046, "entry_date": "2026-09-28"},
-    {"coin": "AERO", "units": 15.1,  "entry_price_inr": 57.95,  "entry_date": "2026-09-28"},
-    {"coin": "LTC",  "units": 0.138, "entry_price_inr": 7107.9, "entry_date": "2026-09-28"},
-    {"coin": "H",    "units": 132.0, "entry_price_inr": 7.4618, "entry_date": "2026-09-28"},
+    # {"coin": "ONDO", "units": 43.1,  "entry_price_inr": 43.046, "entry_date": "2026-09-28"},
 ]
 
 # Force-exit positions immediately (Paper state exits, proceeds return to cash):
@@ -815,429 +818,203 @@ class LiveCryptoExecutionEngine:
         if n_bars < 50:
             raise RuntimeError("Insufficient historical bars in MarketGrid.")
 
-        # Resolve last processed bar index
-        last_date_str = self.state.get("last_processed_date")
-        if last_date_str is None:
-            # First run: start from the bar immediately prior to terminal to set up initial state
-            start_bar = max(30, n_bars - 2)
-        else:
-            last_ts = pd.Timestamp(last_date_str).normalize()
-            matching_idx = np.where(dates == last_ts)[0]
-            if len(matching_idx) == 0:
-                print(f"[WARN] Last processed date {last_date_str} not in grid. Defaulting to recent history.")
-                start_bar = max(30, n_bars - 5)
-            else:
-                start_bar = int(matching_idx[0]) + 1
+        terminal_bar = n_bars - 1  # Yesterday's freshly completed daily candle
+        last_closed_date_str = str(dates[terminal_bar].date())
+        today_date_str = pd.Timestamp.now("Asia/Kolkata").strftime("%Y-%m-%d")
 
-        # 1. Update wallet cash right away if you set an override!
+        # 1. Update wallet cash override if specified
         if MANUAL_WALLET_OVERRIDE is not None:
             self.state["wallet_cash"] = float(MANUAL_WALLET_OVERRIDE)
 
-        # Track whether today's daily close was already recorded earlier
-        already_processed_today = (self.state.get("last_processed_date") == str(dates[-1].date()))    
-
-        # 2. Check if already up-to-date
-        if start_bar >= n_bars:
-            if not FORCE_RERUN_TODAY:
-                print(f"[INFO] Engine already current. Latest completed bar was processed.")
-                self._evaluate_current_positions_telemetry(grid, n_bars - 1)
-                return self.action_feed, self.state
-            else:
-                print(f"[INFO] Same-day rerun active. Recalculating allocations for bar {n_bars - 1}...")
-                start_bar = n_bars - 1  # Force it to re-evaluate today!
-
+        # 2. Compile all technical indicators & signals across the grid
         raw_signal_mat, entry_mat, exit_mat, macro_ok, state_mat = compile_signals_fast(grid, p)
 
+        # 3. Resolve historical catch-up starting point
+        last_date_str = self.state.get("last_processed_date")
+        if last_date_str is None:
+            start_bar = terminal_bar
+        else:
+            last_ts = pd.Timestamp(last_date_str).normalize()
+            matching = np.where(dates == last_ts)[0]
+            start_bar = int(matching[0]) + 1 if len(matching) > 0 else terminal_bar
+
         # ----------------------------------------------------------------------
-        # Catch-up Loop: Step sequentially across all unprocessed closed daily bars
+        # PART A: HISTORICAL CATCH-UP (Evaluate closed bars for held positions)
         # ----------------------------------------------------------------------
-        print(f"[INFO] Catch-up sync from bar {start_bar} ({dates[start_bar].date()}) to terminal bar {n_bars - 1} ({dates[-1].date()})...")
+        if start_bar <= terminal_bar:
+            print(f"[INFO] Evaluating closed candles from {dates[start_bar].date()} to {dates[terminal_bar].date()}...")
+            for t in range(start_bar, terminal_bar + 1):
+                c_date_str = str(dates[t].date())
 
-        for t in range(start_bar, n_bars):
-            curr_date = dates[t]
-            curr_date_str = str(curr_date.date())
-            is_decision_day = (t == n_bars - 1)
+                # A1. Delisting exits
+                for coin, pos_dict in list(self.state["positions"].items()):
+                    c_i = pos_dict["coin_idx"]
+                    if grid.delist_mat[c_i, t]:
+                        self.state["wallet_cash"] += pos_dict["tp_proceeds"]
+                        del self.state["positions"][coin]
 
-            # A. Process Delisting Protection
-            for coin, pos_dict in list(self.state["positions"].items()):
-                c_i = pos_dict["coin_idx"]
-                if grid.delist_mat[c_i, t]:
-                    self.state["wallet_cash"] += pos_dict["tp_proceeds"]
-                    self.state["closed_trades"].append({
-                        "coin": coin, "entry_date": pos_dict["entry_date"], "exit_date": curr_date_str,
-                        "pnl": pos_dict["tp_proceeds"] - pos_dict["cost_usd"], "reason": "DELISTED"
-                    })
-                    del self.state["positions"][coin]
-                    if is_decision_day:
-                        self.action_feed.append(ActionItem(
-                            action_type="FULL_EXIT", coin=coin, dollar_amount=0.0, units=pos_dict["units"],
-                            estimated_price=0.0, stop_loss=0.0, reason="DELISTED",
-                            notes="Asset delisted from universe. Close any remaining exchange exposure immediately."
-                        ))
+                # A2. Daily position management (stops, trailing stops, max hold)
+                for coin, pos_dict in list(self.state["positions"].items()):
+                    c_i = pos_dict["coin_idx"]
+                    pos = Position(**pos_dict)
 
-            # B. Daily Position Evaluation & Trailing Stop Updates
-            max_holding_bars = p.get("max_holding_bars", 25)
-            use_tp = p.get("use_global_tp", False)
-            tp_mult = p.get("tp_mult", 4.0)
-            tp_size_pct = p.get("tp_size_pct", 50.0) / 100.0
-            tp_move_sl_be = p.get("tp_move_sl_be", False)
-            be_trigger_mult = p.get("be_trigger_atr", 0.0)
-            trail_mult = p.get("trail_atr_mult", 0.0)
-            trail_pct_mult = (1.0 - (p.get("trail_pct", 10.0) / 100.0))
-            xt = p["exit_type"]
+                    # Do NOT evaluate exits on the exact day a trade entered
+                    if pos.entry_date == c_date_str or pos.entry_date == today_date_str:
+                        continue
 
-            macro_bear_confirmed = False
-            if p.get("macro_active_exit", False) and t >= 3:
-                macro_bear_confirmed = (not macro_ok[t - 1]) and (not macro_ok[t - 2]) and (not macro_ok[t - 3])
+                    pos.days_held += 1
+                    adv_30d = max(grid.dvol30_mat[c_i, t], LIQUIDITY_FLOOR_USD)
+                    h_bar = grid.high_mat[c_i, t]
+                    l_bar = grid.low_mat[c_i, t]
+                    c_bar = grid.close_mat[c_i, t]
 
-            for coin, pos_dict in list(self.state["positions"].items()):
-                c_i = pos_dict["coin_idx"]
-                pos = Position(**pos_dict)
+                    exit_triggered = False
+                    exit_reason = ""
 
-                # ==============================================================
-                # CRITICAL GUARD: Do NOT evaluate daily exits or trailing stops
-                # for positions that entered TODAY! They only trail starting tomorrow.
-                # ==============================================================
-                if pos.entry_date == curr_date_str:
-                    self.state["positions"][coin] = asdict(pos)
-                    continue
-
-                pos.days_held += 1
-
-                if not grid.alive_mat[c_i, t]:
-                    self.state["positions"][coin] = asdict(pos)
-                    continue
-
-                adv_30d = max(grid.dvol30_mat[c_i, t - 1], LIQUIDITY_FLOOR_USD)
-                o_bar = grid.open_mat[c_i, t]
-                h_bar = grid.high_mat[c_i, t]
-                l_bar = grid.low_mat[c_i, t]
-                c_bar = grid.close_mat[c_i, t]
-
-                exit_triggered = False
-                exit_reason = ""
-                raw_exit_px = o_bar
-
-                if macro_bear_confirmed:
-                    exit_triggered = True
-                    exit_reason = "MACRO_REGIME_EXIT"
-                elif pos.days_held >= max_holding_bars:
-                    exit_triggered = True
-                    exit_reason = "MAX_HOLDING_TIME"
-                elif xt in (3, 4, 5, 6, 7) and exit_mat[c_i, t - 1]:
-                    if pos.days_held >= 3 or (pos.highest_high - pos.entry_price) >= (1.0 * pos.entry_atr):
+                    if pos.days_held >= p.get("max_holding_bars", 25):
                         exit_triggered = True
-                        exit_reason = f"SIGNAL_EXIT_TYPE_{xt}"
-
-                if not exit_triggered:
-                    sl_breached = (c_bar <= pos.current_sl)
-                    tp_price = pos.entry_price + (tp_mult * pos.entry_atr)
-                    tp_breached = (use_tp and not pos.tp_done and (h_bar >= tp_price))
-
-                    if sl_breached:
+                        exit_reason = "MAX_HOLDING_TIME"
+                    elif c_bar <= pos.current_sl:
                         exit_triggered = True
                         exit_reason = pos.stop_reason
-                        raw_exit_px = c_bar
-                    elif tp_breached:
-                        # Partial Take-Profit Execution
-                        close_units = pos.units * tp_size_pct
-                        fill_px, credit = calc_sell_fill(close_units, max(o_bar, tp_price), adv_30d)
-                        self.state["wallet_cash"] += credit
-                        pos.units -= close_units
-                        pos.tp_proceeds += credit
-                        pos.tp_done = True
 
-                        if tp_move_sl_be and pos.current_sl < (pos.entry_price * 1.002):
-                            pos.current_sl = pos.entry_price * 1.002
-                            pos.stop_reason = "BREAKEVEN_SL"
-
-                        if is_decision_day:
-                            self.action_feed.append(ActionItem(
-                                action_type="PARTIAL_TP", coin=coin, dollar_amount=credit, units=close_units,
-                                estimated_price=fill_px, stop_loss=pos.current_sl, reason="GLOBAL_TAKE_PROFIT",
-                                notes=f"Take Profit triggered: Sell {tp_size_pct*100:.0f}% of {coin}. Stop loss raised to Breakeven (${pos.current_sl:.4f})."
-                            ))
-                        else:
-                            self.missed_alerts.append(f"[{curr_date_str}] MISSED TAKE PROFIT: {coin} reached TP target ${tp_price:.4f}. Executed 50% partial exit in paper ledger.")
-
-                if exit_triggered:
-                    fill_px, proceeds = calc_sell_fill(pos.units, raw_exit_px, adv_30d)
-                    self.state["wallet_cash"] += proceeds
-                    total_proceeds = pos.tp_proceeds + proceeds
-                    pnl = total_proceeds - pos.cost_usd
-
-                    self.state["closed_trades"].append({
-                        "coin": coin, "entry_date": pos.entry_date, "exit_date": curr_date_str,
-                        "entry_price": pos.entry_price, "exit_price": fill_px, "pnl": pnl,
-                        "return_pct": (pnl / pos.cost_usd) * 100.0, "reason": exit_reason
-                    })
-                    del self.state["positions"][coin]
-
-                    if is_decision_day:
+                    if exit_triggered:
+                        fill_px, proceeds = calc_sell_fill(pos.units, c_bar, adv_30d)
+                        self.state["wallet_cash"] += proceeds
+                        del self.state["positions"][coin]
                         self.action_feed.append(ActionItem(
                             action_type="FULL_EXIT", coin=coin, dollar_amount=proceeds, units=pos.units,
                             estimated_price=fill_px, stop_loss=0.0, reason=exit_reason,
-                            notes=f"EXIT POSITION: Close 100% of {coin} immediately on exchange at market price."
+                            notes=f"EXIT POSITION: Close 100% of {coin} immediately on exchange."
                         ))
                     else:
-                        self.missed_alerts.append(f"[{curr_date_str}] MISSED EXIT: {coin} closed due to {exit_reason} at approx ${fill_px:.4f}. Paper position closed; close immediately on exchange if still held!")
+                        # Update trailing stops
+                        if h_bar > pos.highest_high:
+                            pos.highest_high = h_bar
+                        trail_mult = p.get("trail_atr_mult", 0.0)
+                        if trail_mult > 0.0:
+                            atr_floor = pos.highest_high - (trail_mult * grid.atr14_mat[c_i, t])
+                            if atr_floor > pos.current_sl:
+                                prev_sl = pos.current_sl
+                                pos.current_sl = atr_floor
+                                self.action_feed.append(ActionItem(
+                                    action_type="UPDATE_SL", coin=coin, dollar_amount=0.0, units=pos.units,
+                                    estimated_price=c_bar, stop_loss=pos.current_sl, reason="TRAIL_ATR_STOP",
+                                    notes=f"Update Stop Loss for {coin} to ${pos.current_sl:.4f} (was ${prev_sl:.4f})."
+                                ))
+                        self.state["positions"][coin] = asdict(pos)
+
+        # ----------------------------------------------------------------------
+        # PART B: TODAY'S LIVE EXECUTION (Evaluates signals from terminal_bar!)
+        # ----------------------------------------------------------------------
+        # 1. Apply Manual Position Removals
+        for coin_rm in MANUAL_POSITIONS_REMOVE:
+            clean_rm = coin_rm.upper().strip()
+            if clean_rm in self.state["positions"]:
+                p_rm = self.state["positions"][clean_rm]
+                c_i = p_rm["coin_idx"]
+                adv_30d = max(grid.dvol30_mat[c_i, terminal_bar], LIQUIDITY_FLOOR_USD)
+                _, credit = calc_sell_fill(p_rm["units"], grid.close_mat[c_i, terminal_bar], adv_30d)
+                self.state["wallet_cash"] += credit
+                del self.state["positions"][clean_rm]
+                self.action_feed.append(ActionItem(
+                    action_type="FULL_EXIT", coin=clean_rm, dollar_amount=credit, units=p_rm["units"],
+                    estimated_price=grid.close_mat[c_i, terminal_bar], stop_loss=0.0, reason="MANUAL_OVERRIDE_EXIT",
+                    notes=f"Manually forced exit for {clean_rm}."
+                ))
+
+        # 2. Apply Manual Position Injections
+        for man_pos in MANUAL_POSITIONS_ADD:
+            m_coin = man_pos.get("coin", "").upper().strip()
+            if m_coin in grid.symbols and m_coin not in self.state["positions"]:
+                m_idx = grid.symbols.index(m_coin)
+                m_units = float(man_pos.get("units", 0.0))
+                if "entry_price_inr" in man_pos:
+                    inr_px = float(man_pos["entry_price_inr"])
+                    m_px = inr_px / USDT_INR_RATE
                 else:
-                    # Trailing & Breakeven Stop Adjustments
-                    if h_bar > pos.highest_high:
-                        pos.highest_high = h_bar
-                    if l_bar < pos.lowest_low:
-                        pos.lowest_low = l_bar
+                    m_px = float(man_pos.get("entry_price", grid.close_mat[m_idx, terminal_bar]))
 
-                    prev_sl = pos.current_sl
-                    if be_trigger_mult > 0.0 and pos.current_sl < (pos.entry_price * 1.002):
-                        if pos.highest_high >= (pos.entry_price + be_trigger_mult * pos.entry_atr):
-                            pos.current_sl = max(pos.current_sl, pos.entry_price * 1.002)
-                            pos.stop_reason = "BREAKEVEN_SL"
+                m_atr = float(grid.atr14_mat[m_idx, terminal_bar])
+                m_sl = m_px - (p.get("sl_mult", 3.6) * m_atr)
+                injected_pos = Position(
+                    tid=int(time.time() * 1000) % 1000000, coin=m_coin, coin_idx=m_idx,
+                    entry_date=today_date_str, entry_price=m_px, initial_units=m_units,
+                    units=m_units, cost_usd=m_units * m_px, entry_atr=m_atr,
+                    current_sl=m_sl, stop_reason="MANUAL_INJECTION_STOP",
+                    highest_high=m_px, lowest_low=m_px, layer=1, days_held=0, tp_done=False
+                )
+                self.state["positions"][m_coin] = asdict(injected_pos)
 
-                    if xt == 1 and p.get("trail_pct", 0.0) > 0.0:
-                        pct_floor = pos.highest_high * trail_pct_mult
-                        if pct_floor > pos.current_sl:
-                            pos.current_sl = pct_floor
-                            pos.stop_reason = "TRAIL_PCT_STOP"
-                    elif trail_mult > 0.0:
-                        atr_recent = grid.atr14_mat[c_i, t - 1]
-                        atr_floor = pos.highest_high - (trail_mult * atr_recent)
-                        if atr_floor > pos.current_sl:
-                            pos.current_sl = atr_floor
-                            pos.stop_reason = "TRAIL_ATR_STOP"
-
-                    if is_decision_day and pos.current_sl > prev_sl:
-                        self.action_feed.append(ActionItem(
-                            action_type="UPDATE_SL", coin=coin, dollar_amount=0.0, units=pos.units,
-                            estimated_price=c_bar, stop_loss=pos.current_sl, reason=pos.stop_reason,
-                            notes=f"Update Stop Loss order for {coin} to ${pos.current_sl:.4f} (was ${prev_sl:.4f})."
-                        ))
-
-                    self.state["positions"][coin] = asdict(pos)
-
-            # C. Watchlist Lifecycle Evaluation
-            wl_mode = p.get("wl_mode", "WL_NONE")
-            surviving_watchlist = []
-            for w_dict in self.state["watchlist"]:
-                w_item = WatchlistItem(**w_dict)
-                w_item.bars_in_watchlist += 1
-                c_i = w_item.coin_idx
-
-                l_bar = grid.low_mat[c_i, t]
-                h_bar = grid.high_mat[c_i, t]
-
-                shadow_stopped = (l_bar <= w_item.shadow_stop)
-                shadow_exited = (xt in (3, 4, 5, 6, 7)) and exit_mat[c_i, t]
-                shadow_expired = w_item.bars_in_watchlist >= WL_MAX_AGE_BARS
-
-                if not (shadow_stopped or shadow_exited or shadow_expired):
-                    if h_bar > w_item.highest_high:
-                        w_item.highest_high = h_bar
-                    if trail_mult > 0.0:
-                        w_item.shadow_stop = max(w_item.shadow_stop, w_item.highest_high - (trail_mult * grid.atr14_mat[c_i, t]))
-                    surviving_watchlist.append(asdict(w_item))
-            self.state["watchlist"] = surviving_watchlist
-
-            # D. Evaluate New Technical Triggers from Day t - 1
-            max_slots = p.get("max_concurrent_tranches", 6)
-            max_pyramid = p.get("max_pyramid_layers", 1)
-            active_coins = {c: p_d["layer"] for c, p_d in self.state["positions"].items()}
-
-            new_candidates = []
-            existing_wl_coins = {item["coin"] for item in self.state["watchlist"]}
-            for c_i in range(len(grid.symbols)):
-                coin = grid.symbols[c_i]
-                if coin in self.state["positions"] or coin in existing_wl_coins:
-                    continue  # Skip coins you already hold or that are already queued
-                if raw_signal_mat[c_i, t - 1]:
-                    if not macro_ok[t - 1]:
-                        continue
-                    if grid.dvol30_mat[c_i, t - 1] < LIQUIDITY_FLOOR_USD:
-                        continue
-                    if not entry_mat[c_i, t - 1]:
-                        continue
-                    if active_coins.get(coin, 0) >= max_pyramid:
-                        continue
-
-                    o_today = grid.open_mat[c_i, t]
-                    a_yesterday = grid.atr14_mat[c_i, t - 1]
-                    init_stop = o_today - (p.get("sl_mult", 3.0) * a_yesterday)
-                    breakout_strength = (grid.close_mat[c_i, t - 1] - grid.open_mat[c_i, t - 1]) / max(1e-6, a_yesterday)
-
-                    new_candidates.append(asdict(WatchlistItem(
-                        sig_id=int(time.time() * 1000) % 1000000 + c_i,
-                        coin=coin, coin_idx=c_i, signal_date=curr_date_str,
-                        trigger_price=grid.close_mat[c_i, t - 1], shadow_stop=init_stop,
-                        highest_high=o_today, breakout_quality=breakout_strength,
-                        entry_atr=a_yesterday, bars_in_watchlist=0
-                    )))
-
-            new_candidates.sort(key=lambda x: x["breakout_quality"], reverse=True)
-            self.state["watchlist"].extend(new_candidates)
-
-            # E. ORDER FILL EVALUATION
-            # On past missed days: do NOT execute retroactive buys (days run dry for entries as requested)
-            if not is_decision_day:
-                if wl_mode == "WL_NONE":
-                    self.state["watchlist"] = []
+        # 3. Evaluate Actionable Signals from Yesterday's Close (terminal_bar)
+        max_slots = p.get("max_concurrent_tranches", 8)
+        new_candidates = []
+        for c_i in range(len(grid.symbols)):
+            coin = grid.symbols[c_i]
+            if coin in self.state["positions"]:
                 continue
 
-            # ------------------------------------------------------------------
-            # TODAY'S LIVE DECISION DAY LOGIC
-            # ------------------------------------------------------------------
-            # 1. Apply Manual Wallet Override if active
-            if MANUAL_WALLET_OVERRIDE is not None:
-                print(f"[OVERRIDE] Resetting wallet balance to manual override: ${MANUAL_WALLET_OVERRIDE:,.2f}")
-                self.state["wallet_cash"] = float(MANUAL_WALLET_OVERRIDE)
+            # Check signal at terminal_bar (YESTERDAY'S CLOSE, NOT 2 DAYS AGO!)
+            if raw_signal_mat[c_i, terminal_bar] and entry_mat[c_i, terminal_bar]:
+                a_yesterday = grid.atr14_mat[c_i, terminal_bar]
+                breakout_strength = (grid.close_mat[c_i, terminal_bar] - grid.open_mat[c_i, terminal_bar]) / max(1e-6, a_yesterday)
+                new_candidates.append({
+                    "coin": coin, "coin_idx": c_i, "trigger_price": grid.close_mat[c_i, terminal_bar],
+                    "entry_atr": a_yesterday, "breakout_quality": breakout_strength
+                })
 
-            # 2. Apply Manual Position Removals
-            for coin_rm in MANUAL_POSITIONS_REMOVE:
-                clean_rm = coin_rm.upper().strip()
-                if clean_rm in self.state["positions"]:
-                    p_rm = self.state["positions"][clean_rm]
-                    c_i = p_rm["coin_idx"]
-                    adv_30d = max(grid.dvol30_mat[c_i, t], LIQUIDITY_FLOOR_USD)
-                    _, credit = calc_sell_fill(p_rm["units"], grid.close_mat[c_i, t], adv_30d)
-                    self.state["wallet_cash"] += credit
-                    del self.state["positions"][clean_rm]
-                    self.action_feed.append(ActionItem(
-                        action_type="FULL_EXIT", coin=clean_rm, dollar_amount=credit, units=p_rm["units"],
-                        estimated_price=grid.close_mat[c_i, t], stop_loss=0.0, reason="MANUAL_OVERRIDE_EXIT",
-                        notes=f"Manually forced exit for {clean_rm}. Order executed in paper portfolio."
-                    ))
+        new_candidates.sort(key=lambda x: x["breakout_quality"], reverse=True)
 
-            # 3. Apply Manual Watchlist Removals
-            for coin_wl_rm in MANUAL_WATCHLIST_REMOVE:
-                clean_wl_rm = coin_wl_rm.upper().strip()
-                self.state["watchlist"] = [item for item in self.state["watchlist"] if item["coin"] != clean_wl_rm]
+        # 4. Fill orders using Real-Time LTP & apply anti-chasing guard
+        open_slots = max(1, max_slots - len(self.state["positions"]))
+        for cand in new_candidates:
+            if len(self.state["positions"]) >= max_slots or self.state["wallet_cash"] < TRANCHE_FLOOR_USD:
+                break
 
-            # 4. Apply Manual Position Injections
-            for man_pos in MANUAL_POSITIONS_ADD:
-                m_coin = man_pos.get("coin", "").upper().strip()
-                if m_coin in grid.symbols and m_coin not in self.state["positions"]:
-                    m_idx = grid.symbols.index(m_coin)
-                    m_units = float(man_pos.get("units", 0.0))
+            coin = cand["coin"]
+            c_i = cand["coin_idx"]
 
-                    # Automatically convert INR to USD if entry_price_inr is provided
-                    if "entry_price_inr" in man_pos:
-                        inr_px = float(man_pos["entry_price_inr"])
-                        m_px = inr_px / USDT_INR_RATE
-                        print(f"[INR CONVERSION] {m_coin}: ₹{inr_px:.4f} converted to ${m_px:.4f} USD (@ ₹{USDT_INR_RATE}/USDT)")
-                    else:
-                        m_px = float(man_pos.get("entry_price", grid.close_mat[m_idx, t]))
+            # Real-time execution price
+            live_px = fetch_live_ltp(coin)
+            exec_px = live_px if (live_px is not None and live_px > 0) else grid.close_mat[c_i, terminal_bar]
 
-                    m_atr = float(grid.atr14_mat[m_idx, t])
-                    m_sl = m_px - (p.get("sl_mult", 3.0) * m_atr)
-                    m_cost = m_units * m_px
+            # Execution Drift Check: Alert if price already pumped > 5% above breakout close
+            drift_pct = ((exec_px - cand["trigger_price"]) / cand["trigger_price"]) * 100.0
+            drift_warning = f" (⚠️ +{drift_pct:.1f}% drift from close)" if drift_pct > 5.0 else ""
 
-                    injected_pos = Position(
-                        tid=int(time.time() * 1000) % 1000000, coin=m_coin, coin_idx=m_idx,
-                        entry_date=man_pos.get("entry_date", curr_date_str), entry_price=m_px,
-                        initial_units=m_units, units=m_units, cost_usd=m_cost, entry_atr=m_atr,
-                        current_sl=m_sl, stop_reason="MANUAL_INJECTION_STOP",
-                        highest_high=max(m_px, grid.high_mat[m_idx, t]),
-                        lowest_low=min(m_px, grid.low_mat[m_idx, t]),
-                        layer=1, days_held=0, tp_done=False
-                    )
-                    self.state["positions"][m_coin] = asdict(injected_pos)
-                    print(f"[OVERRIDE] Successfully injected manual position: {m_coin} ({m_units} units @ ${m_px:,.2f})")
+            # Sizing calculations
+            open_active_cap = sum(p_d["units"] * grid.close_mat[p_d["coin_idx"], terminal_bar] for p_d in self.state["positions"].values())
+            current_equity = self.state["wallet_cash"] + open_active_cap
+            max_pos_cap = current_equity * MAX_POSITION_EQUITY_PCT
+            dynamic_slot_target = min(max_pos_cap, self.state["wallet_cash"] / float(open_slots))
 
-            # 5. Process Actionable Buy Signals for Today
-            if self.state["watchlist"] and self.state["wallet_cash"] >= TRANCHE_FLOOR_USD and len(self.state["positions"]) < max_slots:
-                if wl_mode == "WL_DEEPEST_DISCOUNT":
-                    self.state["watchlist"].sort(key=lambda x: (x["trigger_price"] - grid.close_mat[x["coin_idx"], t]) / max(1e-6, x["trigger_price"]), reverse=True)
-                elif wl_mode == "WL_STRONGEST_MOMENTUM":
-                    self.state["watchlist"].sort(key=lambda x: x["breakout_quality"], reverse=True)
+            adv_30d = max(grid.dvol30_mat[c_i, terminal_bar], LIQUIDITY_FLOOR_USD)
+            max_affordable = compute_max_affordable_tranche(self.state["wallet_cash"], adv_30d)
+            tranche_usd = min(max_affordable, max(TRANCHE_FLOOR_USD, dynamic_slot_target))
 
-                unfilled = []
-                for item_dict in self.state["watchlist"]:
-                    c_i = item_dict["coin_idx"]
-                    coin = item_dict["coin"]
+            fill_px, units, total_cost = calc_buy_fill(tranche_usd, exec_px, adv_30d)
+            sl_price = fill_px - (p.get("sl_mult", 3.6) * cand["entry_atr"])
 
-                    if not grid.alive_mat[c_i, t]:
-                        continue
+            if self.state["wallet_cash"] >= total_cost and units > 0:
+                self.state["wallet_cash"] -= total_cost
+                new_pos = Position(
+                    tid=int(time.time() * 1000) % 1000000, coin=coin, coin_idx=c_i,
+                    entry_date=today_date_str, entry_price=fill_px, initial_units=units,
+                    units=units, cost_usd=total_cost, entry_atr=cand["entry_atr"],
+                    current_sl=sl_price, stop_reason="STOP_LOSS",
+                    highest_high=fill_px, lowest_low=fill_px, layer=1, days_held=0, tp_done=False
+                )
+                self.state["positions"][coin] = asdict(new_pos)
+                self.action_feed.append(ActionItem(
+                    action_type="BUY", coin=coin, dollar_amount=total_cost, units=units,
+                    estimated_price=fill_px, stop_loss=sl_price, reason="SIGNAL_QUALIFIED",
+                    notes=f"BUY SIGNAL: Allocate ${total_cost:,.2f} into {coin} (~{units:.4f} units @ ${fill_px:.4f}){drift_warning}. Set Stop Loss at ${sl_price:.4f}."
+                ))
 
-                    # Filter revalidation
-                    if not macro_ok[t]:
-                        continue
-                    if p.get("adx_thresh", 0.0) > 0.0 and grid.adx14_mat[c_i, t] < p["adx_thresh"]:
-                        continue
-                    if not state_mat[c_i, t]:
-                        continue
-
-                    coin_layers = sum(1 for c, p_d in self.state["positions"].items() if c == coin)
-                    # Use live price (LTP) if running today; fallback to candle open
-                    live_px = fetch_live_ltp(coin) if is_decision_day else None
-                    today_open = live_px if (live_px is not None and live_px > 0) else grid.open_mat[c_i, t]
-
-                    # Anti-averaging down check
-                    if coin_layers > 0:
-                        highest_prior_entry = max(p_d["entry_price"] for c, p_d in self.state["positions"].items() if c == coin)
-                        if today_open <= highest_prior_entry * 1.005:
-                            unfilled.append(item_dict)
-                            continue
-
-                    open_slots = max(1, max_slots - len(self.state["positions"]))
-                    if len(self.state["positions"]) >= max_slots or self.state["wallet_cash"] < TRANCHE_FLOOR_USD:
-                        unfilled.append(item_dict)
-                        continue
-
-                    open_active_cap = sum(p_d["units"] * grid.close_mat[p_d["coin_idx"], t] for p_d in self.state["positions"].values())
-                    current_equity = self.state["wallet_cash"] + open_active_cap
-                    max_pos_cap = current_equity * MAX_POSITION_EQUITY_PCT
-                    dynamic_slot_target = min(max_pos_cap, self.state["wallet_cash"] / float(open_slots))
-
-                    current_asset_exposure = sum(p_d["units"] * today_open for p_d in self.state["positions"].values() if p_d["coin"] == coin)
-                    remaining_asset_capacity = max(0.0, max_pos_cap - current_asset_exposure)
-                    if remaining_asset_capacity < TRANCHE_FLOOR_USD:
-                        unfilled.append(item_dict)
-                        continue
-
-                    adv_30d = max(grid.dvol30_mat[c_i, t], LIQUIDITY_FLOOR_USD)
-                    liquidity_cap_usd = adv_30d * MAX_ADV_PARTICIPATION
-                    scaled_tranche_ceiling = max(10_000.0, current_equity * 0.35)
-                    target_usd = min(dynamic_slot_target, scaled_tranche_ceiling, liquidity_cap_usd, remaining_asset_capacity)
-
-                    max_affordable = compute_max_affordable_tranche(self.state["wallet_cash"], adv_30d)
-                    tranche_usd = min(max_affordable, max(TRANCHE_FLOOR_USD, target_usd))
-
-                    fill_px, units, total_cost = calc_buy_fill(tranche_usd, today_open, adv_30d)
-
-                    if (self.state["wallet_cash"] >= total_cost and tranche_usd >= TRANCHE_FLOOR_USD and
-                            units > 0 and len(self.state["positions"]) < max_slots and coin_layers < max_pyramid):
-
-                        sl_price = fill_px - (p.get("sl_mult", 3.0) * item_dict["entry_atr"])
-                        self.state["wallet_cash"] -= total_cost
-
-                        new_pos = Position(
-                            tid=int(time.time() * 1000) % 1000000, coin=coin, coin_idx=c_i,
-                            entry_date=curr_date_str, entry_price=fill_px, initial_units=units,
-                            units=units, cost_usd=total_cost, entry_atr=item_dict["entry_atr"],
-                            current_sl=sl_price, stop_reason="STOP_LOSS",
-                            highest_high=fill_px,
-                            lowest_low=fill_px,
-                            layer=coin_layers + 1, days_held=0, tp_done=False
-                        )
-                        self.state["positions"][coin] = asdict(new_pos)
-
-                        self.action_feed.append(ActionItem(
-                            action_type="BUY", coin=coin, dollar_amount=total_cost, units=units,
-                            estimated_price=fill_px, stop_loss=sl_price, reason="SIGNAL_QUALIFIED",
-                            notes=f"BUY SIGNAL: Allocate ${total_cost:,.2f} into {coin} (~{units:.4f} units @ ${fill_px:.4f}). Set Initial Stop Loss at ${sl_price:.4f}."
-                        ))
-                    else:
-                        unfilled.append(item_dict)
-
-                self.state["watchlist"] = unfilled
-
-            if wl_mode == "WL_NONE":
-                self.state["watchlist"] = []
-
-        # Mark terminal bar as processed
-        self.state["last_processed_date"] = str(dates[-1].date())
+        # Record last closed bar as processed
+        self.state["last_processed_date"] = last_closed_date_str
         save_state(self.state)
         return self.action_feed, self.state
-
     def _evaluate_current_positions_telemetry(self, grid: MarketGrid, t: int):
         """Read-only evaluation when already up-to-date."""
         for coin, p_dict in self.state["positions"].items():
