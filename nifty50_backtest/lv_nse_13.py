@@ -54,14 +54,14 @@ WORK_DIR_OVERRIDE: Optional[str] = None                          # local testing
 # Holdings you really own (from the Upstox trade register). Added to the ledger once each (by symbol|date|units|price).
 MANUAL_HOLDINGS_ADD: List[Dict[str, Any]] = [
     {"coin": "ADANIGREEN", "units": 6, "entry_price": 1377.80, "entry_date": "2026-07-28"},
-    {"coin": "BPCL", "units": 20, "entry_price": 293.90, "entry_date": "2026-07-28"},
+    {"coin": "BPCL", "units": 20, "entry_price": 293.90, "entry_date": "2026-07-12"},
     {"coin": "CGPOWER", "units": 14, "entry_price": 740.55, "entry_date": "2026-03-13"},
     {"coin": "CHOLAFIN", "units": 4, "entry_price": 1765.60, "entry_date": "2026-09-16"},
     {"coin": "GAIL", "units": 45, "entry_price": 175.78, "entry_date": "2026-06-18"},
     {"coin": "HDBFS", "units": 12, "entry_price": 684.85, "entry_date": "2026-07-29"},
     {"coin": "HUDCO", "units": 38, "entry_price": 208.71, "entry_date": "2026-07-03"},
     {"coin": "ITC", "units": 20, "entry_price": 348.90, "entry_date": "2026-01-02"},
-    {"coin": "IOC", "units": 23, "entry_price": 131.38, "entry_date": "2026-01-02"},
+    {"coin": "IOC", "units": 23, "entry_price": 131.38, "entry_date": "2026-05-18"},
     {"coin": "ITCHOTELS", "units": 48, "entry_price": 164.93, "entry_date": "2026-08-17"},
     {"coin": "JSWENERGY", "units": 15, "entry_price": 515.05, "entry_date": "2026-05-15"},
     {"coin": "MOTILALOFS", "units": 9, "entry_price": 869.30, "entry_date": "2026-07-27"},
