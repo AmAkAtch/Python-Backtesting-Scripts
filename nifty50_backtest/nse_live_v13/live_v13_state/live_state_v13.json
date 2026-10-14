@@ -1,0 +1,1008 @@
+{
+ "schema": 2,
+ "config_hash": "V13.0:956809ad",
+ "last_bar_date": "2026-10-14",
+ "cash": 2000.0,
+ "size_w": 0.03,
+ "positions": [
+  {
+   "id": "P1",
+   "coin": "ADANIGREEN",
+   "entry_date": "2026-07-28",
+   "entry_price": 1377.8,
+   "units": 6.0,
+   "cost_inr": 8300.25,
+   "source": "manual"
+  },
+  {
+   "id": "P2",
+   "coin": "BPCL",
+   "entry_date": "2026-07-28",
+   "entry_price": 293.9,
+   "units": 20.0,
+   "cost_inr": 5908.61,
+   "source": "manual"
+  },
+  {
+   "id": "P3",
+   "coin": "CGPOWER",
+   "entry_date": "2026-03-13",
+   "entry_price": 740.55,
+   "units": 14.0,
+   "cost_inr": 10403.66,
+   "source": "manual"
+  },
+  {
+   "id": "P4",
+   "coin": "CHOLAFIN",
+   "entry_date": "2026-09-16",
+   "entry_price": 1765.6,
+   "units": 4.0,
+   "cost_inr": 7094.42,
+   "source": "manual"
+  },
+  {
+   "id": "P5",
+   "coin": "GAIL",
+   "entry_date": "2026-06-18",
+   "entry_price": 175.78,
+   "units": 45.0,
+   "cost_inr": 7943.13,
+   "source": "manual"
+  },
+  {
+   "id": "P6",
+   "coin": "HDBFS",
+   "entry_date": "2026-07-29",
+   "entry_price": 684.85,
+   "units": 12.0,
+   "cost_inr": 8251.6,
+   "source": "manual"
+  },
+  {
+   "id": "P7",
+   "coin": "HUDCO",
+   "entry_date": "2026-07-03",
+   "entry_price": 208.71,
+   "units": 38.0,
+   "cost_inr": 7964.03,
+   "source": "manual"
+  },
+  {
+   "id": "P8",
+   "coin": "ITC",
+   "entry_date": "2026-01-02",
+   "entry_price": 348.9,
+   "units": 20.0,
+   "cost_inr": 7009.92,
+   "source": "manual"
+  },
+  {
+   "id": "P9",
+   "coin": "IOC",
+   "entry_date": "2026-01-02",
+   "entry_price": 131.38,
+   "units": 23.0,
+   "cost_inr": 3048.94,
+   "source": "manual"
+  },
+  {
+   "id": "P10",
+   "coin": "ITCHOTELS",
+   "entry_date": "2026-08-17",
+   "entry_price": 164.93,
+   "units": 48.0,
+   "cost_inr": 7949.68,
+   "source": "manual"
+  },
+  {
+   "id": "P11",
+   "coin": "JSWENERGY",
+   "entry_date": "2026-05-15",
+   "entry_price": 515.05,
+   "units": 15.0,
+   "cost_inr": 7758.56,
+   "source": "manual"
+  },
+  {
+   "id": "P12",
+   "coin": "MOTILALOFS",
+   "entry_date": "2026-07-27",
+   "entry_price": 869.3,
+   "units": 9.0,
+   "cost_inr": 7856.62,
+   "source": "manual"
+  },
+  {
+   "id": "P13",
+   "coin": "NATCOPHARM",
+   "entry_date": "2026-03-23",
+   "entry_price": 927.55,
+   "units": 8.0,
+   "cost_inr": 7452.84,
+   "source": "manual"
+  },
+  {
+   "id": "P14",
+   "coin": "NATIONALUM",
+   "entry_date": "2026-09-03",
+   "entry_price": 374.0,
+   "units": 14.0,
+   "cost_inr": 5265.84,
+   "source": "manual"
+  },
+  {
+   "id": "P15",
+   "coin": "NHPC",
+   "entry_date": "2026-05-12",
+   "entry_price": 78.5,
+   "units": 67.0,
+   "cost_inr": 5289.37,
+   "source": "manual"
+  },
+  {
+   "id": "P16",
+   "coin": "NTPCGREEN",
+   "entry_date": "2026-05-15",
+   "entry_price": 110.15,
+   "units": 73.0,
+   "cost_inr": 8074.13,
+   "source": "manual"
+  },
+  {
+   "id": "P17",
+   "coin": "PHOENIXLTD",
+   "entry_date": "2026-08-11",
+   "entry_price": 1908.7,
+   "units": 4.0,
+   "cost_inr": 7667.5,
+   "source": "manual"
+  },
+  {
+   "id": "P18",
+   "coin": "TATAPOWER",
+   "entry_date": "2026-04-08",
+   "entry_price": 395.0,
+   "units": 20.0,
+   "cost_inr": 7933.02,
+   "source": "manual"
+  }
+ ],
+ "watchlist": [
+  {
+   "coin": "AEGISLOG",
+   "signal_date": "2026-07-21",
+   "trigger_price": 1383.9000244140625,
+   "shadow_stop": 877.6001776739026,
+   "highest_high": 1528.699951171875,
+   "breakout_quality": 0.4886040415772562,
+   "entry_atr": 81.66126560325159
+  },
+  {
+   "coin": "AJANTPHARM",
+   "signal_date": "2026-07-21",
+   "trigger_price": 3437.50927734375,
+   "shadow_stop": 2800.781900419028,
+   "highest_high": 3796.0,
+   "breakout_quality": 0.2798180093071087,
+   "entry_atr": 102.69798307501357
+  },
+  {
+   "coin": "ANANDRATHI",
+   "signal_date": "2026-07-21",
+   "trigger_price": 2082.699951171875,
+   "shadow_stop": 1726.3082782183058,
+   "highest_high": 2268.39990234375,
+   "breakout_quality": 0.16874607862529942,
+   "entry_atr": 57.482527895736986
+  },
+  {
+   "coin": "ATHERENERG",
+   "signal_date": "2026-07-21",
+   "trigger_price": 1296.699951171875,
+   "shadow_stop": 946.9361965491396,
+   "highest_high": 1744.0,
+   "breakout_quality": 0.25269578148941335,
+   "entry_atr": 57.38125074560247
+  },
+  {
+   "coin": "BAJFINANCE",
+   "signal_date": "2026-07-21",
+   "trigger_price": 1064.0,
+   "shadow_stop": 909.0570271985556,
+   "highest_high": 1176.4000244140625,
+   "breakout_quality": 0.28010305479046177,
+   "entry_atr": 24.99080206474909
+  },
+  {
+   "coin": "BOSCHLTD",
+   "signal_date": "2026-07-21",
+   "trigger_price": 40692.22265625,
+   "shadow_stop": 35539.556648707425,
+   "highest_high": 50000.0,
+   "breakout_quality": 0.18979939466259002,
+   "entry_atr": 837.4842029056631
+  },
+  {
+   "coin": "CGCL",
+   "signal_date": "2026-07-21",
+   "trigger_price": 249.83595275878906,
+   "shadow_stop": 196.04004956587727,
+   "highest_high": 287.45001220703125,
+   "breakout_quality": -0.7362823668862665,
+   "entry_atr": 8.631632373463885
+  },
+  {
+   "coin": "DIVISLAB",
+   "signal_date": "2026-07-21",
+   "trigger_price": 7287.94677734375,
+   "shadow_stop": 6329.985970396621,
+   "highest_high": 9740.0,
+   "breakout_quality": 0.3738391195298984,
+   "entry_atr": 154.50980187768764
+  },
+  {
+   "coin": "ETERNAL",
+   "signal_date": "2026-07-21",
+   "trigger_price": 286.95001220703125,
+   "shadow_stop": 232.9722238159863,
+   "highest_high": 344.3999938964844,
+   "breakout_quality": 0.2689178115994542,
+   "entry_atr": 8.552867126453824
+  },
+  {
+   "coin": "EXIDEIND",
+   "signal_date": "2026-07-21",
+   "trigger_price": 436.6499938964844,
+   "shadow_stop": 366.4928301831188,
+   "highest_high": 496.3999938964844,
+   "breakout_quality": 0.1471785167653104,
+   "entry_atr": 11.210833841432448
+  },
+  {
+   "coin": "GLAND",
+   "signal_date": "2026-07-21",
+   "trigger_price": 2440.661376953125,
+   "shadow_stop": 1953.0885994433138,
+   "highest_high": 3171.0,
+   "breakout_quality": 0.11225135586206444,
+   "entry_atr": 81.34610691927227
+  },
+  {
+   "coin": "HFCL",
+   "signal_date": "2026-07-21",
+   "trigger_price": 207.8358612060547,
+   "shadow_stop": 146.1372796002039,
+   "highest_high": 275.9100036621094,
+   "breakout_quality": -0.02174541528229727,
+   "entry_atr": 10.107689759119172
+  },
+  {
+   "coin": "IKS",
+   "signal_date": "2026-07-21",
+   "trigger_price": 1901.9000244140625,
+   "shadow_stop": 1547.1748190802346,
+   "highest_high": 1970.0,
+   "breakout_quality": 0.08392043272141733,
+   "entry_atr": 57.19761770127265
+  },
+  {
+   "coin": "IPCALAB",
+   "signal_date": "2026-07-21",
+   "trigger_price": 1832.23876953125,
+   "shadow_stop": 1456.307393228105,
+   "highest_high": 2038.0,
+   "breakout_quality": -1.0494894818939917,
+   "entry_atr": 59.25179172949172
+  },
+  {
+   "coin": "JSWINFRA",
+   "signal_date": "2026-07-21",
+   "trigger_price": 348.45001220703125,
+   "shadow_stop": 278.54729625396214,
+   "highest_high": 375.5,
+   "breakout_quality": 0.5432355789019871,
+   "entry_atr": 11.597212250495012
+  },
+  {
+   "coin": "KIRLOSENG",
+   "signal_date": "2026-07-21",
+   "trigger_price": 2217.012451171875,
+   "shadow_stop": 1494.8264480922726,
+   "highest_high": 2444.0,
+   "breakout_quality": -0.29115499598342,
+   "entry_atr": 116.52990626507199
+  },
+  {
+   "coin": "LAURUSLABS",
+   "signal_date": "2026-07-21",
+   "trigger_price": 1558.9000244140625,
+   "shadow_stop": 1307.1110797823878,
+   "highest_high": 2069.199951171875,
+   "breakout_quality": 0.5890995877270985,
+   "entry_atr": 40.74014054669148
+  },
+  {
+   "coin": "LODHA",
+   "signal_date": "2026-07-21",
+   "trigger_price": 1184.2396240234375,
+   "shadow_stop": 929.2107900519318,
+   "highest_high": 1340.2415520455131,
+   "breakout_quality": -0.004837374262326681,
+   "entry_atr": 41.189943896112936
+  },
+  {
+   "coin": "NUVAMA",
+   "signal_date": "2026-07-21",
+   "trigger_price": 1854.0,
+   "shadow_stop": 1471.9437370589217,
+   "highest_high": 2066.0,
+   "breakout_quality": 0.14156822738244046,
+   "entry_atr": 63.573586859196084
+  },
+  {
+   "coin": "NYKAA",
+   "signal_date": "2026-07-21",
+   "trigger_price": 323.5,
+   "shadow_stop": 275.95077591990605,
+   "highest_high": 349.54998779296875,
+   "breakout_quality": 0.13961408138004586,
+   "entry_atr": 7.878905140816562
+  },
+  {
+   "coin": "OFSS",
+   "signal_date": "2026-07-21",
+   "trigger_price": 11620.0,
+   "shadow_stop": 9380.506101610414,
+   "highest_high": 12540.0,
+   "breakout_quality": -0.4994419545313184,
+   "entry_atr": 360.4022416757397
+  },
+  {
+   "coin": "PAYTM",
+   "signal_date": "2026-07-21",
+   "trigger_price": 1347.5,
+   "shadow_stop": 1072.0962402610378,
+   "highest_high": 1855.5,
+   "breakout_quality": -0.05851181582048439,
+   "entry_atr": 42.726412861122924
+  },
+  {
+   "coin": "PHOENIXLTD",
+   "signal_date": "2026-07-21",
+   "trigger_price": 2071.256591796875,
+   "shadow_stop": 1710.5723366288253,
+   "highest_high": 2097.1222812913425,
+   "breakout_quality": -0.106540793564879,
+   "entry_atr": 56.24196355254315
+  },
+  {
+   "coin": "RADICO",
+   "signal_date": "2026-07-21",
+   "trigger_price": 4123.25146484375,
+   "shadow_stop": 3565.880660716617,
+   "highest_high": 4747.0,
+   "breakout_quality": 0.27265512366242284,
+   "entry_atr": 91.12162580810669
+  },
+  {
+   "coin": "REDINGTON",
+   "signal_date": "2026-07-21",
+   "trigger_price": 269.5,
+   "shadow_stop": 214.4621914199417,
+   "highest_high": 419.5,
+   "breakout_quality": -0.46602294858534227,
+   "entry_atr": 9.441582029041664
+  },
+  {
+   "coin": "SONACOMS",
+   "signal_date": "2026-07-21",
+   "trigger_price": 714.5499877929688,
+   "shadow_stop": 610.656516924103,
+   "highest_high": 844.0,
+   "breakout_quality": 0.5270436939934046,
+   "entry_atr": 18.11991662514467
+  },
+  {
+   "coin": "SYRMA",
+   "signal_date": "2026-07-21",
+   "trigger_price": 1339.429931640625,
+   "shadow_stop": 1018.757406293372,
+   "highest_high": 1822.5999755859375,
+   "breakout_quality": -0.17383146333335264,
+   "entry_atr": 51.72138023193274
+  },
+  {
+   "coin": "WELCORP",
+   "signal_date": "2026-07-21",
+   "trigger_price": 1615.800048828125,
+   "shadow_stop": 1261.575159639779,
+   "highest_high": 2900.0,
+   "breakout_quality": 0.525446478961367,
+   "entry_atr": 58.61690973551951
+  },
+  {
+   "coin": "ZYDUSLIFE",
+   "signal_date": "2026-07-21",
+   "trigger_price": 1147.9683837890625,
+   "shadow_stop": 986.9063963386228,
+   "highest_high": 1232.0999755859375,
+   "breakout_quality": 0.3210114032346679,
+   "entry_atr": 25.832716977665825
+  },
+  {
+   "coin": "ACUTAAS",
+   "signal_date": "2026-07-22",
+   "trigger_price": 3674.251708984375,
+   "shadow_stop": 2886.5543810475883,
+   "highest_high": 3690.2396838313616,
+   "breakout_quality": 0.16426714865626027,
+   "entry_atr": 125.9197571015938
+  },
+  {
+   "coin": "DIXON",
+   "signal_date": "2026-07-22",
+   "trigger_price": 14107.1435546875,
+   "shadow_stop": 11223.305878914114,
+   "highest_high": 14988.465235179307,
+   "breakout_quality": -0.9703971566479259,
+   "entry_atr": 468.51962770816823
+  },
+  {
+   "coin": "FEDERALBNK",
+   "signal_date": "2026-07-22",
+   "trigger_price": 354.8377380371094,
+   "shadow_stop": 303.2701303174083,
+   "highest_high": 370.4344787597656,
+   "breakout_quality": 0.6163396714294335,
+   "entry_atr": 8.003911847667478
+  },
+  {
+   "coin": "FLUOROCHEM",
+   "signal_date": "2026-07-23",
+   "trigger_price": 4587.3623046875,
+   "shadow_stop": 3726.0009172631835,
+   "highest_high": 4955.618691060383,
+   "breakout_quality": -0.14799986182999242,
+   "entry_atr": 135.72172706006768
+  },
+  {
+   "coin": "KALYANKJIL",
+   "signal_date": "2026-07-23",
+   "trigger_price": 593.6776123046875,
+   "shadow_stop": 441.76561399299226,
+   "highest_high": 646.3128397837881,
+   "breakout_quality": 0.7663136139294937,
+   "entry_atr": 24.823204144856444
+  },
+  {
+   "coin": "TITAN",
+   "signal_date": "2026-07-24",
+   "trigger_price": 4697.2998046875,
+   "shadow_stop": 4128.012235302393,
+   "highest_high": 5186.7001953125,
+   "breakout_quality": -0.03509777855227232,
+   "entry_atr": 76.93351043509796
+  },
+  {
+   "coin": "M&MFIN",
+   "signal_date": "2026-07-27",
+   "trigger_price": 356.5,
+   "shadow_stop": 272.3510253011483,
+   "highest_high": 415.0,
+   "breakout_quality": -0.5944795208182214,
+   "entry_atr": 14.298221725621243
+  },
+  {
+   "coin": "GLAXO",
+   "signal_date": "2026-07-29",
+   "trigger_price": 2632.60009765625,
+   "shadow_stop": 2226.3072454867897,
+   "highest_high": 3120.699951171875,
+   "breakout_quality": 1.1628926363786198,
+   "entry_atr": 67.67623497692907
+  },
+  {
+   "coin": "IIFL",
+   "signal_date": "2026-07-31",
+   "trigger_price": 607.8499755859375,
+   "shadow_stop": 483.9412642852658,
+   "highest_high": 705.0,
+   "breakout_quality": 0.35037899132560874,
+   "entry_atr": 20.97721543786036
+  },
+  {
+   "coin": "NAUKRI",
+   "signal_date": "2026-07-31",
+   "trigger_price": 1244.050048828125,
+   "shadow_stop": 1011.927345455035,
+   "highest_high": 1391.0,
+   "breakout_quality": -0.13419686884094262,
+   "entry_atr": 36.14075073305886
+  },
+  {
+   "coin": "PPLPHARMA",
+   "signal_date": "2026-07-31",
+   "trigger_price": 196.72000122070312,
+   "shadow_stop": 150.94980754907633,
+   "highest_high": 231.92999267578125,
+   "breakout_quality": 0.2276784175265537,
+   "entry_atr": 7.598417743470552
+  },
+  {
+   "coin": "IDFCFIRSTB",
+   "signal_date": "2026-08-04",
+   "trigger_price": 85.74810028076172,
+   "shadow_stop": 73.14517512457562,
+   "highest_high": 89.61000061035156,
+   "breakout_quality": 0.3419689721132716,
+   "entry_atr": 2.011823979575578
+  },
+  {
+   "coin": "LALPATHLAB",
+   "signal_date": "2026-08-04",
+   "trigger_price": 1900.4000244140625,
+   "shadow_stop": 1530.2386774288548,
+   "highest_high": 2038.5999755859375,
+   "breakout_quality": -0.3183970543328883,
+   "entry_atr": 61.55828177180769
+  },
+  {
+   "coin": "LLOYDSME",
+   "signal_date": "2026-08-06",
+   "trigger_price": 2087.10009765625,
+   "shadow_stop": 1711.75620024096,
+   "highest_high": 2125.0,
+   "breakout_quality": 0.407764112472727,
+   "entry_atr": 61.555435823030656
+  },
+  {
+   "coin": "RRKABEL",
+   "signal_date": "2026-08-06",
+   "trigger_price": 2793.0,
+   "shadow_stop": 2109.2214683080992,
+   "highest_high": 2983.800048828125,
+   "breakout_quality": 1.2576289798655154,
+   "entry_atr": 110.28685995030655
+  },
+  {
+   "coin": "AIIL",
+   "signal_date": "2026-08-10",
+   "trigger_price": 596.5999755859375,
+   "shadow_stop": 453.29840011523976,
+   "highest_high": 596.5499877929688,
+   "breakout_quality": 0.017310614070103425,
+   "entry_atr": 23.105094786730483
+  },
+  {
+   "coin": "CEMPRO",
+   "signal_date": "2026-08-11",
+   "trigger_price": 1266.4000244140625,
+   "shadow_stop": 840.159319762731,
+   "highest_high": 1363.699951171875,
+   "breakout_quality": 1.5013781653964495,
+   "entry_atr": 70.13559358665628
+  },
+  {
+   "coin": "HYUNDAI",
+   "signal_date": "2026-08-12",
+   "trigger_price": 2200.0,
+   "shadow_stop": 1865.5640015896342,
+   "highest_high": 2281.0,
+   "breakout_quality": -0.43590440054693824,
+   "entry_atr": 52.76386283584526
+  },
+  {
+   "coin": "JYOTICNC",
+   "signal_date": "2026-08-12",
+   "trigger_price": 805.0,
+   "shadow_stop": 589.2691075033209,
+   "highest_high": 1134.5999755859375,
+   "breakout_quality": 0.2874617022085101,
+   "entry_atr": 34.78724269414682
+  },
+  {
+   "coin": "IDEA",
+   "signal_date": "2026-08-13",
+   "trigger_price": 13.5,
+   "shadow_stop": 11.262611935903164,
+   "highest_high": 15.789999961853027,
+   "breakout_quality": 1.4679801933960255,
+   "entry_atr": 0.3882884097404485
+  },
+  {
+   "coin": "NEULANDLAB",
+   "signal_date": "2026-08-13",
+   "trigger_price": 22510.0,
+   "shadow_stop": 17427.333341142607,
+   "highest_high": 24225.0,
+   "breakout_quality": -0.5596273691137943,
+   "entry_atr": 854.1397836866762
+  },
+  {
+   "coin": "ABB",
+   "signal_date": "2026-08-14",
+   "trigger_price": 7710.0,
+   "shadow_stop": 6484.225390559964,
+   "highest_high": 7825.0,
+   "breakout_quality": -0.20232104506822216,
+   "entry_atr": 197.7055821677478
+  },
+  {
+   "coin": "APARINDS",
+   "signal_date": "2026-08-14",
+   "trigger_price": 17165.404296875,
+   "shadow_stop": 12087.938346379775,
+   "highest_high": 19265.0,
+   "breakout_quality": -1.2412490774324025,
+   "entry_atr": 782.7813740039558
+  },
+  {
+   "coin": "DEVYANI",
+   "signal_date": "2026-08-14",
+   "trigger_price": 138.50999450683594,
+   "shadow_stop": 103.64592505316779,
+   "highest_high": 155.9499969482422,
+   "breakout_quality": -0.4091349129951443,
+   "entry_atr": 5.621624991424551
+  },
+  {
+   "coin": "ANTHEM",
+   "signal_date": "2026-08-19",
+   "trigger_price": 891.0499877929688,
+   "shadow_stop": 748.6142833422671,
+   "highest_high": 977.5499877929688,
+   "breakout_quality": -0.33217533866340015,
+   "entry_atr": 23.933180106085945
+  },
+  {
+   "coin": "APLAPOLLO",
+   "signal_date": "2026-08-21",
+   "trigger_price": 2131.787841796875,
+   "shadow_stop": 1845.5528243500748,
+   "highest_high": 2272.2467615017363,
+   "breakout_quality": 0.1591721169663746,
+   "entry_atr": 46.311537952888266
+  },
+  {
+   "coin": "MOTHERSON",
+   "signal_date": "2026-08-21",
+   "trigger_price": 169.5800018310547,
+   "shadow_stop": 144.0560291300669,
+   "highest_high": 170.67999267578125,
+   "breakout_quality": -0.3693541857919396,
+   "entry_atr": 4.250641053555238
+  },
+  {
+   "coin": "CHENNPETRO",
+   "signal_date": "2026-08-24",
+   "trigger_price": 1393.5,
+   "shadow_stop": 976.7354111876789,
+   "highest_high": 1677.5,
+   "breakout_quality": -0.008685865537303746,
+   "entry_atr": 69.07493367940664
+  },
+  {
+   "coin": "COFORGE",
+   "signal_date": "2026-08-27",
+   "trigger_price": 1880.0,
+   "shadow_stop": 1590.7405426365685,
+   "highest_high": 2021.199951171875,
+   "breakout_quality": -0.4974167337685572,
+   "entry_atr": 47.44507770604742
+  },
+  {
+   "coin": "NETWEB",
+   "signal_date": "2026-08-27",
+   "trigger_price": 5271.89990234375,
+   "shadow_stop": 3814.83871753838,
+   "highest_high": 5450.10009765625,
+   "breakout_quality": -0.20281693298612766,
+   "entry_atr": 252.44536813897096
+  },
+  {
+   "coin": "KOTAKBANK",
+   "signal_date": "2026-08-28",
+   "trigger_price": 424.20001220703125,
+   "shadow_stop": 376.04644673993874,
+   "highest_high": 445.25,
+   "breakout_quality": 1.0790161703962506,
+   "entry_atr": 7.831219252189821
+  },
+  {
+   "coin": "MOTILALOFS",
+   "signal_date": "2026-08-28",
+   "trigger_price": 1038.0999755859375,
+   "shadow_stop": 854.8660406403559,
+   "highest_high": 1090.25,
+   "breakout_quality": -0.06576168700395159,
+   "entry_atr": 28.89257409026518
+  },
+  {
+   "coin": "IDBI",
+   "signal_date": "2026-09-01",
+   "trigger_price": 90.87999725341797,
+   "shadow_stop": 74.05556160018628,
+   "highest_high": 94.1500015258789,
+   "breakout_quality": -0.7622176146279732,
+   "entry_atr": 2.7813615244470205
+  },
+  {
+   "coin": "MCX",
+   "signal_date": "2026-09-01",
+   "trigger_price": 3400.0,
+   "shadow_stop": 2756.175326046171,
+   "highest_high": 3481.39990234375,
+   "breakout_quality": 0.8623590627215598,
+   "entry_atr": 97.40722122743213
+  },
+  {
+   "coin": "NAVINFLUOR",
+   "signal_date": "2026-09-02",
+   "trigger_price": 8636.0,
+   "shadow_stop": 7216.699863884476,
+   "highest_high": 8949.5,
+   "breakout_quality": -0.2322264412521618,
+   "entry_atr": 223.91937679282648
+  },
+  {
+   "coin": "UNIONBANK",
+   "signal_date": "2026-09-02",
+   "trigger_price": 184.89999389648438,
+   "shadow_stop": 154.4216381472239,
+   "highest_high": 190.75,
+   "breakout_quality": -0.021322997661839746,
+   "entry_atr": 4.690058363350985
+  },
+  {
+   "coin": "CRISIL",
+   "signal_date": "2026-09-07",
+   "trigger_price": 4802.0,
+   "shadow_stop": 4078.0488181918718,
+   "highest_high": 4838.7001953125,
+   "breakout_quality": 0.2318716337311706,
+   "entry_atr": 116.44373900131096
+  },
+  {
+   "coin": "SAILIFE",
+   "signal_date": "2026-09-08",
+   "trigger_price": 1579.5999755859375,
+   "shadow_stop": 1270.730742046915,
+   "highest_high": 1697.0,
+   "breakout_quality": -0.20876197550780373,
+   "entry_atr": 49.817618312745545
+  },
+  {
+   "coin": "BEML",
+   "signal_date": "2026-09-09",
+   "trigger_price": 2093.27490234375,
+   "shadow_stop": 1686.4319016033546,
+   "highest_high": 2142.385861113144,
+   "breakout_quality": -0.21848006194752173,
+   "entry_atr": 65.52365438879444
+  },
+  {
+   "coin": "GESHIP",
+   "signal_date": "2026-10-01",
+   "trigger_price": 1560.0,
+   "shadow_stop": 1288.792669832529,
+   "highest_high": 1577.0,
+   "breakout_quality": 0.5262196864258182,
+   "entry_atr": 41.80763389797916
+  },
+  {
+   "coin": "STLTECH",
+   "signal_date": "2026-10-07",
+   "trigger_price": 1016.7000122070312,
+   "shadow_stop": 719.0995014813061,
+   "highest_high": 1043.5999755859375,
+   "breakout_quality": -0.3721257720309932,
+   "entry_atr": 47.56459653527322
+  }
+ ],
+ "plan": {
+  "made_after_bar": "2026-10-14",
+  "orders": [
+   {
+    "id": "2026-10-14:SELL:BPCL:P2",
+    "side": "SELL",
+    "coin": "BPCL",
+    "pos_id": "P2",
+    "units": 20.0,
+    "est_price": 289.6499938964844,
+    "reason": "SIGNAL_EXIT_TYPE_5",
+    "overdue_since": "2026-07-31"
+   },
+   {
+    "id": "2026-10-14:SELL:CHOLAFIN:P4",
+    "side": "SELL",
+    "coin": "CHOLAFIN",
+    "pos_id": "P4",
+    "units": 4.0,
+    "est_price": 1563.0,
+    "reason": "SIGNAL_EXIT_TYPE_5",
+    "overdue_since": null
+   },
+   {
+    "id": "2026-10-14:SELL:HDBFS:P6",
+    "side": "SELL",
+    "coin": "HDBFS",
+    "pos_id": "P6",
+    "units": 12.0,
+    "est_price": 583.75,
+    "reason": "SIGNAL_EXIT_TYPE_5",
+    "overdue_since": "2026-08-26"
+   },
+   {
+    "id": "2026-10-14:SELL:HUDCO:P7",
+    "side": "SELL",
+    "coin": "HUDCO",
+    "pos_id": "P7",
+    "units": 38.0,
+    "est_price": 164.0500030517578,
+    "reason": "SIGNAL_EXIT_TYPE_5",
+    "overdue_since": "2026-08-04"
+   },
+   {
+    "id": "2026-10-14:SELL:ITC:P8",
+    "side": "SELL",
+    "coin": "ITC",
+    "pos_id": "P8",
+    "units": 20.0,
+    "est_price": 261.5,
+    "reason": "SIGNAL_EXIT_TYPE_5",
+    "overdue_since": "2026-01-07"
+   },
+   {
+    "id": "2026-10-14:SELL:IOC:P9",
+    "side": "SELL",
+    "coin": "IOC",
+    "pos_id": "P9",
+    "units": 23.0,
+    "est_price": 127.80000305175781,
+    "reason": "STOP_LOSS",
+    "overdue_since": "2026-03-20"
+   },
+   {
+    "id": "2026-10-14:SELL:ITCHOTELS:P10",
+    "side": "SELL",
+    "coin": "ITCHOTELS",
+    "pos_id": "P10",
+    "units": 48.0,
+    "est_price": 156.8699951171875,
+    "reason": "SIGNAL_EXIT_TYPE_5",
+    "overdue_since": "2026-08-20"
+   },
+   {
+    "id": "2026-10-14:SELL:JSWENERGY:P11",
+    "side": "SELL",
+    "coin": "JSWENERGY",
+    "pos_id": "P11",
+    "units": 15.0,
+    "est_price": 490.29998779296875,
+    "reason": "BREAKEVEN_SL",
+    "overdue_since": "2026-09-01"
+   },
+   {
+    "id": "2026-10-14:SELL:NATCOPHARM:P13",
+    "side": "SELL",
+    "coin": "NATCOPHARM",
+    "pos_id": "P13",
+    "units": 8.0,
+    "est_price": 782.6500244140625,
+    "reason": "BREAKEVEN_SL",
+    "overdue_since": "2026-06-02"
+   },
+   {
+    "id": "2026-10-14:SELL:NATIONALUM:P14",
+    "side": "SELL",
+    "coin": "NATIONALUM",
+    "pos_id": "P14",
+    "units": 14.0,
+    "est_price": 323.1499938964844,
+    "reason": "SIGNAL_EXIT_TYPE_5",
+    "overdue_since": "2026-10-01"
+   },
+   {
+    "id": "2026-10-14:SELL:NHPC:P15",
+    "side": "SELL",
+    "coin": "NHPC",
+    "pos_id": "P15",
+    "units": 67.0,
+    "est_price": 73.72000122070312,
+    "reason": "SIGNAL_EXIT_TYPE_5",
+    "overdue_since": "2026-06-08"
+   },
+   {
+    "id": "2026-10-14:SELL:NTPCGREEN:P16",
+    "side": "SELL",
+    "coin": "NTPCGREEN",
+    "pos_id": "P16",
+    "units": 73.0,
+    "est_price": 91.72000122070312,
+    "reason": "SIGNAL_EXIT_TYPE_5",
+    "overdue_since": "2026-07-09"
+   },
+   {
+    "id": "2026-10-14:SELL:TATAPOWER:P18",
+    "side": "SELL",
+    "coin": "TATAPOWER",
+    "pos_id": "P18",
+    "units": 20.0,
+    "est_price": 353.0,
+    "reason": "BREAKEVEN_SL",
+    "overdue_since": "2026-06-10"
+   },
+   {
+    "id": "2026-10-14:BUY:TATAELXSI",
+    "side": "BUY",
+    "coin": "TATAELXSI",
+    "units": 1.0,
+    "est_price": 3632.463755129069,
+    "est_cost": 3660.39325235417,
+    "entry_atr": 115.83176804509198,
+    "reason": "SIGNAL",
+    "stop_at_fill": 2914.3067932494987
+   },
+   {
+    "id": "2026-10-14:BUY:KOTAKBANK",
+    "side": "BUY",
+    "coin": "KOTAKBANK",
+    "units": 11.0,
+    "est_price": 438.4052391986589,
+    "est_cost": 4851.805470211281,
+    "entry_atr": 7.831219252189821,
+    "reason": "WATCHLIST",
+    "stop_at_fill": 389.851679835082
+   },
+   {
+    "id": "2026-10-14:BUY:GESHIP",
+    "side": "BUY",
+    "coin": "GESHIP",
+    "units": 3.0,
+    "est_price": 1547.0602515462215,
+    "est_cost": 4670.31253156831,
+    "entry_atr": 41.80763389797916,
+    "reason": "WATCHLIST",
+    "stop_at_fill": 1287.8529213787506
+   },
+   {
+    "id": "2026-10-14:BUY:STLTECH",
+    "side": "BUY",
+    "coin": "STLTECH",
+    "units": 5.0,
+    "est_price": 927.0181676239803,
+    "est_cost": 4664.215356538949,
+    "entry_atr": 47.56459653527322,
+    "reason": "WATCHLIST",
+    "stop_at_fill": 632.1176691052863
+   }
+  ],
+  "starved": false,
+  "watchlist_after": []
+ },
+ "closed_trades": [],
+ "applied_manual_ids": [
+  "ADANIGREEN|2026-07-28|6|1377.8",
+  "BPCL|2026-07-28|20|293.9",
+  "CGPOWER|2026-03-13|14|740.55",
+  "CHOLAFIN|2026-09-16|4|1765.6",
+  "GAIL|2026-06-18|45|175.78",
+  "HDBFS|2026-07-29|12|684.85",
+  "HUDCO|2026-07-03|38|208.71",
+  "ITC|2026-01-02|20|348.9",
+  "IOC|2026-01-02|23|131.38",
+  "ITCHOTELS|2026-08-17|48|164.93",
+  "JSWENERGY|2026-05-15|15|515.05",
+  "MOTILALOFS|2026-07-27|9|869.3",
+  "NATCOPHARM|2026-03-23|8|927.55",
+  "NATIONALUM|2026-09-03|14|374.0",
+  "NHPC|2026-05-12|67|78.5",
+  "NTPCGREEN|2026-05-15|73|110.15",
+  "PHOENIXLTD|2026-08-11|4|1908.7",
+  "TATAPOWER|2026-04-08|20|395.0"
+ ],
+ "applied_cash_ids": [],
+ "applied_remove_ids": [],
+ "next_id": 19
+}

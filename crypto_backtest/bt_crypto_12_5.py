@@ -1,0 +1,3851 @@
+#!/usr/bin/env python3
+"""
+CRYPTO QUANTITATIVE SWING-TRADING FRAMEWORK  --  V12.4-CRYPTO
+==============================================================
+Port of the NSE framework (bt_nse_12, engine V12.4) to the crypto spot market, following PROJECT_LIFECYCLE_REPORT.md.
+The crypto script was still on the V10.2 engine, so every NSE improvement since then is carried over here:
+
+EXECUTION REALISM (NSE V11)
+  * Every signal AND every stop is DECIDED on the close of bar t-1 and FILLED at the open of bar t. A stop breach on
+    bar t's close sets `pending_stop`; the sale happens at bar t+1's open (gaps included). Day-1 stops follow the same rule.
+  * Breakeven stop sits at the true cost-covering exit price (fees + slippage), not entry x 1.002.
+  * Take-profit / partial-exit block removed. DEMA and RMA moving averages removed (kinds allowed: 0=SMA, 1=EMA, 3=WMA).
+  * Costs: median-ADV liquidity (new listings with too little history FAIL the floor instead of passing it), per-bar liquidity-tier
+    slippage + impact, extra slippage on volume-breakout entries (the 6 bps flat assumption was optimistic after a 3x volume spike).
+
+DATA INTEGRITY (NSE V12)
+  * repair_price_artifacts(): spike-and-revert bad prints are rescaled; unadjusted token swaps / redenominations / ticker
+    migrations are rebased. In a 24/7 market the open of a daily bar sits on the previous close, so a large OPEN gap is a data
+    seam, not a market move. Direction test (open and close moved the same way), calm-BTC-day test, manual override dicts.
+  * Delisted coins are liquidated at the last valid close with a haircut instead of a silent total loss.
+  * New listings sit out LISTING_COOLDOWN_BARS bars (initial listing pumps are not a tradable edge).
+
+OBJECTIVE V2 + PROMOTION GATES (NSE V12.x)
+  * Objective V2: per calendar year, strategy TWR minus the BETTER of (BTC buy-and-hold, equal-weight survivor basket of the
+    universe), each year clipped to +/- OBJ_YEAR_EXCESS_CLIP points, averaged; drawdown penalised only beyond BTC's own drawdown.
+  * 3 seeds x N_TRIALS_PER_SEED, shortlist, three disjoint folds, stage-2 neighbourhood + deposit-timing battery,
+    cheap pre-screen of every gate, FULL gate set (placebos + leave-top-5) for the best clean candidates, champion = fewest failing gates.
+  * Gates: continuous-slice OOS vs BTC and vs basket, fresh-start OOS vs BTC, IS/OOS placebo rank, EOT organic-return gate (multi-cut),
+    leave-top-5-out, year concentration, years beating BTC, top-5 trade share, drawdown vs BTC, neighbourhood, timing p10, seed agreement.
+  * Report: gates table, deposit-timing table, missed swings, liquidity-tier breakdown, fee reality check, slippage sweep,
+    drawdown reality check, India VDA tax estimate, search diagnostics.
+
+Crypto-specific adaptations are marked "CRYPTO:" in comments. Calendar: 365 bars per year (24/7), not 248.
+"""
+
+from __future__ import annotations
+
+import os
+import io
+import sys
+import ast
+import copy
+import json
+import time
+import inspect
+import hashlib
+import logging
+import urllib.request
+from pathlib import Path
+from dataclasses import dataclass, field
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from typing import Dict, List, Tuple, Any, Optional, Set
+
+import numpy as np
+import pandas as pd
+import requests
+import optuna
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+
+# ==============================================================================
+# USER CONTROL PANEL
+# ==============================================================================
+
+ENGINE_VERSION: str = "V12.5-CRYPTO"
+UNIVERSE_NAME: str = "TOP_CRYPTO_LIQUID"
+TOP_N_COINS: int = 50                       # top coins by market cap / volume (stablecoins, wrappers, staking derivatives filtered out)
+
+MACRO_INDEX_NAME: str = "BTC"               # regime-filter series
+MACRO_INDEX_TICKER: str = "BTC"
+BENCH_SYMBOL: str = "BTC"                   # literal buy-and-hold benchmark (the "index" in every gate / objective)
+
+FORCE_MACRO_REGIME_FILTER: Optional[bool] = None
+FORCE_TRAIL_STOP: Optional[bool] = None     # Set True to lock trailing stops off (trail_atr_mult=0.0, trail_pct=0.0)
+
+BARS_PER_YEAR: float = 365.0                # CRYPTO: 24/7 market (NSE used 248 days)
+START_YEAR: int = 2017
+QUOTE_CURRENCY: str = "USD"
+INITIAL_CAPITAL: float = 1_000.0
+MONTHLY_CONTRIBUTION: float = 1_000.0
+CASH_ANNUAL_YIELD: float = 0.0              # Deliberately 0: Optuna must not be rewarded for sitting in cash
+MIN_HISTORY_DAYS: int = 300
+WARMUP_BARS: int = 300
+
+# --- Search budget: several independent short studies beat one long one (winner's-curse control)
+SEEDS: List[int] = [42, 1337, 2718]
+N_TRIALS_PER_SEED: int = 500
+N_STARTUP_TRIALS: int = 40
+TOP_K_POSTHOC: int = 25                     # distinct top trials that get the full robustness battery
+
+PARALLEL_DOWNLOAD_WORKERS: int = 8
+FORCE_REFRESH: bool = False
+CACHE_MAX_AGE_HOURS: float = 48.0
+WL_MAX_AGE_BARS: int = 15
+
+# --- Liquidity: MEDIAN daily traded value (USD) over ADV_WINDOW bars. NaN (insufficient history) -> 0, so a new listing FAILS the floor.
+ADV_WINDOW: int = 30
+ADV_MIN_PERIODS: int = 30                    # CRYPTO: = LISTING_COOLDOWN_BARS. A coin has no median ADV (-> 0, fails the floor) until it has 30 live bars,
+                                            #         so new listings cannot be bought during their first month (initial listing pumps are not an edge).
+LIQUIDITY_FLOOR_USD: float = 2_000_000.0    # median 30d quote volume below this = not tradable (every tier)
+# CRYPTO: tiers are assigned PER BAR from the causal median ADV (bar t-1), not from index membership.
+TIER_ADV_LARGE_USD: float = 300_000_000.0   # median ADV >= this -> LARGE
+TIER_ADV_MID_USD: float = 50_000_000.0      # median ADV >= this -> MID, else SMALL
+BRACKET_SLIPPAGE_BPS: Dict[str, float] = {"LARGE": 6.0, "MID": 12.0, "SMALL": 25.0}
+BRACKET_IMPACT_COEF_BPS: Dict[str, float] = {"LARGE": 120.0, "MID": 180.0, "SMALL": 300.0}
+VOL_BREAKOUT_SLIP_MULT: float = 2.0         # entry_type 3 buys INTO a volume spike: base slippage x this (spreads are widest on breakout bars)
+SLIPPAGE_SCALE: float = 1.0                 # global multiplier on every slippage figure (the report sweeps 0.5x / 1x / 2x / 3x)
+SLIPPAGE_SWEEP: Tuple[float, ...] = (0.5, 1.0, 2.0, 3.0)
+
+TRANCHE_FLOOR_USD: float = 50.0             # default; Optuna picks from TRANCHE_FLOOR_CHOICES
+TRANCHE_FLOOR_CHOICES: List[float] = [50.0, 100.0, 150.0]
+DEFAULT_MAX_CONCURRENT_TRANCHES: int = 12
+MAX_POSITION_EQUITY_PCT: float = 0.25       # Hard cap on aggregate allocation per coin at entry
+MAX_ADV_PARTICIPATION: float = 0.015
+
+NEIGHBORHOOD_DROP_LIMIT: float = 0.25
+EOT_EXCESS_WEIGHT: float = 0.30             # Credit only a fraction of terminal-bar unrealized excess CAGR
+
+# --- Objective V2 (annual, survivorship-neutral): each calendar year the strategy must beat the BETTER of (BTC, equal-weight basket).
+DD_PENALTY_WEIGHT: float = 0.25
+MIN_CLOSED_TRADES: int = 40
+OBJ_YEAR_EXCESS_CLIP: float = 75.0          # V12.5: per-year excess is measured in LOG POINTS = 100*ln((1+strategy)/(1+reference)); +/-75 is a factor of ~2.1x either way
+OBJ_SCORE_SCALE: float = 25.0 / OBJ_YEAR_EXCESS_CLIP   # maps the clipped yearly excess onto the NSE score scale (+/-25) so the pipeline's -5 / -10 / -50 thresholds keep their meaning
+OBJ_YEAR_CLIP_SENSITIVITY: Tuple[float, ...] = (50.0, 75.0, 100.0)
+OBJ_MIN_YEAR_BARS: int = 90                 # a (partial) calendar year needs this many bars to count (NSE: 60 of 248)
+
+# --- Execution of stops (V12.5). The NSE convention is NEXT_OPEN: a stop is judged on the CLOSE and sold at the next open. A 24/7 exchange can run a resting
+#     stop-market order instead (INTRADAY): the stop fills the bar the LOW touches it, at min(open, stop) with STOP_MARKET_SLIP_MULT x the normal slippage.
+#     Which one is right depends on how the live bot places stops. The report A/B-tests both for the champion.
+STOP_EXECUTION: str = "NEXT_OPEN"           # "NEXT_OPEN" | "INTRADAY"
+STOP_MARKET_SLIP_MULT: float = 2.0
+
+# --- Universe hygiene (V12.5)
+EXCLUDED_SYMBOLS: Set[str] = {"USD1", "USDS", "FIGR_HELOC", "SUSDS", "SUSDE", "USDG", "USDY", "USDTB", "BUIDL", "USYC", "BFUSD"}   # stablecoins / tokenised funds the list filter missed
+ALLOWED_PROVIDERS: Optional[Set[str]] = {"binance", "bybit", "okx"}   # exchange-sourced candles only; aggregator volume (e.g. Yahoo) is not tradable liquidity. None = allow all
+PEGGED_BAND: float = 0.04                   # a close within +/-4% of its own median for >= PEGGED_SHARE of its bars = stablecoin-like, dropped
+PEGGED_SHARE: float = 0.90
+BASKET_INVESTABLE_ONLY: bool = True         # the survivor basket only holds a coin on days the strategy COULD buy it (median-ADV floor + 30 live bars)
+
+# --- Promotion gates (all must pass for winner.json to be written)
+GATE_MAX_DD_VS_INDEX: float = 1.25
+GATE_PLACEBO_IS_PCT: float = 95.0
+GATE_PLACEBO_OOS_PCT: float = 80.0
+GATE_MAX_EOT_PROFIT_SHARE: float = 0.15
+GATE_MAX_YEAR_PROFIT_SHARE: float = 0.40
+GATE_MIN_SEED_AGREEMENT: int = 2
+GATE_MIN_YEARS_BEATING: float = 0.70        # share of calendar years the strategy must beat BTC (continuous run)
+GATE_MAX_TOP5_TRADE_SHARE: float = 0.50     # lottery guard
+GATE_FRESH_OOS_MUST_BEAT_INDEX: bool = True
+GATE_EOT_MODE: str = "return"               # "return" = organic IS CAGR must beat the survivor basket; "share" = V12.3 dollar-share rule
+FULL_GATE_TOP_N: int = 3                    # cheap-gate-clean candidates that also get the placebo / leave-5 gates before the champion is chosen (0 = off)
+GATE_FRESH_OOS_DD_VS_BASKET: Optional[float] = None   # if set (e.g. 1.5): fresh-start OOS max DD must be <= this multiple of the basket's
+EOT_CUT_BACKSHIFTS: Tuple[int, ...] = (0, 60, 120, 180)   # CRYPTO: bars (NSE: 0/42/84/126 days)
+EOT_MIN_WINDOW_BARS: int = 590              # an earlier IS cut is skipped if the window would be shorter than this (NSE: 400 days)
+
+# --- Data integrity (applied to BTC and every constituent before anything is computed)
+SPIKE_MIN_MOVE: float = 0.50                # CRYPTO: one-bar move that starts a spike-and-revert check (NSE 0.40)
+SPIKE_REVERT_WITHIN: int = 5
+SPIKE_REVERT_TOL: float = 0.30              # CRYPTO: price must be back within 30% of the pre-spike level (NSE 0.15; 3-day moves of 15%+ are routine in alts)
+SPIKE_OPEN_EXPLAINS: float = 0.50           # CRYPTO: a bad print is already wrong at the OPEN. A genuine flash crash opens near the previous close, so it is NOT 'fixed'
+CA_DROP_Q: float = 0.70                     # close/prev-close at or below this, gap-explained, on a calm BTC day => token swap / redenomination / seam
+CA_JUMP_Q: float = 1.90
+CA_GAP_EXPLAINS: float = 0.80               # the OPEN must already sit at the new level (24/7 market: real moves do not gap)
+CA_MARKET_DAY_MAX: float = 0.15             # CRYPTO: a day on which BTC itself moved more than this is never treated as a data seam (NSE 0.06)
+LARGE_MOVE_LOG: float = 0.40                # CRYPTO: moves this big that are NOT rebased are still listed for manual review (NSE 0.30)
+MANUAL_CORPORATE_ACTIONS: Dict[str, List[str]] = {}   # force-rebase: {"SYMBOL": ["YYYY-MM-DD"]}  (e.g. token migrations the rule misses)
+KEEP_AS_REAL_MOVES: Dict[str, List[str]] = {}          # veto auto-rebase of a GENUINE crash/jump: {"LUNA": ["2022-05-12"]}
+DATA_REPAIR_LOG: List[Dict[str, Any]] = []
+LISTING_COOLDOWN_BARS: int = 30             # CRYPTO: documentation constant; enforced through ADV_MIN_PERIODS above
+DELIST_HAIRCUT: float = 0.50                # CRYPTO: a coin whose data ends is liquidated at its last valid close x (1 - haircut)
+PLACEBO_SEEDS_CONDITIONED: int = 100
+PLACEBO_SEEDS_UNCONDITIONED: int = 30
+
+# --- Installment-timing / start-date robustness (contribution lands on bar N of each calendar month)
+TIMING_CONTRIB_OFFSETS: List[int] = [0, 7, 14, 21, 27]     # CRYPTO: calendar days (NSE: trading days 0/5/10/15/20)
+TIMING_START_SHIFTS: List[int] = [0, 30, 60]
+
+# --- Spot exchange fees (taker, both sides). Verify against YOUR exchange's fee tier.
+CRYPTO_EXCHANGE_FEE_RATE: float = 0.0010
+EFFECTIVE_BUY_FEE_RATE: float = CRYPTO_EXCHANGE_FEE_RATE
+EFFECTIVE_SELL_FEE_RATE: float = CRYPTO_EXCHANGE_FEE_RATE
+FLAT_SELL_FIXED_USD: float = 0.0
+
+# --- India VDA tax estimate (report only; ASSUMPTION - verify with a CA). Flat 30% + 4% cess on each profitable transfer,
+#     no set-off of losses against gains, 1% TDS on sales is a pre-payment (information only, not modelled as a cost).
+TAX_VDA_RATE: float = 0.30
+TAX_VDA_CESS: float = 0.04
+TDS_RATE_INFO: float = 0.01
+
+DATA_DIR = Path("data_cache")
+OUTPUT_DIR = Path("output") / f"TOP_{TOP_N_COINS}"
+DATA_DIR.mkdir(parents=True, exist_ok=True)
+OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+
+CURRENT_WINNER_FILE = OUTPUT_DIR / "winner_candidate.json"
+PASTE_FILE = OUTPUT_DIR / "PASTE_INTO_LIVE.txt"
+SANITY_CSV_FILE = OUTPUT_DIR / "DATA_SANITY.csv"
+REPAIRS_CSV_FILE = OUTPUT_DIR / "DATA_REPAIRS.csv"
+CONT_TRADES_FILE = OUTPUT_DIR / "continuous_trades.csv"
+AUDIT_STAMP_FILE = OUTPUT_DIR / "causality_audit.ok"
+FINAL_WINNER_FILE = OUTPUT_DIR / "winner.json"
+REPORT_FILE = OUTPUT_DIR / "WINNER_REPORT.md"
+TRADES_CSV_FILE = OUTPUT_DIR / "winner_trades.csv"
+STUDY_DB = f"sqlite:///{OUTPUT_DIR.resolve() / 'crypto_swing_study_v12.db'}"   # new file: the old V10 study has a different parameter space
+
+# Historical Stress Regimes
+STRESS_WINDOWS: Dict[str, Tuple[str, str]] = {
+    "2018 Crypto Winter":           ("2018-01-08", "2018-12-15"),
+    "2020 COVID Liquidation Crash": ("2020-02-15", "2020-04-15"),
+    "2021 May Deleveraging Crash":  ("2021-05-08", "2021-07-25"),
+    "2022 Terra/Luna & 3AC Crash":  ("2022-05-01", "2022-07-01"),
+    "2022 FTX Insolvency Crisis":   ("2022-11-01", "2022-12-31"),
+}
+
+
+
+# ==============================================================================
+# ==============================================================================
+# CRYPTO NOISE & WRAPPER FILTERING ENGINE
+# ==============================================================================
+
+STABLECOINS: Set[str] = {
+    "USD1", "USDS", "USDG", "FIGR_HELOC",
+    "USDT", "USDC", "BUSD", "DAI", "FDUSD", "TUSD", "USDD", "USDP", "FRAX",
+    "LUSD", "GUSD", "PYUSD", "EURT", "EURS", "USTC", "USDJ", "CUSD", "SUSD",
+    "USDE", "USD0", "CRVUSD", "GHO", "FIRST", "MIM", "FEI", "ALUSD", "RLUSD"
+}
+
+FIAT_COMMODITY_PEGS: Set[str] = {
+    "XAUT", "PAXG", "EUROC", "XSGD", "EURCV"
+}
+
+WRAPPED_TOKEN_NAMES: Set[str] = {
+    "WBTC", "WETH", "WMATIC", "WAVAX", "WBNB", "WSOL", "WFTM", "WTRX", "WKAVA",
+    "WBETH", "WROSE", "WNEAR", "WCELO", "WKLAY", "WBTT", "WGLMR", "WQTUM", "CBBTC"
+}
+
+LIQUID_STAKING_PREFIXES: Tuple[str, ...] = (
+    "ST", "WST", "R", "CB", "ANKR", "MSOL", "SAVAX", "BNSOL", "JITOSOL", "OSOL"
+)
+
+PROTECTED_TICKERS: Set[str] = {
+    "STX", "STORJ", "ROSE", "RENDER", "RUNE", "RVN", "RAD", "REQ", "RLC",
+    "RARE", "RAY", "RON", "RDNT", "RPL", "STEEM", "STRAX", "STRK"
+}
+
+LEVERAGED_SUFFIXES: Tuple[str, ...] = (
+    "UP", "DOWN", "BULL", "BEAR", "2L", "2S", "3L", "3S", "4L", "4S", "5L", "5S"
+)
+
+
+def is_noise_or_wrapper_coin(raw_symbol: str) -> bool:
+    sym = raw_symbol.upper().replace("-USD", "").replace("/USD", "").replace("/USDT", "").strip()
+
+    if sym in STABLECOINS or sym in FIAT_COMMODITY_PEGS or sym in WRAPPED_TOKEN_NAMES:
+        return True
+
+    if any(sym.endswith(suf) for suf in LEVERAGED_SUFFIXES):
+        return True
+
+    if sym.startswith("W") and len(sym) >= 4 and sym[1:] in {
+        "BTC", "ETH", "SOL", "BNB", "AVAX", "ADA", "MATIC", "POL", "DOT", "LINK", "NEAR"
+    }:
+        return True
+
+    if sym not in PROTECTED_TICKERS:
+        for pfx in LIQUID_STAKING_PREFIXES:
+            if sym.startswith(pfx) and len(sym) > len(pfx):
+                base = sym[len(pfx):]
+                if base in {"ETH", "SOL", "MATIC", "AVAX", "DOT", "ADA", "BNB", "ATOM", "NEAR"}:
+                    return True
+
+    return False
+
+
+def filter_crypto_universe(symbols: List[str]) -> List[str]:
+    filtered = []
+    for s in symbols:
+        clean = s.upper().replace("-USD", "").strip()
+        if not is_noise_or_wrapper_coin(clean):
+            filtered.append(clean)
+    seen = set()
+    ordered = []
+    for s in filtered:
+        if s not in seen:
+            seen.add(s)
+            ordered.append(s)
+    return ordered
+
+
+def format_price(px: float) -> str:
+    if not np.isfinite(px):
+        return "$0.00"
+    sign = "-" if px < 0 else ""
+    abs_px = abs(px)
+    if abs_px >= 1.0:
+        return f"{sign}${abs_px:,.2f}"
+    elif abs_px >= 0.01:
+        return f"{sign}${abs_px:,.4f}"
+    else:
+        return f"{sign}${abs_px:.7f}"
+
+
+# ==============================================================================
+# FAST NUMPY INDICATOR KERNELS
+# ==============================================================================
+def shift_1d(arr: np.ndarray, fill_value: float = np.nan) -> np.ndarray:
+    """Non-wrapping causal 1D array shift."""
+    res = np.empty_like(arr)
+    res[0] = fill_value
+    res[1:] = arr[:-1]
+    return res
+
+
+# ==============================================================================
+# FAST NUMPY INDICATOR KERNELS
+# ==============================================================================
+def np_rolling_mean(arr: np.ndarray, window: int) -> np.ndarray:
+    w = max(1, int(window))
+    out = np.full_like(arr, np.nan, dtype=np.float64)
+    if len(arr) < w:
+        return out
+    valid_mask = ~np.isnan(arr)
+    if not np.any(valid_mask):
+        return out
+    first_valid = int(np.argmax(valid_mask))
+    clean = np.where(valid_mask, arr, 0.0)
+    cumsum = np.cumsum(clean)
+    cumsum = np.insert(cumsum, 0, 0.0)
+    vals = (cumsum[w:] - cumsum[:-w]) / float(w)
+    out[w - 1:] = vals
+    out[:first_valid + w - 1] = np.nan
+    return out
+
+
+def np_rolling_max(arr: np.ndarray, window: int) -> np.ndarray:
+    w = max(1, int(window))
+    out = np.full_like(arr, np.nan, dtype=np.float64)
+    n = len(arr)
+    if n < w:
+        return out
+    from numpy.lib.stride_tricks import sliding_window_view
+    valid_mask = ~np.isnan(arr)
+    if not np.any(valid_mask):
+        return out
+    first_valid = int(np.argmax(valid_mask))
+    windows = sliding_window_view(arr, window_shape=w)
+    out[w - 1:] = np.max(windows, axis=-1)
+    out[:first_valid + w - 1] = np.nan
+    return out
+
+
+def np_rolling_std(arr: np.ndarray, window: int) -> np.ndarray:
+    w = max(1, int(window))
+    out = np.full_like(arr, np.nan, dtype=np.float64)
+    if len(arr) < w:
+        return out
+    from numpy.lib.stride_tricks import sliding_window_view
+    valid_mask = ~np.isnan(arr)
+    if not np.any(valid_mask):
+        return out
+    first_valid = int(np.argmax(valid_mask))
+    windows = sliding_window_view(arr, window_shape=w)
+    out[w - 1:] = np.std(windows, axis=-1, ddof=0)
+    out[:first_valid + w - 1] = np.nan
+    return out
+
+
+def np_rolling_median(arr: np.ndarray, window: int, min_periods: int) -> np.ndarray:
+    return pd.Series(arr).rolling(window, min_periods=min_periods).median().values.astype(np.float64)
+
+
+def np_ewm_mean(arr: np.ndarray, span: int) -> np.ndarray:
+    span = max(1, int(span))
+    alpha = 2.0 / (span + 1.0)
+    n = len(arr)
+    out = np.full(n, np.nan, dtype=np.float64)
+    if n == 0:
+        return out
+    valid_mask = ~np.isnan(arr)
+    if not np.any(valid_mask):
+        return out
+    first_valid = int(np.argmax(valid_mask))
+    out[first_valid] = arr[first_valid]
+    for i in range(first_valid + 1, n):
+        val = arr[i]
+        if np.isnan(val):
+            out[i] = out[i - 1]
+        else:
+            out[i] = alpha * val + (1.0 - alpha) * out[i - 1]
+    return out
+
+
+# ==============================================================================
+# CRYPTO SPOT FEE & EXECUTION SLIPPAGE ENGINE (same function signatures as the NSE V12 engine)
+# ==============================================================================
+@dataclass
+class FeeBreakdown:
+    exchange_fee: float = 0.0
+    slippage_cost: float = 0.0
+
+    @property
+    def total_frictions(self) -> float:
+        return self.exchange_fee + self.slippage_cost
+
+
+def compute_buy_cost_audited(gross_usd: float, slip_cost: float) -> Tuple[float, FeeBreakdown]:
+    if gross_usd <= 0:
+        return 0.0, FeeBreakdown()
+    exch = gross_usd * CRYPTO_EXCHANGE_FEE_RATE
+    return gross_usd + exch, FeeBreakdown(exchange_fee=exch, slippage_cost=slip_cost)
+
+
+def compute_sell_proceeds_audited(gross_usd: float, slip_cost: float) -> Tuple[float, FeeBreakdown]:
+    if gross_usd <= 0:
+        return 0.0, FeeBreakdown()
+    exch = gross_usd * CRYPTO_EXCHANGE_FEE_RATE
+    return max(0.0, gross_usd - exch), FeeBreakdown(exchange_fee=exch, slippage_cost=slip_cost)
+
+
+def compute_max_affordable_tranche(cash: float, adv_30d: float, base_bps: float, impact_bps: float) -> float:
+    clean_adv = adv_30d if np.isfinite(adv_30d) else LIQUIDITY_FLOOR_USD
+    adv = max(clean_adv, LIQUIDITY_FLOOR_USD)
+    usable_cash = max(0.0, cash)
+    tranche_guess = usable_cash / (1.0 + EFFECTIVE_BUY_FEE_RATE + base_bps / 10000.0)
+    for _ in range(3):
+        part_rate = min(1.0, max(0.0, tranche_guess / adv))
+        slip_mult = (base_bps + impact_bps * np.sqrt(part_rate)) / 10000.0
+        tranche_guess = usable_cash / (1.0 + EFFECTIVE_BUY_FEE_RATE + slip_mult)
+    return float(np.nan_to_num(tranche_guess * (1.0 - 1e-6), nan=0.0))
+
+
+def breakeven_exit_price(total_cost: float, units: float, slip_mult: float) -> float:
+    """Exit price at which net sell proceeds (after slippage and the exchange fee) == total buy cost."""
+    denom = units * max(1e-6, (1.0 - slip_mult - EFFECTIVE_SELL_FEE_RATE))
+    return (total_cost + FLAT_SELL_FIXED_USD) / max(1e-9, denom)
+
+
+def _buy_fill_audited(tranche_usd: float, ref_open_price: float, slip_mult: float) -> Tuple[float, float, float, FeeBreakdown]:
+    fill_px = ref_open_price * (1.0 + slip_mult)
+    units = tranche_usd / ref_open_price if ref_open_price > 0 else 0.0
+    gross_at_slip = units * fill_px
+    slip_cost = units * (fill_px - ref_open_price)
+    total_cash_cost, fees = compute_buy_cost_audited(gross_at_slip, slip_cost)
+    return fill_px, units, total_cash_cost, fees
+
+
+def _sell_fill_audited(units: float, ref_price: float, slip_mult: float) -> Tuple[float, float, FeeBreakdown]:
+    fill_px = ref_price * (1.0 - slip_mult)
+    gross = units * fill_px
+    slip_cost = units * (ref_price - fill_px)
+    net_proceeds, fees = compute_sell_proceeds_audited(gross, slip_cost)
+    return fill_px, net_proceeds, fees
+
+
+# ==============================================================================
+# MULTI-EXCHANGE DATA INGESTION ENGINE WITH METADATA SIDECARS
+# ==============================================================================
+
+DEFAULT_CRYPTO_LIST: List[str] = [
+    "BTC", "ETH", "SOL", "BNB", "XRP", "ADA", "AVAX", "DOGE", "DOT", "LINK",
+    "NEAR", "LTC", "BCH", "UNI", "APT", "ATOM", "ICP", "FIL", "ETC", "XLM",
+    "RENDER", "HBAR", "AAVE", "INJ", "GRT", "VET", "ALGO", "OP", "ARB", "FTM",
+    "THETA", "SAND", "MANA", "AXS", "FLOW", "EOS", "KAVA", "EGLD", "XTZ", "RUNE"
+]
+
+_HTTP_SESSION = requests.Session()
+_HTTP_SESSION.headers.update({"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"})
+
+
+def _clean_kline_dataframe(df: pd.DataFrame) -> pd.DataFrame:
+    df["date"] = pd.to_datetime(df["date"]).dt.tz_localize(None).dt.normalize()
+    df = df.drop_duplicates(subset=["date"]).sort_values("date").reset_index(drop=True)
+    today_utc = pd.Timestamp.now("UTC").tz_localize(None).floor("D")
+    df = df[df["date"] < today_utc].dropna(subset=["close"])
+    for col in ["open", "high", "low", "close", "volume", "quote_volume"]:
+        df[col] = pd.to_numeric(df[col], errors="coerce")
+
+    # Sanitize invalid ticks & wild daily spikes (>50x intraday gap)
+    df = df[(df["close"] > 0) & (df["open"] > 0) & (df["high"] >= df["low"])]
+    ratio = df["high"] / np.maximum(1e-8, df["low"])
+    df = df[ratio < 50.0]
+
+    return df.set_index("date")
+
+
+def fetch_from_binance(symbol: str, start_year: int) -> Optional[pd.DataFrame]:
+    hosts = ["https://data-api.binance.vision", "https://api.binance.com"]
+    start_ts = int(pd.Timestamp(f"{start_year}-01-01", tz="UTC").timestamp() * 1000)
+    now_ts = int(pd.Timestamp.now("UTC").floor("D").timestamp() * 1000)
+
+    for host in hosts:
+        curr_start = start_ts
+        all_rows = []
+        success = True
+        while curr_start < now_ts:
+            url = f"{host}/api/v3/klines"
+            params = {"symbol": f"{symbol}USDT", "interval": "1d", "startTime": curr_start, "limit": 1000}
+            try:
+                r = _HTTP_SESSION.get(url, params=params, timeout=6)
+                if r.status_code != 200:
+                    success = False
+                    break
+                data = r.json()
+                if not data or not isinstance(data, list):
+                    break
+                all_rows.extend(data)
+                if len(data) < 1000:
+                    break
+                curr_start = data[-1][0] + 86400000
+                time.sleep(0.02)
+            except Exception:
+                success = False
+                break
+        if success and len(all_rows) >= MIN_HISTORY_DAYS:
+            parsed = [[d[0], d[1], d[2], d[3], d[4], d[5], d[7]] for d in all_rows]
+            df = pd.DataFrame(parsed, columns=["date", "open", "high", "low", "close", "volume", "quote_volume"])
+            df["date"] = pd.to_datetime(df["date"], unit="ms", utc=True)
+            return _clean_kline_dataframe(df)
+    return None
+
+
+def fetch_from_bybit(symbol: str) -> Optional[pd.DataFrame]:
+    url = "https://api.bybit.com/v5/market/kline"
+    end_ts = int(pd.Timestamp.now("UTC").timestamp() * 1000)
+    all_rows = []
+
+    for _ in range(12):
+        params = {"category": "spot", "symbol": f"{symbol}USDT", "interval": "D", "end": end_ts, "limit": 1000}
+        try:
+            r = _HTTP_SESSION.get(url, params=params, timeout=6)
+            if r.status_code != 200:
+                break
+            res = r.json().get("result", {}).get("list", [])
+            if not res:
+                break
+            all_rows.extend(res)
+            if len(res) < 1000:
+                break
+            end_ts = int(res[-1][0]) - 1
+            time.sleep(0.02)
+        except Exception:
+            break
+
+    if len(all_rows) >= MIN_HISTORY_DAYS:
+        parsed = [[int(d[0]), float(d[1]), float(d[2]), float(d[3]), float(d[4]), float(d[5]), float(d[6])] for d in all_rows]
+        df = pd.DataFrame(parsed, columns=["date", "open", "high", "low", "close", "volume", "quote_volume"])
+        df["date"] = pd.to_datetime(df["date"], unit="ms", utc=True)
+        return _clean_kline_dataframe(df)
+    return None
+
+
+def fetch_from_okx(symbol: str) -> Optional[pd.DataFrame]:
+    url = "https://www.okx.com/api/v5/market/history-candles"
+    inst_id = f"{symbol}-USDT"
+    all_rows = []
+    after = ""
+
+    for _ in range(30):
+        params = {"instId": inst_id, "bar": "1Dutc", "limit": 100}
+        if after:
+            params["after"] = after
+        try:
+            r = _HTTP_SESSION.get(url, params=params, timeout=6)
+            if r.status_code != 200:
+                break
+            data = r.json().get("data", [])
+            if not data:
+                break
+            all_rows.extend(data)
+            after = data[-1][0]
+            if len(data) < 100:
+                break
+            time.sleep(0.02)
+        except Exception:
+            break
+
+    if len(all_rows) >= MIN_HISTORY_DAYS:
+        parsed = [[int(d[0]), float(d[1]), float(d[2]), float(d[3]), float(d[4]), float(d[5]), float(d[6])] for d in all_rows]
+        df = pd.DataFrame(parsed, columns=["date", "open", "high", "low", "close", "volume", "quote_volume"])
+        df["date"] = pd.to_datetime(df["date"], unit="ms", utc=True)
+        return _clean_kline_dataframe(df)
+    return None
+
+
+def fetch_from_yahoo(symbol: str, start_year: int) -> Optional[pd.DataFrame]:
+    start_ts = int(pd.Timestamp(f"{start_year}-01-01", tz="UTC").timestamp())
+    end_ts = int(pd.Timestamp.now("UTC").timestamp())
+    url = f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}-USD?period1={start_ts}&period2={end_ts}&interval=1d"
+    try:
+        r = _HTTP_SESSION.get(url, timeout=8)
+        if r.status_code != 200:
+            return None
+        res = r.json()["chart"]["result"][0]
+        timestamps = res["timestamp"]
+        q = res["indicators"]["quote"][0]
+        df = pd.DataFrame({
+            "date": pd.to_datetime(timestamps, unit="s", utc=True),
+            "open": q["open"],
+            "high": q["high"],
+            "low": q["low"],
+            "close": q["close"],
+            "volume": q["volume"],
+            "quote_volume": [c * v if c and v else 0.0 for c, v in zip(q["close"], q["volume"])]
+        })
+        cleaned = _clean_kline_dataframe(df)
+        if len(cleaned) >= MIN_HISTORY_DAYS:
+            return cleaned
+    except Exception:
+        pass
+    return None
+
+
+def fetch_single_crypto(symbol: str, start_year: int, refresh: bool) -> Tuple[str, Optional[pd.DataFrame], str]:
+    clean_sym = symbol.upper().replace("-USD", "").replace("/USD", "").replace("/USDT", "").strip()
+    cache_file = DATA_DIR / f"{clean_sym}_1d_from{start_year}.parquet"
+    meta_file = DATA_DIR / f"{clean_sym}_1d_from{start_year}.meta.json"
+
+    if not refresh and cache_file.exists() and meta_file.exists():
+        age_hours = (time.time() - os.path.getmtime(cache_file)) / 3600.0
+        if age_hours < CACHE_MAX_AGE_HOURS:
+            try:
+                with open(meta_file, "r") as mf:
+                    meta = json.load(mf)
+                if meta.get("start_year") == start_year:
+                    df = pd.read_parquet(cache_file)
+                    if len(df) >= MIN_HISTORY_DAYS:
+                        return clean_sym, df, meta.get("provider", "cache")
+            except Exception:
+                pass
+
+    for provider_name, fetch_fn in [
+        ("binance", lambda: fetch_from_binance(clean_sym, start_year)),
+        ("bybit", lambda: fetch_from_bybit(clean_sym)),
+        ("okx", lambda: fetch_from_okx(clean_sym)),
+        ("yahoo", lambda: fetch_from_yahoo(clean_sym, start_year)),
+    ]:
+        try:
+            df = fetch_fn()
+            if df is not None and len(df) >= MIN_HISTORY_DAYS:
+                df.to_parquet(cache_file)
+                with open(meta_file, "w") as mf:
+                    json.dump({
+                        "provider": provider_name, "timestamp": time.time(),
+                        "bars": len(df), "start_year": start_year
+                    }, mf)
+                return clean_sym, df, provider_name
+        except Exception:
+            continue
+
+    return clean_sym, None, "none"
+
+
+def load_universe_constituents(universe_name: str, top_n: int = TOP_N_COINS) -> List[str]:
+    cache_path = DATA_DIR / f"{universe_name.lower()}_top{top_n}_list.json"
+    if cache_path.exists():
+        try:
+            with open(cache_path, "r") as f:
+                data = json.load(f)
+                filtered = filter_crypto_universe(data)
+                if len(filtered) >= min(15, top_n):
+                    return filtered[:top_n]
+        except Exception:
+            pass
+
+    candidates: List[str] = []
+    try:
+        url = "https://api.coingecko.com/api/v3/coins/markets?vs_currency=usd&order=market_cap_desc&per_page=250&page=1"
+        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            api_data = json.loads(resp.read().decode("utf-8"))
+            raw_syms = [coin["symbol"].upper() for coin in api_data]
+            candidates = filter_crypto_universe(raw_syms)
+    except Exception as e:
+        logging.warning(f"CoinGecko constituent discovery unavailable ({e}). Falling back to Binance volume.")
+
+    if len(candidates) < top_n:
+        try:
+            resp = _HTTP_SESSION.get("https://api.binance.com/api/v3/ticker/24hr", timeout=8)
+            if resp.status_code == 200:
+                pairs = []
+                for t in resp.json():
+                    s = t.get("symbol", "")
+                    if s.endswith("USDT"):
+                        pairs.append((s[:-4], float(t.get("quoteVolume", 0.0))))
+                pairs.sort(key=lambda x: x[1], reverse=True)
+                candidates.extend(filter_crypto_universe([p[0] for p in pairs]))
+        except Exception as e:
+            logging.warning(f"Binance volume ranking fallback failed: {e}")
+
+    if len(candidates) < top_n:
+        candidates.extend(filter_crypto_universe(DEFAULT_CRYPTO_LIST))
+
+    seen = set()
+    final_ranked = []
+    for c in candidates:
+        if c not in seen:
+            seen.add(c)
+            final_ranked.append(c)
+
+    chosen = final_ranked[:top_n]
+    with open(cache_path, "w") as f:
+        json.dump(chosen, f)
+    logging.info(f"Loaded Top {len(chosen)} liquid universe constituents.")
+    return chosen
+
+
+
+# ==============================================================================
+# STATIC MARKET GRID & INDICATOR ENGINE
+# ==============================================================================
+@dataclass
+class MarketGrid:
+    symbols: List[str]
+    dates: pd.DatetimeIndex
+    open_mat: np.ndarray
+    high_mat: np.ndarray
+    low_mat: np.ndarray
+    close_mat: np.ndarray
+    volume_mat: np.ndarray
+    atr14_mat: np.ndarray
+    dvol30_mat: np.ndarray
+    adx14_mat: np.ndarray
+    delist_mat: np.ndarray
+    alive_mat: np.ndarray
+    macro_close: np.ndarray
+    macro_open: np.ndarray
+    months_arr: np.ndarray
+    years_arr: np.ndarray
+    bench_close: np.ndarray            # literal BTC buy-and-hold series (same series as the macro regime input)
+    brackets: List[str]                # DISPLAY ONLY: modal liquidity tier per coin (the engine uses the per-bar arrays below)
+    liq_floor: np.ndarray              # (n_syms,) median-ADV floor in USD
+    slip_bps: np.ndarray               # (n_syms, n_bars) CRYPTO: per-bar tier slippage, read at bar t-1
+    impact_bps: np.ndarray             # (n_syms, n_bars) per-bar tier impact coefficient
+
+
+
+class FastIndicators:
+    @staticmethod
+    def moving_average(arr: np.ndarray, length: int, kind: int) -> np.ndarray:
+        # Supported kinds: 0 = SMA, 1 = EMA, 3 = WMA. (DEMA=2 and RMA=4 were removed in V11:
+        # RMA(L) is mathematically EMA(2L-1); DEMA showed no measurable edge.)
+        length = max(2, int(length))
+        if kind == 0:   return np_rolling_mean(arr, length)
+        elif kind == 1: return np_ewm_mean(arr, length)
+        elif kind == 3:
+            valid_mask = ~np.isnan(arr)
+            out = np.full_like(arr, np.nan, dtype=np.float64)
+            if not np.any(valid_mask):
+                return out
+            first_valid = int(np.argmax(valid_mask))
+            n_valid = len(arr) - first_valid
+            if n_valid < length:
+                return out
+            w = np.arange(1, length + 1, dtype=float)
+            w_norm = w / w.sum()
+            clean_tail = arr[first_valid:]
+            conv = np.convolve(clean_tail, w_norm[::-1], mode='full')[:n_valid]
+            conv[:length - 1] = np.nan
+            out[first_valid:] = conv
+            return out
+        raise ValueError(f"Unsupported moving-average kind {kind} (allowed: 0=SMA, 1=EMA, 3=WMA)")
+
+    @staticmethod
+    def atr_1d(h: np.ndarray, l: np.ndarray, c: np.ndarray, length: int = 14) -> np.ndarray:
+        cp = shift_1d(c, fill_value=c[0])
+        tr1 = h - l
+        tr2 = np.abs(h - cp)
+        tr3 = np.abs(l - cp)
+        tr = np.fmax(tr1, np.fmax(tr2, tr3))
+        alpha = 1.0 / max(2, length)
+        span = int(round((2.0 / alpha) - 1.0))
+        return np_ewm_mean(tr, span)
+
+    @staticmethod
+    def adx_1d(h: np.ndarray, l: np.ndarray, c: np.ndarray, length: int = 14) -> np.ndarray:
+        length = max(2, int(length))
+        span = int(round((2.0 * length) - 1.0))
+        up = h - shift_1d(h, fill_value=h[0])
+        down = shift_1d(l, fill_value=l[0]) - l
+        p_dm = np.where((up > down) & (up > 0.0), up, 0.0)
+        m_dm = np.where((down > up) & (down > 0.0), down, 0.0)
+        atr_arr = FastIndicators.atr_1d(h, l, c, length)
+        p_di = 100.0 * np_ewm_mean(p_dm, span) / (atr_arr + 1e-9)
+        m_di = 100.0 * np_ewm_mean(m_dm, span) / (atr_arr + 1e-9)
+        dx = 100.0 * np.abs(p_di - m_di) / (p_di + m_di + 1e-9)
+        return np_ewm_mean(dx, span)
+
+    @staticmethod
+    def rsi_smoothed(c: np.ndarray, length: int, smooth: int) -> np.ndarray:
+        length, smooth = max(2, int(length)), max(1, int(smooth))
+        delta = np.diff(c, prepend=c[0])
+        gain = np.where(delta > 0, delta, 0.0)
+        loss = np.where(delta < 0, -delta, 0.0)
+        span = int(round((2.0 * length) - 1.0))
+        avg_gain = np_ewm_mean(gain, span)
+        avg_loss = np_ewm_mean(loss, span)
+        rs = avg_gain / (avg_loss + 1e-9)
+        rsi = 100.0 - (100.0 / (1.0 + rs))
+        return np_rolling_mean(rsi, smooth)
+
+    @staticmethod
+    def bollinger_bands(c: np.ndarray, length: int, std_mult: float) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+        length = max(2, int(length))
+        mid = np_rolling_mean(c, length)
+        std = np_rolling_std(c, length)
+        return mid + (std_mult * std), mid, mid - (std_mult * std)
+
+
+
+def repair_price_artifacts(df: pd.DataFrame, sym: str, mkt_ret: Optional[pd.Series],
+                           allow_corporate: bool = True) -> Tuple[pd.DataFrame, List[Dict[str, Any]]]:
+    """
+    Exchange/aggregator daily candles can carry two kinds of corrupt history that a trading engine will happily exploit:
+      1. SPIKE-AND-REVERT bad prints (a candle printed at a wrong level for 1-5 bars, then back) -> rescaled onto the surrounding level.
+      2. UNADJUSTED token events (swaps, redenominations, ticker migrations such as MATIC->POL, FTM->S, LUNA->LUNC). Each shows up as a
+         fake -30% to -80% (or +90%) day plus a fake volume spike -> history BEFORE the event is rebased (prices x ratio, volume / ratio).
+    CRYPTO: this is a 24/7 market, so the OPEN of a daily bar sits on the previous close. A move whose OPEN already sits at the new level
+    (and moved the same way as the close) is a data seam, not trading. Genuine crashes (LUNA, FTT) happen INSIDE a bar and are kept.
+    A day on which BTC itself moved more than CA_MARKET_DAY_MAX is never rebased. Anything else large is only LOGGED.
+    Use MANUAL_CORPORATE_ACTIONS to force a rebase and KEEP_AS_REAL_MOVES to veto one.
+    """
+    recs: List[Dict[str, Any]] = []
+    if df is None or len(df) < 10:
+        return df, recs
+    d = df.copy()
+    o = d["open"].values.astype(np.float64).copy()
+    h = d["high"].values.astype(np.float64).copy()
+    l = d["low"].values.astype(np.float64).copy()
+    c = d["close"].values.astype(np.float64).copy()
+    v = d["volume"].values.astype(np.float64).copy() if "volume" in d.columns else np.zeros(len(d))
+    n = len(c)
+    idx = d.index
+
+    def _date(i: int) -> str:
+        return str(pd.Timestamp(idx[i]).date())
+
+    # 1) spike-and-revert
+    with np.errstate(divide="ignore", invalid="ignore"):
+        q = np.r_[1.0, c[1:] / np.where(c[:-1] > 0, c[:-1], np.nan)]
+    cand = np.flatnonzero(np.abs(np.nan_to_num(q, nan=1.0) - 1.0) >= SPIKE_MIN_MOVE)
+    skip_until = -1
+    for i in cand:
+        if i <= skip_until or i < 1 or i >= n - 1 or not np.isfinite(c[i - 1]) or c[i - 1] <= 0:
+            continue
+        if np.isfinite(o[i]) and o[i] > 0:
+            _gap_i = o[i] / c[i - 1] - 1.0
+            if _gap_i * (q[i] - 1.0) <= 0.0 or abs(_gap_i) < SPIKE_OPEN_EXPLAINS * abs(q[i] - 1.0):
+                continue          # CRYPTO (24/7): the open sat on the previous close, so this is a real intraday move, not a bad print
+        for j in range(i, min(n - 1, i + SPIKE_REVERT_WITHIN)):
+            if np.isfinite(c[j + 1]) and abs(c[j + 1] / c[i - 1] - 1.0) <= SPIKE_REVERT_TOL:
+                f = c[i - 1] / c[i]
+                sl = slice(i, j + 1)
+                o[sl] *= f; h[sl] *= f; l[sl] *= f; c[sl] *= f
+                recs.append({"symbol": sym, "date": _date(i), "type": "SPIKE_REVERT_FIXED", "ratio": float(q[i]),
+                             "detail": f"{j - i + 1} bad bar(s) rescaled x{f:.3f}"})
+                skip_until = j + 1
+                break
+
+    # 2) unadjusted corporate actions (chronological; later events never touch earlier-rebased bars twice)
+    if allow_corporate:
+        forced_dates = set(MANUAL_CORPORATE_ACTIONS.get(sym, []))
+        veto_dates = set(KEEP_AS_REAL_MOVES.get(sym, []))
+        with np.errstate(divide="ignore", invalid="ignore"):
+            q_now = np.r_[1.0, c[1:] / np.where(c[:-1] > 0, c[:-1], np.nan)]
+        cand_e = set(np.flatnonzero(np.abs(np.nan_to_num(q_now, nan=1.0) - 1.0) >= LARGE_MOVE_LOG).tolist())
+        cand_e |= {i for i in range(1, n) if _date(i) in forced_dates} if forced_dates else set()
+        for e in sorted(cand_e):
+            if e < 1 or not (np.isfinite(c[e]) and np.isfinite(c[e - 1]) and c[e - 1] > 0 and c[e] > 0):
+                continue
+            qe = c[e] / c[e - 1]
+            mag = abs(qe - 1.0)
+            forced = _date(e) in forced_dates
+            if _date(e) in veto_dates:
+                recs.append({"symbol": sym, "date": _date(e), "type": "LARGE_MOVE_KEPT", "ratio": float(qe),
+                             "detail": "kept by KEEP_AS_REAL_MOVES override"})
+                continue
+            if mag < LARGE_MOVE_LOG and not forced:
+                continue
+            gap = o[e] / c[e - 1] if (np.isfinite(o[e]) and o[e] > 0) else qe
+            same_dir = (gap - 1.0) * (qe - 1.0) > 0.0          # V12.2: the open must have moved the SAME way as the close
+            explained = bool(same_dir and abs(gap - 1.0) >= CA_GAP_EXPLAINS * mag)
+            m_day = 0.0
+            if mkt_ret is not None:
+                try:
+                    m_day = abs(float(mkt_ret.get(pd.Timestamp(idx[e]).normalize(), 0.0)))
+                    m_day = m_day if np.isfinite(m_day) else 0.0
+                except Exception:
+                    m_day = 0.0
+            if forced or ((qe <= CA_DROP_Q or qe >= CA_JUMP_Q) and explained and m_day < CA_MARKET_DAY_MAX):
+                _pc, _nc, _no = float(c[e - 1]), float(c[e]), float(o[e])
+                o[:e] *= qe; h[:e] *= qe; l[:e] *= qe; c[:e] *= qe; v[:e] /= qe
+                recs.append({"symbol": sym, "date": _date(e), "type": "CORP_ACTION_REBASED", "ratio": float(qe),
+                             "detail": f"pre-event prices x{qe:.4f}, volume /{qe:.4f}; prev close {_pc:.2f}, open {_no:.2f}, close {_nc:.2f}" + (" (manual)" if forced else "")})
+            else:
+                recs.append({"symbol": sym, "date": _date(e), "type": "LARGE_MOVE_KEPT", "ratio": float(qe),
+                             "detail": f"{mag * 100:.0f}% move kept (BTC day move {m_day * 100:.1f}%, open-gap explains move: {bool(explained)}"
+                                                  + ("" if (same_dir or abs(gap - 1.0) < 0.05) else "; OPEN AND CLOSE MOVED OPPOSITE WAYS - suspect bar, not rebased") + ")"})
+
+    if any(r["type"] != "LARGE_MOVE_KEPT" for r in recs):
+        d["open"], d["high"], d["low"], d["close"] = o, h, l, c
+        if "volume" in d.columns:
+            d["volume"] = v
+        # CRYPTO: quote_volume (real USD traded) is price-scale invariant under a rebase, so it is left untouched.
+    return d, recs
+
+
+
+
+
+def tier_cost_arrays(dvol: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Per-bar liquidity tier from the causal median ADV. Returns (slippage bps, impact bps, tier code 0=LARGE 1=MID 2=SMALL)."""
+    large = dvol >= TIER_ADV_LARGE_USD
+    mid = (dvol >= TIER_ADV_MID_USD) & (~large)
+    slip = np.where(large, BRACKET_SLIPPAGE_BPS["LARGE"], np.where(mid, BRACKET_SLIPPAGE_BPS["MID"], BRACKET_SLIPPAGE_BPS["SMALL"]))
+    imp = np.where(large, BRACKET_IMPACT_COEF_BPS["LARGE"], np.where(mid, BRACKET_IMPACT_COEF_BPS["MID"], BRACKET_IMPACT_COEF_BPS["SMALL"]))
+    code = np.where(large, 0, np.where(mid, 1, 2))
+    return slip.astype(np.float64), imp.astype(np.float64), code
+
+
+def build_market_universe(universe_name: str, start_year: int, refresh: bool) -> Tuple[MarketGrid, Dict[str, pd.DataFrame], pd.DataFrame, List[Dict[str, Any]]]:
+    symbols = load_universe_constituents(universe_name, top_n=TOP_N_COINS)
+    _, macro_df, macro_prov = fetch_single_crypto(MACRO_INDEX_TICKER, start_year, refresh)
+    if macro_df is None:
+        raise RuntimeError(f"Failed to load crypto macro benchmark: {MACRO_INDEX_TICKER}")
+    logging.info(f"Loaded macro benchmark {MACRO_INDEX_TICKER} from [{macro_prov}] ({len(macro_df)} bars).")
+
+    raw_universe: Dict[str, pd.DataFrame] = {}
+    provider_map: Dict[str, str] = {MACRO_INDEX_TICKER: macro_prov}
+    fetch_symbols = [s for s in symbols if s != MACRO_INDEX_TICKER]
+    with ThreadPoolExecutor(max_workers=PARALLEL_DOWNLOAD_WORKERS) as executor:
+        future_map = {executor.submit(fetch_single_crypto, sym, start_year, refresh): sym for sym in fetch_symbols}
+        for future in as_completed(future_map):
+            sym, df, provider = future.result()
+            if df is not None and len(df) >= MIN_HISTORY_DAYS:
+                raw_universe[sym] = df
+                provider_map[sym] = provider
+    if MACRO_INDEX_TICKER in symbols and len(macro_df) >= MIN_HISTORY_DAYS:
+        raw_universe[MACRO_INDEX_TICKER] = macro_df.copy()      # BTC is also a tradable constituent
+
+    # ---- UNIVERSE HYGIENE (V12.5): the list filter misses new stablecoins / tokenised funds, and aggregator candles carry un-tradable volume ----
+    dropped: List[str] = []
+    for sym_h in list(raw_universe.keys()):
+        if sym_h == MACRO_INDEX_TICKER:
+            continue
+        cl_h = raw_universe[sym_h]["close"].dropna()
+        why = ""
+        if sym_h in EXCLUDED_SYMBOLS:
+            why = "excluded list"
+        elif ALLOWED_PROVIDERS is not None and provider_map.get(sym_h, "unknown") not in ALLOWED_PROVIDERS:
+            why = f"provider '{provider_map.get(sym_h, 'unknown')}' is not an exchange feed"
+        elif len(cl_h) > 30 and float(np.mean(np.abs(cl_h.values / max(1e-12, float(np.median(cl_h.values))) - 1.0) <= PEGGED_BAND)) >= PEGGED_SHARE:
+            why = "pegged asset (stablecoin-like price)"
+        if why:
+            dropped.append(f"{sym_h} ({why})")
+            raw_universe.pop(sym_h, None)
+    if dropped:
+        logging.info(f"Universe hygiene: dropped {len(dropped)} symbols: " + "; ".join(dropped))
+
+    # ---- DATA INTEGRITY: repair BTC (benchmark + regime) and every constituent BEFORE any indicator is computed ----
+    DATA_REPAIR_LOG.clear()
+    macro_df, r_m = repair_price_artifacts(macro_df, MACRO_INDEX_TICKER, None, allow_corporate=False)
+    mkt_ret = macro_df["close"].pct_change()
+    mkt_ret.index = pd.DatetimeIndex(mkt_ret.index).normalize()
+    all_recs: List[Dict[str, Any]] = list(r_m)
+    for sym_r in list(raw_universe.keys()):
+        if sym_r == MACRO_INDEX_TICKER:
+            raw_universe[sym_r] = macro_df.copy()               # the repaired BTC series, so the traded BTC equals the benchmark BTC
+            continue
+        raw_universe[sym_r], recs_r = repair_price_artifacts(raw_universe[sym_r], sym_r, mkt_ret)
+        all_recs.extend(recs_r)
+    DATA_REPAIR_LOG.extend(all_recs)
+    try:
+        pd.DataFrame(all_recs).to_csv(REPAIRS_CSV_FILE, index=False)
+    except Exception:
+        pass
+    n_fix = sum(1 for r in all_recs if r["type"] == "SPIKE_REVERT_FIXED")
+    n_ca = sum(1 for r in all_recs if r["type"] == "CORP_ACTION_REBASED")
+    n_kept = sum(1 for r in all_recs if r["type"] == "LARGE_MOVE_KEPT")
+    logging.info(f"Data integrity: {n_fix} spike-and-revert bad prints fixed, {n_ca} unadjusted token events rebased, "
+                 f"{n_kept} large moves kept for manual review (see {REPAIRS_CSV_FILE.name}).")
+
+    master_dates = pd.DatetimeIndex(sorted(macro_df.index.unique())).normalize()
+    macro_df = macro_df.reindex(master_dates).ffill().dropna(subset=["close"])
+    bench_close = macro_df["close"].reindex(master_dates).ffill().bfill().values.astype(np.float64)
+
+    valid_symbols = sorted(raw_universe.keys())
+    n_syms, n_bars = len(valid_symbols), len(master_dates)
+
+    open_mat = np.full((n_syms, n_bars), np.nan, dtype=np.float64)
+    high_mat = np.full((n_syms, n_bars), np.nan, dtype=np.float64)
+    low_mat = np.full((n_syms, n_bars), np.nan, dtype=np.float64)
+    close_mat = np.full((n_syms, n_bars), np.nan, dtype=np.float64)
+    vol_mat = np.zeros((n_syms, n_bars), dtype=np.float64)
+    atr14_mat = np.zeros((n_syms, n_bars), dtype=np.float64)
+    adx14_mat = np.zeros((n_syms, n_bars), dtype=np.float64)
+    dvol30_mat = np.zeros((n_syms, n_bars), dtype=np.float64)
+    delist_mat = np.zeros((n_syms, n_bars), dtype=bool)
+    alive_mat = np.zeros((n_syms, n_bars), dtype=bool)
+    slip_mat = np.zeros((n_syms, n_bars), dtype=np.float64)
+    impact_mat = np.zeros((n_syms, n_bars), dtype=np.float64)
+    brackets: List[str] = []
+
+    provenance_records = []
+    universe: Dict[str, pd.DataFrame] = {}
+
+    for i, sym in enumerate(valid_symbols):
+        df = raw_universe[sym]
+        reindexed = df.reindex(master_dates)
+        raw_close = reindexed["close"].copy()
+
+        first_idx, last_idx = df.index.min(), df.index.max()
+        is_missing = raw_close.isna()
+        trailing_missing_count = int((is_missing[::-1].cumprod()[::-1]).astype(int).sum())
+        has_ever_traded = (~is_missing).cumsum() > 0
+        is_delisted_perm = (is_missing[::-1].cumprod()[::-1].astype(bool) & has_ever_traded & (trailing_missing_count >= 20)).values
+
+        reindexed["alive"] = ~is_missing
+        reindexed["close"] = reindexed["close"].ffill()
+        reindexed["open"] = reindexed["open"].ffill()
+        reindexed["high"] = reindexed["high"].ffill()
+        reindexed["low"] = reindexed["low"].ffill()
+        reindexed["volume"] = reindexed["volume"].fillna(0.0)
+
+        h_arr = reindexed["high"].values
+        l_arr = reindexed["low"].values
+        c_arr = reindexed["close"].values
+
+        atr14 = FastIndicators.atr_1d(h_arr, l_arr, c_arr, 14)
+        adx14 = FastIndicators.adx_1d(h_arr, l_arr, c_arr, 14)
+
+        qv = reindexed["quote_volume"].values if "quote_volume" in reindexed else (c_arr * reindexed["volume"].values)
+        # Median (not mean): a single volume-spike day cannot make an illiquid coin look liquid.
+        # NaN (fewer than ADV_MIN_PERIODS live bars = a new listing) -> 0, so the coin FAILS the floor until history exists.
+        dvol30 = np_rolling_median(qv, ADV_WINDOW, ADV_MIN_PERIODS)
+        dvol30 = np.nan_to_num(dvol30, nan=0.0)
+        s_bps, i_bps, tier_code = tier_cost_arrays(dvol30)
+
+        open_mat[i, :] = reindexed["open"].values
+        high_mat[i, :] = h_arr
+        low_mat[i, :] = l_arr
+        close_mat[i, :] = c_arr
+        vol_mat[i, :] = reindexed["volume"].values
+        atr14_mat[i, :] = np.nan_to_num(atr14, nan=0.0)
+        adx14_mat[i, :] = np.nan_to_num(adx14, nan=0.0)
+        dvol30_mat[i, :] = dvol30
+        delist_mat[i, :] = is_delisted_perm
+        alive_mat[i, :] = (~is_missing).values
+        slip_mat[i, :] = s_bps
+        impact_mat[i, :] = i_bps
+        universe[sym] = reindexed
+
+        live_codes = tier_code[(~is_missing).values & (dvol30 > 0)]
+        modal = int(np.bincount(live_codes, minlength=3).argmax()) if len(live_codes) else 2
+        brackets.append(("LARGE", "MID", "SMALL")[modal])
+
+        both_alive = (~is_missing).values[1:] & (~is_missing).values[:-1]
+        rets_1d = np.where(both_alive, np.abs(c_arr[1:] / np.maximum(1e-9, c_arr[:-1]) - 1.0), 0.0)
+        max_move_i = int(np.argmax(rets_1d)) if len(rets_1d) else 0
+        provenance_records.append({
+            "symbol": sym, "bracket": brackets[i], "provider": provider_map.get(sym, "unknown"),
+            "first_date": str(first_idx.date()), "last_date": str(last_idx.date()),
+            "total_bars": len(df), "is_delisted": bool(is_delisted_perm[-1]) if len(is_delisted_perm) else False,
+            "max_1d_move_pct": float(rets_1d[max_move_i] * 100.0) if len(rets_1d) else 0.0,
+            "max_1d_move_date": str(master_dates[max_move_i + 1].date()) if len(rets_1d) else "",
+            "median_dvol_musd": float(np.nanmedian(dvol30[dvol30 > 0]) / 1e6) if np.any(dvol30 > 0) else 0.0,
+        })
+
+    grid = MarketGrid(
+        symbols=valid_symbols, dates=master_dates,
+        open_mat=open_mat, high_mat=high_mat, low_mat=low_mat, close_mat=close_mat, volume_mat=vol_mat,
+        atr14_mat=atr14_mat, dvol30_mat=dvol30_mat, adx14_mat=adx14_mat,
+        delist_mat=delist_mat, alive_mat=alive_mat,
+        macro_close=macro_df["close"].values, macro_open=macro_df["open"].values,
+        months_arr=master_dates.month.values, years_arr=master_dates.year.values,
+        bench_close=bench_close, brackets=brackets,
+        liq_floor=np.full(n_syms, LIQUIDITY_FLOOR_USD, dtype=np.float64),
+        slip_bps=slip_mat, impact_bps=impact_mat
+    )
+    return grid, universe, macro_df, provenance_records
+
+
+
+# ==============================================================================
+# COMPILE SIGNALS & FUNNEL ATTRIBUTES
+# ==============================================================================
+def compile_signals_fast(grid: MarketGrid, p: Dict[str, Any]) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    n_syms, n_bars = grid.close_mat.shape
+
+    use_macro = p.get("use_market_macro_system", False)
+    if use_macro:
+        macro_ma = FastIndicators.moving_average(grid.macro_close, p["macro_ma_len"], p["macro_ma_type"])
+        macro_ok = (~np.isnan(macro_ma)) & (grid.macro_close > macro_ma)
+    else:
+        macro_ok = np.ones(n_bars, dtype=bool)
+
+    raw_signal_mat = np.zeros((n_syms, n_bars), dtype=bool)
+    entry_mat = np.zeros((n_syms, n_bars), dtype=bool)
+    exit_mat = np.zeros((n_syms, n_bars), dtype=bool)
+    state_mat = np.zeros((n_syms, n_bars), dtype=bool)
+
+    et, xt = p["entry_type"], p["exit_type"]
+    adx_t = p.get("adx_thresh", 0.0)
+
+    for i in range(n_syms):
+        c_arr = grid.close_mat[i, :]
+        o_arr = grid.open_mat[i, :]
+        h_arr = grid.high_mat[i, :]
+        v_arr = grid.volume_mat[i, :]
+        raw_entry = np.zeros(n_bars, dtype=bool)
+        state_entry = np.zeros(n_bars, dtype=bool)
+
+        if et == 0:
+            ma = FastIndicators.moving_average(c_arr, p["entry_ma_len"], p["entry_ma_type"])
+            raw_entry = (~np.isnan(ma)) & (c_arr > ma)
+            state_entry = raw_entry
+        elif et == 1:
+            rf = FastIndicators.rsi_smoothed(c_arr, p["rsi_f_len"], p["rsi_f_smt"])
+            rs = FastIndicators.rsi_smoothed(c_arr, p["rsi_s_len"], p["rsi_s_smt"])
+            raw_entry = (~np.isnan(rf)) & (~np.isnan(rs)) & (rf > rs) & (shift_1d(rf) <= shift_1d(rs))
+            if p.get("use_rsi_trend_filter", False):
+                rma = FastIndicators.moving_average(c_arr, p["rsi_trend_ma_len"], p["rsi_trend_ma_type"])
+                raw_entry = raw_entry & (~np.isnan(rma)) & (c_arr > rma)
+                state_entry = (~np.isnan(rf)) & (~np.isnan(rs)) & (rf > rs) & (~np.isnan(rma)) & (c_arr > rma)
+            else:
+                state_entry = (~np.isnan(rf)) & (~np.isnan(rs)) & (rf > rs)
+        elif et == 2:
+            s_ma = FastIndicators.moving_average(c_arr, p["xover_short_len"], p["xover_short_type"])
+            l_ma = FastIndicators.moving_average(c_arr, p["xover_long_len"], p["xover_long_type"])
+            raw_entry = (~np.isnan(s_ma)) & (~np.isnan(l_ma)) & (s_ma > l_ma) & (shift_1d(s_ma) <= shift_1d(l_ma))
+            state_entry = (~np.isnan(s_ma)) & (~np.isnan(l_ma)) & (s_ma > l_ma)
+        elif et == 3:
+            v_shifted = shift_1d(v_arr)
+            vma = np_rolling_mean(v_shifted, int(p["vol_ma_len"]))
+            h_shifted = shift_1d(h_arr)
+            hhv = np_rolling_max(h_shifted, int(p["price_lookback"]))
+            body = c_arr - o_arr
+            raw_entry = (~np.isnan(vma)) & (~np.isnan(hhv)) & (v_arr > (p["vol_mult"] * vma)) & (c_arr > hhv) & (body >= (p["body_atr_mult"] * grid.atr14_mat[i, :]))
+            base_ma = FastIndicators.moving_average(c_arr, int(p["price_lookback"]), 0)
+            state_entry = (~np.isnan(base_ma)) & (c_arr > base_ma)
+        elif et == 4:
+            b_up, b_mid, _ = FastIndicators.bollinger_bands(c_arr, p["bb_entry_len"], p["bb_entry_std"])
+            raw_entry = (~np.isnan(b_up)) & (c_arr > b_up) & (shift_1d(c_arr) <= shift_1d(b_up))
+            state_entry = (~np.isnan(b_mid)) & (c_arr > b_mid)
+
+        raw_signal_mat[i, :] = raw_entry & grid.alive_mat[i, :]
+        liq_ok = grid.dvol30_mat[i, :] >= max(float(grid.liq_floor[i]), 1.0)
+        adx_ok = (grid.adx14_mat[i, :] >= adx_t) if adx_t > 0.0 else True
+
+        entry_mat[i, :] = raw_entry & liq_ok & macro_ok & adx_ok & grid.alive_mat[i, :]
+        state_mat[i, :] = state_entry & liq_ok & macro_ok & adx_ok & grid.alive_mat[i, :]
+
+        if xt == 3:
+            ma_val = FastIndicators.moving_average(c_arr, p["exit_ma_len"], p["exit_ma_type"])
+            exit_mat[i, :] = (~np.isnan(ma_val)) & (c_arr < ma_val)
+        elif xt == 4:
+            rf = FastIndicators.rsi_smoothed(c_arr, p["exit_rsi_f_len"], p["exit_rsi_f_smt"])
+            rs = FastIndicators.rsi_smoothed(c_arr, p["exit_rsi_s_len"], p["exit_rsi_s_smt"])
+            exit_mat[i, :] = (~np.isnan(rf)) & (~np.isnan(rs)) & (rf < rs)
+        elif xt == 5:
+            s_ma = FastIndicators.moving_average(c_arr, p["exit_xover_short_len"], p["exit_xover_short_type"])
+            l_ma = FastIndicators.moving_average(c_arr, p["exit_xover_long_len"], p["exit_xover_long_type"])
+            exit_mat[i, :] = (~np.isnan(s_ma)) & (~np.isnan(l_ma)) & (s_ma < l_ma)
+        elif xt == 6:
+            v_shifted = shift_1d(v_arr)
+            vma = np_rolling_mean(v_shifted, int(p["exit_vol_ma_len"]))
+            exit_mat[i, :] = (~np.isnan(vma)) & (v_arr > (p["exit_vol_mult"] * vma)) & (c_arr < o_arr)
+        elif xt == 7:
+            _, b_mid, _ = FastIndicators.bollinger_bands(c_arr, p["bb_exit_len"], 2.0)
+            exit_mat[i, :] = (~np.isnan(b_mid)) & (c_arr < b_mid)
+
+    return raw_signal_mat, entry_mat, exit_mat, macro_ok, state_mat
+
+
+# ==============================================================================
+# EXECUTION & FORENSICS ENGINE
+# ==============================================================================
+@dataclass
+class Tranche:
+    tid: int
+    coin: str
+    coin_idx: int
+    entry_bar: int
+    entry_date: pd.Timestamp
+    entry_price: float
+    initial_units: float
+    units: float
+    cost_usd: float
+    entry_atr: float
+    current_sl: float
+    stop_reason: str
+    highest_high: float
+    lowest_low: float
+    peak_bar: int
+    trough_bar: int
+    layer: int
+    be_price: float = 0.0
+    pending_stop: bool = False
+    pending_reason: str = ""
+    from_watchlist: bool = False
+    wait_days: int = 0
+    proceeds: float = 0.0
+    fee_acc: FeeBreakdown = field(default_factory=FeeBreakdown)
+
+
+def _accumulate_fees(dst: FeeBreakdown, src: FeeBreakdown) -> None:
+    dst.exchange_fee += src.exchange_fee
+    dst.slippage_cost += src.slippage_cost
+
+
+class BacktestEngine:
+    """
+    Execution conventions (V11):
+      * Every signal AND every stop is DECIDED on the close of bar t-1 and FILLED at the open of bar t.
+        (Previously stops filled at the same bar's close, which is not achievable in live trading.)
+      * A stop-loss breach on bar t's close therefore sets `pending_stop`; the position is sold at bar t+1's open,
+        gaps included.
+      * Breakeven stops sit at the true cost-covering exit price, not entry x 1.002.
+      * Take-profit / partial exits were removed in V11.
+    """
+    def __init__(self, params: Dict[str, Any]):
+        self.p = params
+
+    def run_interval(self, grid: MarketGrid, raw_signal_mat: np.ndarray, entry_mat: np.ndarray,
+                     exit_mat: np.ndarray, macro_ok: np.ndarray,
+                     start_bar: int, end_bar: int, active_symbols_mask: Optional[np.ndarray] = None,
+                     state_mat: Optional[np.ndarray] = None, contrib_offset: int = 0,
+                     record_signals: bool = False) -> Dict[str, Any]:
+        assert start_bar >= 1, "start_bar must be >= 1 for causal lookback."
+        p = self.p
+        dates = grid.dates
+        max_holding_bars = p.get("max_holding_bars", 20)
+        max_slots = p.get("max_concurrent_tranches", DEFAULT_MAX_CONCURRENT_TRANCHES)
+        be_trigger_mult = p.get("be_trigger_atr", 0.0)
+        macro_active_exit = p.get("macro_active_exit", False)
+        adx_t = p.get("adx_thresh", 0.0)
+        floor_usd = float(p.get("tranche_floor", TRANCHE_FLOOR_USD))
+        sl_mult_p = p.get("sl_mult", 3.0)
+
+        active_state_mat = state_mat if state_mat is not None else entry_mat
+
+        n_syms = len(grid.symbols)
+        cash = INITIAL_CAPITAL
+        total_inflow = INITIAL_CAPITAL
+        live_tranches: List[Tranche] = []
+        watchlist: List[Dict[str, Any]] = []
+        closed_trades: List[Dict[str, Any]] = []
+
+        n_interval = end_bar - start_bar
+        active_capital_curve = np.zeros(n_interval, dtype=np.float64)
+        total_equity_curve = np.zeros(n_interval, dtype=np.float64)
+        twr_curve = np.zeros(n_interval, dtype=np.float64)
+        concurrency_hist = np.zeros(max_slots + 1, dtype=np.int64)
+
+        tid_counter = 0
+        sig_id_counter = 0
+        sig_meta: Dict[int, Tuple[int, int]] = {}
+        sig_outcome: Dict[int, str] = {}
+
+        funnel_dispositions = {
+            "raw_triggers": 0, "macro_blocked": 0, "liquidity_blocked": 0,
+            "adx_blocked": 0, "pyramid_blocked": 0, "revalidation_dropped": 0,
+            "slot_saturated_dropped": 0, "cash_starved_dropped": 0,
+            "risk_cap_dropped": 0, "expired_unfilled": 0, "executed_fills": 0
+        }
+
+        binding_stats = {"tranche_ceiling": 0, "liquidity_cap": 0, "equity_slot": 0, "tranche_floor": 0, "cash_constrained": 0}
+        max_pyramid = p.get("max_pyramid_layers", 1)
+        trail_mult = p.get("trail_atr_mult", 0.0)
+        trail_pct_mult = (1.0 - (p.get("trail_pct", 10.0) / 100.0))
+        xt = p["exit_type"]
+        wl_mode = p.get("wl_mode", "WL_NONE")
+
+        entry_slip_mult = VOL_BREAKOUT_SLIP_MULT if int(p["entry_type"]) == 3 else 1.0
+
+        def _slip(c_i: int, part_rate: float, bar: int, mult: float = 1.0) -> float:
+            # CRYPTO: tier slippage/impact are read at the signal bar (bar-1, causal). mult>1 only for volume-breakout ENTRIES.
+            b = max(0, bar)
+            return SLIPPAGE_SCALE * mult * (grid.slip_bps[c_i, b] + grid.impact_bps[c_i, b] * np.sqrt(part_rate)) / 10000.0
+
+        def _set_outcome(item: Dict[str, Any], outcome: str) -> None:
+            if record_signals:
+                sig_outcome[item["sig_id"]] = outcome
+
+        current_twr = 1.0
+        prev_equity = cash
+        peak_single_stock_pct = 0.0
+        month_day = 0
+        contrib_due = False
+
+        for idx, t in enumerate(range(start_bar, end_bar)):
+            curr_date = dates[t]
+            inflow_today = 0.0
+
+            # 0. Monthly Systematic Inflow (lands on trading day `contrib_offset` of each month; 0 = first)
+            if t > start_bar:
+                if grid.months_arr[t] != grid.months_arr[t - 1]:
+                    if contrib_due:   # previous month was too short to reach the offset day: deposit late
+                        cash += MONTHLY_CONTRIBUTION
+                        total_inflow += MONTHLY_CONTRIBUTION
+                        inflow_today += MONTHLY_CONTRIBUTION
+                    contrib_due = True
+                    month_day = 0
+                else:
+                    month_day += 1
+                if contrib_due and month_day >= contrib_offset:
+                    cash += MONTHLY_CONTRIBUTION
+                    total_inflow += MONTHLY_CONTRIBUTION
+                    inflow_today += MONTHLY_CONTRIBUTION
+                    contrib_due = False
+
+            if CASH_ANNUAL_YIELD > 0.0:
+                cash += cash * (CASH_ANNUAL_YIELD / BARS_PER_YEAR)
+
+            # 1. Delisting Guard
+            surviving_tranches = []
+            for tr in live_tranches:
+                if grid.delist_mat[tr.coin_idx, t]:
+                    # CRYPTO: the coin's data ended. Liquidate at the last valid close less DELIST_HAIRCUT (no fee/slippage model exists for a dead market).
+                    px_last = grid.close_mat[tr.coin_idx, t]
+                    liq_proceeds = tr.units * px_last * (1.0 - DELIST_HAIRCUT) if (np.isfinite(px_last) and px_last > 0) else 0.0
+                    cash += liq_proceeds
+                    tr.proceeds += liq_proceeds
+                    pnl = tr.proceeds - tr.cost_usd
+                    vwap_exit = tr.proceeds / tr.initial_units if tr.initial_units > 0 else 0.0
+                    closed_trades.append({
+                        "coin": tr.coin, "pnl": pnl, "ret": pnl / tr.cost_usd if tr.cost_usd > 0 else 0.0,
+                        "reason": "DELISTED", "bars": t - tr.entry_bar, "bars_to_peak": tr.peak_bar - tr.entry_bar,
+                        "mfe_pct": ((tr.highest_high - tr.entry_price) / tr.entry_price) * 100.0,
+                        "mae_pct": ((tr.lowest_low - tr.entry_price) / tr.entry_price) * 100.0,
+                        "entry_date": tr.entry_date, "exit_date": curr_date, "exit_idx": idx,
+                        "entry_price": tr.entry_price, "exit_price": vwap_exit,
+                        "cost_usd": tr.cost_usd, "proceeds": tr.proceeds,
+                        "frictions": tr.fee_acc, "from_watchlist": tr.from_watchlist,
+                    })
+                else:
+                    surviving_tranches.append(tr)
+            live_tranches = surviving_tranches
+
+            # 2. Position management: decide on close(t-1) info, fill at open(t)
+            macro_bear_confirmed = False
+            if macro_active_exit and t >= 3:
+                macro_bear_confirmed = (not macro_ok[t - 1]) and (not macro_ok[t - 2]) and (not macro_ok[t - 3])
+
+            surviving_tranches = []
+            for tr in live_tranches:
+                c_i = tr.coin_idx
+
+                if not grid.alive_mat[c_i, t]:
+                    surviving_tranches.append(tr)
+                    continue
+
+                adv = max(grid.dvol30_mat[c_i, t - 1], LIQUIDITY_FLOOR_USD)
+                o_bar = grid.open_mat[c_i, t]
+                h_bar = grid.high_mat[c_i, t]
+                l_bar = grid.low_mat[c_i, t]
+                bars_held = t - tr.entry_bar
+
+                exit_triggered = False
+                exit_reason = ""
+                raw_exit_px = o_bar
+                exit_slip_mult = 1.0
+
+                # Phase 2A: Open exits. A stop decided on yesterday's close is filled at today's open.
+                if tr.pending_stop:
+                    exit_triggered = True
+                    exit_reason = tr.pending_reason
+                elif macro_bear_confirmed:
+                    exit_triggered = True
+                    exit_reason = "MACRO_REGIME_EXIT"
+                elif bars_held >= max_holding_bars:
+                    exit_triggered = True
+                    exit_reason = "MAX_HOLDING_TIME"
+                elif xt in (3, 4, 5, 6, 7) and exit_mat[c_i, t - 1]:
+                    if bars_held >= 3 or (tr.highest_high - tr.entry_price) >= (1.0 * tr.entry_atr):
+                        exit_triggered = True
+                        exit_reason = f"SIGNAL_EXIT_TYPE_{xt}"
+
+                # INTRADAY stop-market model: the stop level was fixed at yesterday's close, so today's low touching it is causal.
+                if (not exit_triggered) and STOP_EXECUTION == "INTRADAY" and np.isfinite(l_bar) and l_bar <= tr.current_sl:
+                    exit_triggered = True
+                    exit_reason = tr.stop_reason
+                    raw_exit_px = min(o_bar, tr.current_sl)          # a gap through the stop fills at the open
+                    exit_slip_mult = STOP_MARKET_SLIP_MULT
+
+                if exit_triggered:
+                    part_rate_exit = min(1.0, max(0.0, (tr.units * raw_exit_px) / adv))
+                    slip_exit = _slip(c_i, part_rate_exit, t - 1, exit_slip_mult)
+                    fill_px, proceeds, fee_exit = _sell_fill_audited(tr.units, raw_exit_px, slip_exit)
+
+                    cash += proceeds
+                    total_proceeds = tr.proceeds + proceeds
+                    pnl = total_proceeds - tr.cost_usd
+                    vwap_exit = total_proceeds / tr.initial_units if tr.initial_units > 0 else fill_px
+                    _accumulate_fees(tr.fee_acc, fee_exit)
+
+                    closed_trades.append({
+                        "coin": tr.coin, "pnl": pnl, "ret": pnl / tr.cost_usd if tr.cost_usd > 0 else 0.0,
+                        "reason": exit_reason, "bars": bars_held, "bars_to_peak": tr.peak_bar - tr.entry_bar,
+                        "mfe_pct": ((tr.highest_high - tr.entry_price) / tr.entry_price) * 100.0,
+                        "mae_pct": ((tr.lowest_low - tr.entry_price) / tr.entry_price) * 100.0,
+                        "entry_date": tr.entry_date, "exit_date": curr_date, "exit_idx": idx,
+                        "entry_price": tr.entry_price, "exit_price": vwap_exit,
+                        "cost_usd": tr.cost_usd, "proceeds": total_proceeds,
+                        "frictions": tr.fee_acc, "from_watchlist": tr.from_watchlist,
+                    })
+                else:
+                    # Phase 2B: end-of-day evaluation. Stop is judged on the CLOSE; exit happens next open.
+                    c_bar = grid.close_mat[c_i, t]
+                    if h_bar > tr.highest_high:
+                        tr.highest_high = h_bar
+                        tr.peak_bar = t
+                    if l_bar < tr.lowest_low:
+                        tr.lowest_low = l_bar
+                        tr.trough_bar = t
+
+                    if STOP_EXECUTION == "NEXT_OPEN" and c_bar <= tr.current_sl:
+                        tr.pending_stop = True
+                        tr.pending_reason = tr.stop_reason
+                    else:
+                        if be_trigger_mult > 0.0 and tr.current_sl < tr.be_price:
+                            be_target = tr.entry_price + (be_trigger_mult * tr.entry_atr)
+                            if tr.highest_high >= be_target:
+                                tr.current_sl = max(tr.current_sl, tr.be_price)
+                                tr.stop_reason = "BREAKEVEN_SL"
+
+                        if xt == 1:
+                            pct_floor = tr.highest_high * trail_pct_mult
+                            if pct_floor > tr.current_sl:
+                                tr.current_sl = pct_floor
+                                tr.stop_reason = "TRAIL_PCT_STOP"
+                        elif trail_mult > 0.0:
+                            atr_bar_trailing = grid.atr14_mat[c_i, t - 1]
+                            atr_floor = tr.highest_high - (trail_mult * atr_bar_trailing)
+                            if atr_floor > tr.current_sl:
+                                tr.current_sl = atr_floor
+                                tr.stop_reason = "TRAIL_ATR_STOP"
+
+                    surviving_tranches.append(tr)
+            live_tranches = surviving_tranches
+
+            # 3. Ingest candidates decided on close(t-1)
+            active_counts = {tr.coin_idx: 0 for tr in live_tranches}
+            for tr in live_tranches:
+                active_counts[tr.coin_idx] += 1
+
+            new_candidates = []
+            sig_idx = np.flatnonzero(raw_signal_mat[:, t - 1])
+            if active_symbols_mask is not None and len(sig_idx):
+                sig_idx = sig_idx[active_symbols_mask[sig_idx]]
+
+            # Fast path: on a day when NO order can be placed (no cash / no slot) and signals do not wait,
+            # every filtered signal is dropped for the same reason -> count them vectorised (identical accounting).
+            if (wl_mode == "WL_NONE") and (not record_signals) and (cash < floor_usd or len(live_tranches) >= max_slots) and len(sig_idx):
+                n_sig = int(len(sig_idx))
+                funnel_dispositions["raw_triggers"] += n_sig
+                sig_id_counter += n_sig
+                if not macro_ok[t - 1]:
+                    funnel_dispositions["macro_blocked"] += n_sig
+                else:
+                    liq_ok_v = grid.dvol30_mat[sig_idx, t - 1] >= np.maximum(grid.liq_floor[sig_idx], 1.0)
+                    funnel_dispositions["liquidity_blocked"] += int((~liq_ok_v).sum())
+                    rem = sig_idx[liq_ok_v]
+                    ent_ok_v = entry_mat[rem, t - 1]
+                    funnel_dispositions["adx_blocked"] += int((~ent_ok_v).sum())
+                    rem = rem[ent_ok_v]
+                    if len(rem):
+                        if active_counts:
+                            n_pyr = int(sum(1 for cc in rem if active_counts.get(int(cc), 0) >= max_pyramid))
+                        else:
+                            n_pyr = 0
+                        funnel_dispositions["pyramid_blocked"] += n_pyr
+                        n_rest = len(rem) - n_pyr
+                        if cash < floor_usd:
+                            funnel_dispositions["cash_starved_dropped"] += n_rest
+                        else:
+                            funnel_dispositions["slot_saturated_dropped"] += n_rest
+                sig_idx = sig_idx[:0]
+
+            for c_i in sig_idx:
+                c_i = int(c_i)
+                if raw_signal_mat[c_i, t - 1]:
+                    sig_id_counter += 1
+                    funnel_dispositions["raw_triggers"] += 1
+                    if record_signals:
+                        sig_meta[sig_id_counter] = (c_i, t)
+
+                    if not macro_ok[t - 1]:
+                        funnel_dispositions["macro_blocked"] += 1
+                        if record_signals: sig_outcome[sig_id_counter] = "macro_blocked"
+                        continue
+                    if grid.dvol30_mat[c_i, t - 1] < max(float(grid.liq_floor[c_i]), 1.0):
+                        funnel_dispositions["liquidity_blocked"] += 1
+                        if record_signals: sig_outcome[sig_id_counter] = "liquidity_blocked"
+                        continue
+                    if not entry_mat[c_i, t - 1]:
+                        funnel_dispositions["adx_blocked"] += 1
+                        if record_signals: sig_outcome[sig_id_counter] = "adx_blocked"
+                        continue
+                    if active_counts.get(c_i, 0) >= max_pyramid:
+                        funnel_dispositions["pyramid_blocked"] += 1
+                        if record_signals: sig_outcome[sig_id_counter] = "pyramid_blocked"
+                        continue
+
+                    o_today = grid.open_mat[c_i, t]
+                    a_yesterday = grid.atr14_mat[c_i, t - 1]
+                    init_stop = o_today - (sl_mult_p * a_yesterday)
+                    breakout_strength = (grid.close_mat[c_i, t - 1] - grid.open_mat[c_i, t - 1]) / max(1e-6, a_yesterday)
+                    new_candidates.append({
+                        "sig_id": sig_id_counter,
+                        "coin": grid.symbols[c_i], "coin_idx": c_i, "signal_bar": t,
+                        "trigger_price": grid.close_mat[c_i, t - 1], "shadow_stop": init_stop,
+                        "highest_high": o_today, "breakout_quality": breakout_strength,
+                        "entry_atr": a_yesterday, "unfilled_reason": None
+                    })
+
+            new_candidates.sort(key=lambda x: x["breakout_quality"], reverse=True)
+            watchlist.extend(new_candidates)
+
+            # 4. Sizing & order fill with persistent-state revalidation
+            day_block_cause: Optional[str] = None
+
+            def _record_unfilled_disposition(item: Dict[str, Any], default_bucket: str = "expired_unfilled"):
+                reason = day_block_cause if day_block_cause else item.get("unfilled_reason")
+                if reason == "cash_starved":
+                    funnel_dispositions["cash_starved_dropped"] += 1
+                elif reason in ("pyramid_blocked", "anti_averaging_down"):
+                    funnel_dispositions["pyramid_blocked"] += 1
+                elif reason == "scrip_risk_cap":
+                    funnel_dispositions["risk_cap_dropped"] += 1
+                elif reason == "slot_saturated":
+                    funnel_dispositions["slot_saturated_dropped"] += 1
+                else:
+                    funnel_dispositions[default_bucket] += 1
+                _set_outcome(item, reason if reason else default_bucket)
+
+            if watchlist and cash >= floor_usd and len(live_tranches) < max_slots:
+                if wl_mode == "WL_DEEPEST_DISCOUNT":
+                    watchlist.sort(key=lambda x: (x["trigger_price"] - grid.close_mat[x["coin_idx"], t - 1]) / max(1e-6, x["trigger_price"]), reverse=True)
+                elif wl_mode == "WL_STRONGEST_MOMENTUM":
+                    watchlist.sort(key=lambda x: x["breakout_quality"], reverse=True)
+
+                unfilled = []
+                for item in watchlist:
+                    c_i = item["coin_idx"]
+
+                    if not grid.alive_mat[c_i, t]:
+                        funnel_dispositions["revalidation_dropped"] += 1
+                        _set_outcome(item, "revalidation_dropped")
+                        continue
+
+                    if t > item["signal_bar"]:
+                        if not macro_ok[t - 1]:
+                            funnel_dispositions["revalidation_dropped"] += 1
+                            _set_outcome(item, "revalidation_dropped")
+                            continue
+                        if adx_t > 0.0 and grid.adx14_mat[c_i, t - 1] < adx_t:
+                            funnel_dispositions["revalidation_dropped"] += 1
+                            _set_outcome(item, "revalidation_dropped")
+                            continue
+                        if not active_state_mat[c_i, t - 1]:
+                            funnel_dispositions["revalidation_dropped"] += 1
+                            _set_outcome(item, "revalidation_dropped")
+                            continue
+
+                    coin_layers = sum(1 for tr in live_tranches if tr.coin_idx == c_i)
+                    today_open = grid.open_mat[c_i, t]
+
+                    # Anti-Averaging Down Rule
+                    if coin_layers > 0:
+                        highest_prior_entry = max(tr.entry_price for tr in live_tranches if tr.coin_idx == c_i)
+                        if today_open <= highest_prior_entry * 1.005:
+                            item["unfilled_reason"] = "anti_averaging_down"
+                            unfilled.append(item)
+                            continue
+
+                    open_slots = max(1, max_slots - len(live_tranches))
+                    if len(live_tranches) >= max_slots:
+                        item["unfilled_reason"] = "slot_saturated"
+                        unfilled.append(item)
+                        continue
+                    if cash < floor_usd:
+                        item["unfilled_reason"] = "cash_starved"
+                        unfilled.append(item)
+                        continue
+
+                    open_active_cap = sum(tr.units * grid.open_mat[tr.coin_idx, t] for tr in live_tranches)
+                    current_equity = cash + open_active_cap
+                    max_pos_cap = current_equity * MAX_POSITION_EQUITY_PCT
+                    dynamic_slot_target = min(max_pos_cap, cash / float(open_slots))
+
+                    current_scrip_exposure = sum(tr.units * today_open for tr in live_tranches if tr.coin_idx == c_i)
+                    remaining_scrip_capacity = max(0.0, max_pos_cap - current_scrip_exposure)
+                    if remaining_scrip_capacity < floor_usd:
+                        item["unfilled_reason"] = "scrip_risk_cap"
+                        unfilled.append(item)
+                        continue
+
+                    adv_30d = max(grid.dvol30_mat[c_i, t - 1], LIQUIDITY_FLOOR_USD)
+                    liquidity_cap_usd = adv_30d * MAX_ADV_PARTICIPATION
+                    target_usd = min(dynamic_slot_target, liquidity_cap_usd, remaining_scrip_capacity)
+
+                    max_affordable = compute_max_affordable_tranche(cash, adv_30d, float(SLIPPAGE_SCALE * entry_slip_mult * grid.slip_bps[c_i, t - 1]), float(SLIPPAGE_SCALE * entry_slip_mult * grid.impact_bps[c_i, t - 1]))
+                    tranche_usd = min(max_affordable, max(floor_usd, target_usd))
+
+                    part_rate = min(1.0, max(0.0, tranche_usd / adv_30d))
+                    slip_mult = _slip(c_i, part_rate, t - 1, entry_slip_mult)
+
+                    fill_px, units, total_cost, fee_buy = _buy_fill_audited(tranche_usd, today_open, slip_mult)
+
+                    if (cash >= total_cost and tranche_usd >= floor_usd and units > 0 and
+                            len(live_tranches) < max_slots and coin_layers < max_pyramid):
+
+                        if max_affordable < target_usd:
+                            binding_stats["cash_constrained"] += 1
+                        elif target_usd == liquidity_cap_usd:
+                            binding_stats["liquidity_cap"] += 1
+                        elif target_usd < floor_usd:
+                            binding_stats["tranche_floor"] += 1
+                        else:
+                            binding_stats["equity_slot"] += 1
+
+                        sl_price = fill_px - (sl_mult_p * item["entry_atr"])
+                        cash -= total_cost
+                        tid_counter += 1
+                        funnel_dispositions["executed_fills"] += 1
+                        _set_outcome(item, "executed")
+
+                        h_today = grid.high_mat[c_i, t]
+                        l_today = grid.low_mat[c_i, t]
+                        c_today = grid.close_mat[c_i, t]
+
+                        # Day-1 stop: judged on today's close, filled at tomorrow's open (pending_stop).
+                        live_tranches.append(Tranche(
+                            tid=tid_counter, coin=item["coin"], coin_idx=c_i, entry_bar=t, entry_date=curr_date,
+                            entry_price=fill_px, initial_units=units, units=units, cost_usd=total_cost,
+                            entry_atr=item["entry_atr"], current_sl=sl_price, stop_reason="STOP_LOSS",
+                            highest_high=max(fill_px, h_today), lowest_low=min(fill_px, l_today),
+                            peak_bar=t, trough_bar=t, layer=coin_layers + 1,
+                            be_price=breakeven_exit_price(total_cost, units, slip_mult),
+                            pending_stop=bool(c_today <= sl_price), pending_reason="STOP_LOSS",
+                            from_watchlist=(t > item["signal_bar"]), wait_days=(t - item["signal_bar"]),
+                            proceeds=0.0, fee_acc=fee_buy
+                        ))
+                    else:
+                        if coin_layers >= max_pyramid:
+                            item["unfilled_reason"] = "pyramid_blocked"
+                        elif cash < total_cost or tranche_usd < floor_usd:
+                            item["unfilled_reason"] = "cash_starved"
+                        else:
+                            item["unfilled_reason"] = "slot_saturated"
+                        unfilled.append(item)
+                watchlist = unfilled
+            elif watchlist:
+                # Nothing could be attempted today: remember WHY (capital vs slots) for disposition accounting.
+                day_block_cause = "cash_starved" if cash < floor_usd else "slot_saturated"
+
+            # Terminal disposition accounting for single-day watchlist modes
+            if wl_mode == "WL_NONE" and watchlist:
+                for item in watchlist:
+                    _record_unfilled_disposition(item, default_bucket="slot_saturated_dropped")
+                watchlist = []
+
+            # 5. Causal watchlist lifecycle update (EOD on unfilled items only)
+            if wl_mode != "WL_NONE":
+                surviving_watchlist = []
+                for item in watchlist:
+                    c_i = item["coin_idx"]
+                    l_bar, h_bar = grid.low_mat[c_i, t], grid.high_mat[c_i, t]
+
+                    shadow_stopped = (l_bar <= item["shadow_stop"])
+                    shadow_exited = (xt in (3, 4, 5, 6, 7)) and exit_mat[c_i, t]
+                    shadow_expired = (t - item["signal_bar"]) >= WL_MAX_AGE_BARS
+
+                    if shadow_expired or shadow_stopped or shadow_exited:
+                        _record_unfilled_disposition(item, default_bucket="expired_unfilled")
+                    else:
+                        if h_bar > item["highest_high"]:
+                            item["highest_high"] = h_bar
+                        if trail_mult > 0.0:
+                            item["shadow_stop"] = max(item["shadow_stop"], item["highest_high"] - (trail_mult * grid.atr14_mat[c_i, t]))
+                        surviving_watchlist.append(item)
+                watchlist = surviving_watchlist
+            else:
+                watchlist = []
+
+            # 6. Horizon terminal mark (final bar only)
+            if t == end_bar - 1:
+                if wl_mode != "WL_NONE" and watchlist:
+                    for item in watchlist:
+                        _record_unfilled_disposition(item, default_bucket="expired_unfilled")
+                    watchlist = []
+
+                for tr in list(live_tranches):
+                    c_i = tr.coin_idx
+                    c_px = grid.close_mat[c_i, t]
+                    if np.isfinite(c_px) and c_px > 0:
+                        adv = max(grid.dvol30_mat[c_i, t - 1], LIQUIDITY_FLOOR_USD)
+                        part_rate = min(1.0, max(0.0, (tr.units * c_px) / adv))
+                        slip_mult = _slip(c_i, part_rate, t - 1)
+                        fill_px, proceeds, fee_term = _sell_fill_audited(tr.units, c_px, slip_mult)
+                        cash += proceeds
+                        total_proceeds = tr.proceeds + proceeds
+                        pnl = total_proceeds - tr.cost_usd
+                        vwap_exit = total_proceeds / tr.initial_units if tr.initial_units > 0 else fill_px
+                        _accumulate_fees(tr.fee_acc, fee_term)
+
+                        closed_trades.append({
+                            "coin": tr.coin, "pnl": pnl, "ret": pnl / tr.cost_usd if tr.cost_usd > 0 else 0.0,
+                            "reason": "END_OF_TEST", "bars": t - tr.entry_bar,
+                            "bars_to_peak": tr.peak_bar - tr.entry_bar,
+                            "mfe_pct": ((tr.highest_high - tr.entry_price) / tr.entry_price) * 100.0,
+                            "mae_pct": ((tr.lowest_low - tr.entry_price) / tr.entry_price) * 100.0,
+                            "entry_date": tr.entry_date, "exit_date": curr_date, "exit_idx": idx,
+                            "entry_price": tr.entry_price, "exit_price": vwap_exit,
+                            "cost_usd": tr.cost_usd, "proceeds": total_proceeds,
+                            "frictions": tr.fee_acc, "from_watchlist": tr.from_watchlist,
+                        })
+                live_tranches = []
+
+            # 7. Daily time-weighted return (TWR) indexing & exposure tracking
+            scrip_mkt_vals: Dict[int, float] = {}
+            for tr in live_tranches:
+                val = tr.units * grid.close_mat[tr.coin_idx, t]
+                scrip_mkt_vals[tr.coin_idx] = scrip_mkt_vals.get(tr.coin_idx, 0.0) + val
+
+            current_active = sum(scrip_mkt_vals.values())
+            eod_equity = cash + current_active
+
+            if eod_equity > 0 and scrip_mkt_vals:
+                max_scrip_val_today = max(scrip_mkt_vals.values())
+                peak_single_stock_pct = max(peak_single_stock_pct, max_scrip_val_today / eod_equity)
+
+            if idx == 0:
+                daily_twr_ret = 0.0
+            else:
+                capital_base = prev_equity + inflow_today
+                daily_twr_ret = (eod_equity - capital_base) / max(1.0, capital_base)
+
+            current_twr *= (1.0 + daily_twr_ret)
+            prev_equity = eod_equity
+
+            active_capital_curve[idx] = current_active
+            total_equity_curve[idx] = eod_equity
+            twr_curve[idx] = current_twr
+            concurrency_hist[min(len(live_tranches), max_slots)] += 1
+
+        signal_log = []
+        if record_signals:
+            for sid, (c_i, sbar) in sig_meta.items():
+                signal_log.append((sid, c_i, sbar, sig_outcome.get(sid, "open_at_end")))
+
+        return {
+            "trades": pd.DataFrame(closed_trades),
+            "equity": total_equity_curve,
+            "twr_curve": twr_curve,
+            "active_capital": active_capital_curve,
+            "total_inflow": total_inflow,
+            "final_cash": cash,
+            "dates": dates[start_bar:end_bar],
+            "binding_stats": binding_stats,
+            "funnel_stats": funnel_dispositions,
+            "concurrency_hist": concurrency_hist,
+            "peak_single_stock_pct": float(peak_single_stock_pct * 100.0),
+            "signal_log": signal_log,
+        }
+
+
+# ==============================================================================
+# AUDITED TIME-WEIGHTED RETURN (TWR) METRIC ENGINE
+# ==============================================================================
+def _year_returns(twr: np.ndarray, years: np.ndarray, min_bars: int = OBJ_MIN_YEAR_BARS) -> Dict[int, float]:
+    """Flow-stripped calendar-year returns (%) from a TWR curve aligned bar-for-bar with `years`."""
+    out: Dict[int, float] = {}
+    if len(twr) < 2 or len(twr) != len(years):
+        return out
+    for y in np.unique(years):
+        ix = np.flatnonzero(years == y)
+        if len(ix) < min_bars:
+            continue
+        base = twr[ix[0] - 1] if ix[0] >= 1 else 1.0
+        out[int(y)] = float((twr[ix[-1]] / max(1e-12, base) - 1.0) * 100.0)
+    return out
+
+
+def calculate_benchmarks(grid: MarketGrid, start_bar: int, end_bar: int, macro_ok: Optional[np.ndarray] = None) -> Dict[str, Any]:
+    """Calculates TWR for Literal BTC, Survivor Basket, and Reference 200 SMA Timed Benchmarks."""
+    n_bars = end_bar - start_bar
+
+    # 1. Literal benchmark TWR (BTC ETF series; falls back to BTC if the ETF is unavailable)
+    btc_p = grid.bench_close[start_bar:end_bar]
+    btc_daily_ret = np.diff(btc_p) / np.maximum(1e-6, btc_p[:-1])
+    btc_twr = np.insert(np.cumprod(1.0 + btc_daily_ret), 0, 1.0)
+    btc_cagr = (btc_twr[-1] ** (BARS_PER_YEAR / max(1, n_bars))) - 1.0
+
+    peak_n = np.maximum.accumulate(btc_twr)
+    dd_n = np.where(peak_n > 0, (peak_n - btc_twr) / peak_n, 0.0)
+    btc_max_dd = float(np.max(dd_n)) * 100.0 if len(dd_n) > 0 else 0.0
+
+    # 2. Equal-Weight Survivor Basket TWR
+    basket_close = grid.close_mat[:, start_bar:end_bar]
+    alive_slice = grid.alive_mat[:, start_bar:end_bar]
+    basket_returns = np.diff(basket_close, axis=1) / np.maximum(1e-6, basket_close[:, :-1])
+    # Prevent a single corrupted small-cap tick from dominating the benchmark CAGR.
+    basket_returns = np.clip(basket_returns, -0.95, 3.0)
+
+    daily_basket_ret = np.zeros(n_bars - 1, dtype=np.float64)
+    tradable_slice = (grid.dvol30_mat[:, start_bar:end_bar] >= grid.liq_floor[:, None])     # median ADV over the floor AND >= 30 live bars (NaN -> 0)
+    for b in range(n_bars - 1):
+        alive_today = alive_slice[:, b] & alive_slice[:, b + 1]
+        if BASKET_INVESTABLE_ONLY:
+            alive_today = alive_today & tradable_slice[:, b]
+        if np.any(alive_today):
+            daily_basket_ret[b] = np.mean(basket_returns[alive_today, b])
+
+    basket_twr = np.insert(np.cumprod(1.0 + daily_basket_ret), 0, 1.0)
+    basket_cagr = (basket_twr[-1] ** (BARS_PER_YEAR / max(1, n_bars))) - 1.0
+
+    peak_b = np.maximum.accumulate(basket_twr)
+    dd_b = np.where(peak_b > 0, (peak_b - basket_twr) / peak_b, 0.0)
+    basket_max_dd = float(np.max(dd_b)) * 100.0 if len(dd_b) > 0 else 0.0
+
+    # 3. Strategy Macro-Timed Benchmarks
+    daily_cash_ret = CASH_ANNUAL_YIELD / BARS_PER_YEAR
+    if macro_ok is not None:
+        macro_slice = macro_ok[start_bar:end_bar - 1]
+        timed_btc_daily = np.where(macro_slice, btc_daily_ret, daily_cash_ret)
+        timed_basket_daily = np.where(macro_slice, daily_basket_ret, daily_cash_ret)
+
+        timed_btc_twr = np.insert(np.cumprod(1.0 + timed_btc_daily), 0, 1.0)
+        timed_btc_cagr = (timed_btc_twr[-1] ** (BARS_PER_YEAR / max(1, n_bars))) - 1.0
+        timed_btc_total_return = (timed_btc_twr[-1] - 1.0) * 100.0
+
+        timed_basket_twr = np.insert(np.cumprod(1.0 + timed_basket_daily), 0, 1.0)
+        timed_basket_cagr = (timed_basket_twr[-1] ** (BARS_PER_YEAR / max(1, n_bars))) - 1.0
+        timed_basket_total_return = (timed_basket_twr[-1] - 1.0) * 100.0
+    else:
+        timed_btc_cagr = btc_cagr
+        timed_btc_total_return = (btc_twr[-1] - 1.0) * 100.0
+        timed_basket_cagr = basket_cagr
+        timed_basket_total_return = (basket_twr[-1] - 1.0) * 100.0
+
+    # 4. Standard Reference 200 SMA Timed Benchmark
+    ref_200_ma = FastIndicators.moving_average(grid.macro_close, 200, 0)
+    ref_macro_ok = (~np.isnan(ref_200_ma)) & (grid.macro_close > ref_200_ma)
+    ref_slice = ref_macro_ok[start_bar:end_bar - 1]
+    ref_timed_btc_daily = np.where(ref_slice, btc_daily_ret, daily_cash_ret)
+    ref_timed_btc_twr = np.insert(np.cumprod(1.0 + ref_timed_btc_daily), 0, 1.0)
+    ref_timed_btc_cagr = (ref_timed_btc_twr[-1] ** (BARS_PER_YEAR / max(1, n_bars))) - 1.0
+
+    yrs_slice = grid.years_arr[start_bar:end_bar]
+    return {
+        "idx_year": _year_returns(btc_twr, yrs_slice),
+        "bsk_year": _year_returns(basket_twr, yrs_slice),
+        "btc_twr_cagr": float(btc_cagr * 100.0),
+        "btc_total_return": float((btc_twr[-1] - 1.0) * 100.0),
+        "btc_max_dd": float(btc_max_dd),
+        "btc_daily_ret": btc_daily_ret,
+        "basket_twr_cagr": float(basket_cagr * 100.0),
+        "basket_total_return": float((basket_twr[-1] - 1.0) * 100.0),
+        "basket_max_dd": float(basket_max_dd),
+        "timed_btc_cagr": float(timed_btc_cagr * 100.0),
+        "timed_btc_total_return": float(timed_btc_total_return),
+        "timed_basket_cagr": float(timed_basket_cagr * 100.0),
+        "timed_basket_total_return": float(timed_basket_total_return),
+        "ref_200sma_timed_cagr": float(ref_timed_btc_cagr * 100.0),
+    }
+
+
+def _calc_sub_metrics(tdf: pd.DataFrame, cagr: float, total_ret: float) -> Dict[str, Any]:
+    if len(tdf) == 0:
+        return {
+            "trades": 0, "net_pnl": 0.0, "cagr": 0.0, "total_return": 0.0,
+            "win_rate": 0.0, "pure_win_rate": 0.0, "be_rate": 0.0, "loss_rate": 0.0,
+            "profit_factor": 0.0
+        }
+    net_pnl = float(tdf["pnl"].sum())
+    
+    is_be = tdf["reason"].str.contains("BREAKEVEN") | (tdf["ret"].abs() <= 0.0025)
+    wins = tdf[(tdf["pnl"] > 0) & (~is_be)]["pnl"]
+    losses = tdf[(tdf["pnl"] < 0) & (~is_be)]["pnl"].abs()
+    be_trades = tdf[is_be]
+
+    pure_wins_count = len(wins)
+    be_count = len(be_trades)
+    losses_count = len(losses)
+    n_tot = len(tdf)
+
+    win_rate = (len(tdf[tdf["pnl"] > 0]) / n_tot) * 100.0
+    pure_win_rate = (pure_wins_count / n_tot) * 100.0
+    be_rate = (be_count / n_tot) * 100.0
+    loss_rate = (losses_count / n_tot) * 100.0
+
+    pf = float(wins.sum() / (losses.sum() + 1e-9)) if len(losses) > 0 else 10.0
+    return {
+        "trades": n_tot, "net_pnl": net_pnl, "cagr": cagr, "total_return": total_ret,
+        "win_rate": win_rate, "pure_win_rate": pure_win_rate, "be_rate": be_rate,
+        "loss_rate": loss_rate, "profit_factor": pf
+    }
+
+
+def calculate_metrics(results: Dict[str, Any], grid: MarketGrid, start_bar: int, end_bar: int,
+                      benchmark_cagr: Any, min_trades: Optional[int] = None) -> Dict[str, Any]:
+    # `benchmark_cagr` is normally the dict from calculate_benchmarks (enables the annual objective); a bare float
+    # still works and falls back to a clipped whole-window excess.
+    bench_obj = benchmark_cagr if isinstance(benchmark_cagr, dict) else None
+    benchmark_cagr = float(bench_obj["btc_twr_cagr"]) if bench_obj is not None else float(benchmark_cagr)
+    tdf = results["trades"]
+    twr_series = results["twr_curve"]
+    eq = results["equity"]
+    ac = results["active_capital"]
+    n_bars = end_bar - start_bar
+
+    if len(twr_series) > 0:
+        peak_twr = np.maximum.accumulate(twr_series)
+        dd_curve = np.where(peak_twr > 0, (peak_twr - twr_series) / peak_twr, 0.0)
+        max_dd = float(np.max(dd_curve)) * 100.0 if len(dd_curve) > 0 else 0.0
+        total_ret_full = float((twr_series[-1] - 1.0) * 100.0)
+        cagr_full = float(((twr_series[-1]) ** (BARS_PER_YEAR / max(1, n_bars)) - 1.0) * 100.0)
+    else:
+        max_dd, total_ret_full, cagr_full = 0.0, 0.0, 0.0
+
+    if len(tdf) > 0 and len(eq) > 0:
+        cum_pnl = tdf["pnl"].cumsum().values
+        peak_pnl = np.maximum.accumulate(cum_pnl)
+        trade_dd_usd = peak_pnl - cum_pnl
+        peak_contemp_equity = np.maximum.accumulate(eq)
+        
+        if "exit_idx" in tdf.columns:
+            exit_indices = np.clip(tdf["exit_idx"].values.astype(int), 0, len(eq) - 1)
+            trade_denominators = np.maximum(1000.0, peak_contemp_equity[exit_indices])
+        else:
+            trade_denominators = np.maximum(1000.0, float(np.max(eq)))
+            
+        trade_dd_pcts = (trade_dd_usd / trade_denominators) * 100.0
+        closed_trade_dd_pct = float(np.max(trade_dd_pcts)) if len(trade_dd_pcts) > 0 else 0.0
+    else:
+        closed_trade_dd_pct = 0.0
+
+    avg_active_cap = float(np.mean(ac)) if len(ac) > 0 else 0.0
+    avg_total_equity = float(np.mean(eq)) if len(eq) > 0 else INITIAL_CAPITAL
+    utilization = float(avg_active_cap / (avg_total_equity + 1e-9))
+
+    full = _calc_sub_metrics(tdf, cagr_full, total_ret_full)
+
+    eot_tdf = tdf[tdf["reason"] == "END_OF_TEST"] if len(tdf) > 0 else pd.DataFrame()
+    eot_trades = len(eot_tdf)
+    eot_pnl = float(eot_tdf["pnl"].sum()) if eot_trades > 0 else 0.0
+
+    # Benchmark drawdown over the same window (from the benchmark series itself)
+    bp = grid.bench_close[start_bar:end_bar]
+    if len(bp) > 1:
+        b_peak = np.maximum.accumulate(bp)
+        bench_dd = float(np.max((b_peak - bp) / np.maximum(1e-9, b_peak))) * 100.0
+    else:
+        bench_dd = 0.0
+
+    # Terminal-bar marks are not fully-realized alpha: credit only a fraction of the unclosed excess.
+    final_equity = float(eq[-1]) if len(eq) > 0 else INITIAL_CAPITAL
+    organic_final_equity = max(1e-6, final_equity - eot_pnl)
+    final_twr = max(1e-6, float(twr_series[-1])) if len(twr_series) > 0 else 1.0
+    organic_twr_ratio = np.clip(organic_final_equity / max(1e-6, final_equity), 0.0, 1.0)
+    organic_twr_end = final_twr * organic_twr_ratio
+    years_n = max(1, n_bars) / BARS_PER_YEAR
+    cagr_organic = float(((organic_twr_end ** (1.0 / years_n)) - 1.0) * 100.0)
+
+    unclosed_excess_cagr = max(0.0, cagr_full - cagr_organic)
+    anti_cheat_cagr = cagr_organic + (EOT_EXCESS_WEIGHT * unclosed_excess_cagr)
+
+    if len(tdf) > 5:
+        trade_rets = tdf["ret"].values
+        p95 = float(np.percentile(trade_rets, 95))
+        clipped_rets = np.minimum(trade_rets, p95)
+        denom_rets = float(np.sum(trade_rets))
+        expectance_discount = float(np.clip(np.sum(clipped_rets) / denom_rets, 0.2, 1.0)) if denom_rets > 0 else 0.2
+    else:
+        expectance_discount = 1.0
+
+    trimmed_cagr = anti_cheat_cagr * expectance_discount if anti_cheat_cagr > 0 else anti_cheat_cagr
+
+    # OBJECTIVE V2 - annual, survivorship-neutral, lottery-resistant:
+    #   for each calendar year: strategy TWR minus the BETTER of (BTC, equal-weight basket of this universe),
+    #   clipped to +/- OBJ_YEAR_EXCESS_CLIP points, averaged over years; minus a penalty only for drawdown WORSE than the
+    #   benchmark's own. Cash earns 0, so hiding in cash cannot flatter the score.
+    excess_cagr = trimmed_cagr - benchmark_cagr
+    year_excess_raw: List[float] = []
+    if bench_obj is not None and len(twr_series) > 1:
+        s_year = _year_returns(twr_series, grid.years_arr[start_bar:end_bar])
+        for y_, sr_ in s_year.items():
+            ref_ = max(bench_obj.get("idx_year", {}).get(y_, -1e9), bench_obj.get("bsk_year", {}).get(y_, -1e9))
+            if ref_ > -1e8:
+                year_excess_raw.append(float(100.0 * np.log(max(1e-6, 1.0 + sr_ / 100.0) / max(1e-6, 1.0 + ref_ / 100.0))))   # log points: scale-free, usable at +847% years
+    if year_excess_raw:
+        obj_core = float(np.mean(np.clip(year_excess_raw, -OBJ_YEAR_EXCESS_CLIP, OBJ_YEAR_EXCESS_CLIP))) * OBJ_SCORE_SCALE
+    else:
+        obj_core = float(np.clip(cagr_full - benchmark_cagr, -OBJ_YEAR_EXCESS_CLIP, OBJ_YEAR_EXCESS_CLIP)) * OBJ_SCORE_SCALE
+    dd_penalty = DD_PENALTY_WEIGHT * max(0.0, max_dd - bench_dd)
+    score = obj_core - dd_penalty
+
+    n_min = MIN_CLOSED_TRADES if min_trades is None else int(min_trades)
+    if n_min > 0 and len(tdf) < n_min:
+        # V12.5: the penalty is RELATIVE to the config's own score. The old absolute -10..-5 ramp sat ABOVE every genuinely bad score, so TPE learned to
+        # stop just under the trade floor (all 5 seeds converged to -5.125 = 39 trades). Now 39 trades can never beat the same config with 40.
+        score = min(score, -5.0) - 5.0 * (1.0 - len(tdf) / float(n_min))
+
+    eot_share = (eot_pnl / float(tdf["pnl"].sum())) if (len(tdf) > 0 and float(tdf["pnl"].sum()) > 0) else 0.0
+
+    return {
+        "score": float(np.nan_to_num(np.clip(score, -50.0, 200.0), nan=-10.0)), "full": full,
+        "eot_trades": eot_trades, "eot_pnl": eot_pnl, "eot_profit_share": float(eot_share),
+        "cagr_organic": float(cagr_organic), "trimmed_cagr": float(trimmed_cagr),
+        "excess_cagr": float(excess_cagr), "bench_max_dd": float(bench_dd),
+        "max_dd": float(max_dd), "closed_trade_dd_pct": float(closed_trade_dd_pct),
+        "utilization": float(utilization * 100.0),
+        "obj_core": float(obj_core), "dd_penalty": float(dd_penalty), "year_excess_raw": year_excess_raw,
+        "excess_vs_basket_cagr": float(trimmed_cagr - float(bench_obj["basket_twr_cagr"])) if bench_obj is not None else 0.0,
+    }
+
+
+# ==============================================================================
+# ANTI-OVERFITTING: MULTI-ARCH CAUSALITY & NEIGHBORHOOD AUDIT
+# ==============================================================================
+def dynamic_parameter_neighbors(base_p: Dict[str, Any]) -> List[Dict[str, Any]]:
+    steps = {
+        "entry_ma_len": 5, "rsi_f_len": 2, "rsi_f_smt": 2, "rsi_s_len": 2, "rsi_s_smt": 2,
+        "rsi_trend_ma_len": 10, "xover_short_len": 5, "xover_gap": 5, "vol_ma_len": 2,
+        "vol_mult": 0.2, "price_lookback": 2, "body_atr_mult": 0.1, "bb_entry_len": 2,
+        "bb_entry_std": 0.1, "macro_ma_len": 10, "sl_mult": 0.3,
+        "trail_atr_mult": 0.5, "max_holding_bars": 5, "trail_pct": 2.0, "exit_ma_len": 5,
+        "exit_rsi_f_len": 2, "exit_rsi_f_smt": 2, "exit_rsi_s_len": 2, "exit_rsi_s_smt": 2,
+        "exit_xover_short_len": 5, "exit_xover_gap": 5, "exit_vol_ma_len": 5,
+        "exit_vol_mult": 0.2, "bb_exit_len": 2, "max_concurrent_tranches": 1,
+        "adx_thresh": 5.0, "be_trigger_atr": 1.0
+    }
+
+    neighbors = []
+    for k, step in steps.items():
+        if k not in base_p:
+            continue
+        for mult in (+1, -1):
+            cand = copy.deepcopy(base_p)
+            if isinstance(cand[k], float):
+                cand[k] = round(max(0.0, cand[k] + mult * step), 2)
+            elif isinstance(cand[k], int):
+                cand[k] = max(2, int(cand[k] + mult * step))
+
+            if "xover_short_len" in cand and "xover_gap" in cand:
+                cand["xover_long_len"] = min(200, cand["xover_short_len"] + cand["xover_gap"])
+            if "exit_xover_short_len" in cand and "exit_xover_gap" in cand:
+                cand["exit_xover_long_len"] = min(200, cand["exit_xover_short_len"] + cand["exit_xover_gap"])
+
+            neighbors.append(cand)
+
+    ma_type_keys = ("entry_ma_type", "xover_short_type", "xover_long_type", "rsi_trend_ma_type",
+                    "macro_ma_type", "exit_ma_type", "exit_xover_short_type", "exit_xover_long_type")
+    for k in ma_type_keys:
+        if k in base_p:
+            for alt in (0, 1, 3):
+                if alt != base_p[k]:
+                    cand_t = copy.deepcopy(base_p)
+                    cand_t[k] = alt
+                    neighbors.append(cand_t)
+
+    if "tranche_floor" in base_p and float(base_p["tranche_floor"]) in TRANCHE_FLOOR_CHOICES:
+        i_f = TRANCHE_FLOOR_CHOICES.index(float(base_p["tranche_floor"]))
+        for j_f in (i_f - 1, i_f + 1):
+            if 0 <= j_f < len(TRANCHE_FLOOR_CHOICES):
+                cand_f = copy.deepcopy(base_p)
+                cand_f["tranche_floor"] = TRANCHE_FLOOR_CHOICES[j_f]
+                neighbors.append(cand_f)
+
+    if "macro_active_exit" in base_p:
+        cand_macro = copy.deepcopy(base_p)
+        cand_macro["macro_active_exit"] = not cand_macro["macro_active_exit"]
+        neighbors.append(cand_macro)
+
+    if "wl_mode" in base_p:
+        cand_wl = copy.deepcopy(base_p)
+        cand_wl["wl_mode"] = "WL_STRONGEST_MOMENTUM" if cand_wl["wl_mode"] != "WL_STRONGEST_MOMENTUM" else "WL_NONE"
+        neighbors.append(cand_wl)
+
+    return neighbors
+
+
+def evaluate_neighborhood_stability(params: Dict[str, Any], candidate_score: float, grid: MarketGrid,
+                                     start_bar: int, end_bar: int, benchmark_cagr: float) -> Tuple[bool, float, float, List[float]]:
+    neighbors = dynamic_parameter_neighbors(params)
+    neighbor_scores = []
+    for n_p in neighbors:
+        raw_sig, n_entry, n_exit, n_macro, n_state = compile_signals_fast(grid, n_p)
+        engine = BacktestEngine(params=n_p)
+        res = engine.run_interval(grid, raw_sig, n_entry, n_exit, n_macro, start_bar, end_bar, state_mat=n_state)
+        metrics = calculate_metrics(res, grid, start_bar, end_bar, benchmark_cagr)
+        neighbor_scores.append(metrics["score"])
+
+    scores_arr = np.array(neighbor_scores)
+    valid_mask = scores_arr > 0.0
+    pass_rate = float(np.mean(valid_mask))
+    p10_score = float(np.percentile(scores_arr, 10))
+    median_neighbor_score = float(np.median(scores_arr))
+
+    drop_tolerance = max(1.5, NEIGHBORHOOD_DROP_LIMIT * abs(candidate_score))   # score points (= CAGR pts)
+    is_stable = (
+        pass_rate >= 0.80 and
+        median_neighbor_score >= (candidate_score - drop_tolerance) and
+        p10_score > 0.0
+    )
+    plateau_score = min(candidate_score, median_neighbor_score)
+    return is_stable, plateau_score, pass_rate, neighbor_scores
+
+
+def slice_market_grid(grid: MarketGrid, cutoff_bar: int) -> MarketGrid:
+    """Return a physically truncated MarketGrid so indicators can be recomputed independently."""
+    return MarketGrid(
+        symbols=grid.symbols,
+        dates=grid.dates[:cutoff_bar],
+        open_mat=grid.open_mat[:, :cutoff_bar].copy(),
+        high_mat=grid.high_mat[:, :cutoff_bar].copy(),
+        low_mat=grid.low_mat[:, :cutoff_bar].copy(),
+        close_mat=grid.close_mat[:, :cutoff_bar].copy(),
+        volume_mat=grid.volume_mat[:, :cutoff_bar].copy(),
+        atr14_mat=grid.atr14_mat[:, :cutoff_bar].copy(),
+        dvol30_mat=grid.dvol30_mat[:, :cutoff_bar].copy(),
+        adx14_mat=grid.adx14_mat[:, :cutoff_bar].copy(),
+        delist_mat=grid.delist_mat[:, :cutoff_bar].copy(),
+        alive_mat=grid.alive_mat[:, :cutoff_bar].copy(),
+        macro_close=grid.macro_close[:cutoff_bar].copy(),
+        macro_open=grid.macro_open[:cutoff_bar].copy(),
+        months_arr=grid.months_arr[:cutoff_bar].copy(),
+        years_arr=grid.years_arr[:cutoff_bar].copy(),
+        bench_close=grid.bench_close[:cutoff_bar].copy(),
+        brackets=list(grid.brackets), liq_floor=grid.liq_floor.copy(),
+        slip_bps=grid.slip_bps[:, :cutoff_bar].copy(), impact_bps=grid.impact_bps[:, :cutoff_bar].copy()
+    )
+
+
+def verify_behavioral_causality(grid: MarketGrid):
+    logging.info("Executing Complete 5-Archetype Prefix-Invariance Causality Audit (Comparing Row Data)...")
+    n_bars = len(grid.dates)
+    if n_bars < 500:
+        return
+
+    t_cutoff = n_bars - 80
+    t_cutoff_date = grid.dates[t_cutoff]
+    # IMPORTANT: indicators/signals must be recomputed on the shorter grid.
+    # Slicing signal arrays from the full grid would make this audit tautological.
+    grid_trunc = slice_market_grid(grid, t_cutoff)
+
+    test_cfgs = [
+        {"entry_type": 0, "entry_ma_len": 50, "entry_ma_type": 1, "use_market_macro_system": True,
+         "macro_ma_len": 100, "macro_ma_type": 0, "macro_active_exit": False, "adx_thresh": 0.0,
+         "max_pyramid_layers": 1, "wl_mode": "WL_NONE", "max_concurrent_tranches": 6,
+         "max_holding_bars": 25, "sl_mult": 3.0, "exit_type": 0, "trail_atr_mult": 0.0, "tranche_floor": 5000.0},
+        {"entry_type": 1, "rsi_f_len": 14, "rsi_f_smt": 6, "rsi_s_len": 40, "rsi_s_smt": 10,
+         "use_rsi_trend_filter": False, "use_market_macro_system": True, "macro_ma_len": 100,
+         "macro_ma_type": 0, "macro_active_exit": True, "adx_thresh": 20.0,
+         "max_pyramid_layers": 1, "wl_mode": "WL_DEEPEST_DISCOUNT", "max_concurrent_tranches": 6,
+         "be_trigger_atr": 1.5, "tranche_floor": 10000.0,
+         "max_holding_bars": 35, "sl_mult": 4.5, "exit_type": 1, "trail_pct": 20.0, "trail_atr_mult": 0.0},
+        {"entry_type": 2, "xover_short_len": 15, "xover_short_type": 0, "xover_long_len": 60, "xover_long_type": 0, "xover_gap": 45,
+         "use_market_macro_system": True, "macro_ma_len": 100, "macro_ma_type": 0, "macro_active_exit": False, "adx_thresh": 0.0,
+         "max_pyramid_layers": 1, "wl_mode": "WL_NONE", "max_concurrent_tranches": 6,
+         "max_holding_bars": 20, "sl_mult": 3.0, "exit_type": 5, "trail_atr_mult": 0.0,
+         "exit_xover_short_len": 15, "exit_xover_short_type": 0, "exit_xover_long_len": 60, "exit_xover_long_type": 0, "exit_xover_gap": 45},
+        {"entry_type": 3, "vol_ma_len": 20, "vol_mult": 2.5, "price_lookback": 20, "body_atr_mult": 0.8,
+         "use_market_macro_system": True, "macro_ma_len": 100, "macro_ma_type": 0, "macro_active_exit": False, "adx_thresh": 0.0,
+         "max_pyramid_layers": 1, "wl_mode": "WL_NONE", "max_concurrent_tranches": 6,
+         "max_holding_bars": 20, "sl_mult": 3.0, "exit_type": 6, "trail_atr_mult": 0.0,
+         "exit_vol_ma_len": 20, "exit_vol_mult": 1.5},
+        {"entry_type": 4, "bb_entry_len": 50, "bb_entry_std": 3.0, "use_market_macro_system": False,
+         "adx_thresh": 25.0, "max_pyramid_layers": 2, "wl_mode": "WL_NONE", "max_concurrent_tranches": 11,
+         "max_holding_bars": 55, "sl_mult": 9.0, "be_trigger_atr": 2.5, "tranche_floor": 15000.0, "exit_type": 1, "trail_pct": 29.0, "trail_atr_mult": 0.0,
+         "bb_exit_len": 20},
+    ]
+
+    for cfg in test_cfgs:
+        raw_sig, entry_full, exit_full, macro_full, state_full = compile_signals_fast(grid, cfg)
+        engine_full = BacktestEngine(params=cfg)
+        res_full = engine_full.run_interval(grid, raw_sig, entry_full, exit_full, macro_full, 300, t_cutoff, state_mat=state_full)
+
+        raw_trunc, entry_trunc, exit_trunc, macro_trunc, state_trunc = compile_signals_fast(grid_trunc, cfg)
+        engine_trunc = BacktestEngine(params=cfg)
+        f_prior = res_full["trades"]
+        if len(f_prior) > 0:
+            f_prior = f_prior[(f_prior["reason"] != "END_OF_TEST") & (f_prior["exit_date"] < t_cutoff_date)].sort_values(by=["coin", "entry_date"]).reset_index(drop=True)
+
+        res_trunc = engine_trunc.run_interval(
+            grid_trunc, raw_trunc, entry_trunc, exit_trunc, macro_trunc,
+            300, t_cutoff, state_mat=state_trunc
+        )
+        t_prior = res_trunc["trades"]
+        if len(t_prior) > 0:
+            t_prior = t_prior[(t_prior["reason"] != "END_OF_TEST") & (t_prior["exit_date"] < t_cutoff_date)].sort_values(by=["coin", "entry_date"]).reset_index(drop=True)
+
+        if len(f_prior) != len(t_prior):
+            raise RuntimeError(f"Causality Drift in Archetype {cfg['entry_type']}: Trade count mismatch.")
+
+        for row_i in range(len(f_prior)):
+            f_row = f_prior.iloc[row_i]
+            t_row = t_prior.iloc[row_i]
+            if (f_row["coin"] != t_row["coin"] or
+                f_row["entry_date"] != t_row["entry_date"] or
+                f_row["exit_date"] != t_row["exit_date"] or
+                abs(f_row["pnl"] - t_row["pnl"]) > 0.01):
+                raise RuntimeError(f"Row-level Causality Drift on trade {f_row['coin']} on {f_row['entry_date']}")
+
+    logging.info("Complete 5-Archetype Prefix-Invariance Audit Passed (Exact Row-Level PnL Verified).")
+
+
+# ==============================================================================
+# OPTUNA HYPERPARAMETER TUNER (Safe Static Search Space)
+# ==============================================================================
+def sample_hyperparameters(trial: optuna.Trial) -> Dict[str, Any]:
+    p = {}
+    p["entry_type"] = trial.suggest_categorical("entry_type", [0, 1, 2, 3, 4])   # V12.1: all five families searched again (owner decision)
+    p["adx_thresh"] = trial.suggest_categorical("adx_thresh", [0.0, 15.0, 20.0, 25.0, 30.0, 35.0, 40.0, 45.0])
+
+    if p["entry_type"] == 0:
+        p["entry_ma_len"] = trial.suggest_int("entry_ma_len", 10, 200, step=5)
+        p["entry_ma_type"] = trial.suggest_categorical("entry_ma_type", [0, 1, 3])
+    elif p["entry_type"] == 1:
+        p["rsi_f_len"] = trial.suggest_int("rsi_f_len", 10, 80, step=2)
+        p["rsi_f_smt"] = trial.suggest_int("rsi_f_smt", 6, 40, step=2)
+        p["rsi_s_len"] = trial.suggest_int("rsi_s_len", 10, 80, step=2)
+        p["rsi_s_smt"] = trial.suggest_int("rsi_s_smt", 6, 40, step=2)
+        p["use_rsi_trend_filter"] = trial.suggest_categorical("use_rsi_trend_filter", [True, False])
+        if p["use_rsi_trend_filter"]:
+            p["rsi_trend_ma_len"] = trial.suggest_int("rsi_trend_ma_len", 20, 200, step=10)
+            p["rsi_trend_ma_type"] = trial.suggest_categorical("rsi_trend_ma_type", [0, 1, 3])
+    elif p["entry_type"] == 2:
+        p["xover_short_len"] = trial.suggest_int("xover_short_len", 10, 100, step=5)
+        p["xover_short_type"] = trial.suggest_categorical("xover_short_type", [0, 1, 3])
+        gap = trial.suggest_int("xover_gap", 10, 80, step=5)
+        p["xover_gap"] = gap
+        p["xover_long_len"] = min(200, p["xover_short_len"] + gap)
+        p["xover_long_type"] = trial.suggest_categorical("xover_long_type", [0, 1, 3])
+    elif p["entry_type"] == 3:
+        p["vol_ma_len"] = trial.suggest_int("vol_ma_len", 10, 50, step=2)
+        p["vol_mult"] = round(trial.suggest_float("vol_mult", 1.5, 4.5, step=0.1), 1)
+        p["price_lookback"] = trial.suggest_int("price_lookback", 10, 50, step=2)
+        p["body_atr_mult"] = round(trial.suggest_float("body_atr_mult", 0.3, 2.0, step=0.1), 1)
+    elif p["entry_type"] == 4:
+        p["bb_entry_len"] = trial.suggest_int("bb_entry_len", 10, 50, step=2)
+        p["bb_entry_std"] = round(trial.suggest_float("bb_entry_std", 1.5, 3.0, step=0.1), 1)
+
+    if FORCE_MACRO_REGIME_FILTER is not None:
+        p["use_market_macro_system"] = FORCE_MACRO_REGIME_FILTER
+    else:
+        p["use_market_macro_system"] = trial.suggest_categorical("use_market_macro_system", [True, False])
+
+    if p["use_market_macro_system"]:
+        p["macro_ma_len"] = trial.suggest_int("macro_ma_len", 20, 250, step=10)
+        p["macro_ma_type"] = trial.suggest_categorical("macro_ma_type", [0, 1, 3])
+        p["macro_active_exit"] = trial.suggest_categorical("macro_active_exit", [True, False])
+    else:
+        p["macro_active_exit"] = False
+
+    p["max_concurrent_tranches"] = trial.suggest_int("max_concurrent_tranches", 4, 20, step=1)
+    if p["entry_type"] in (0, 3, 4):
+        p["max_pyramid_layers"] = trial.suggest_categorical("max_pyramid_layers", [1, 2])
+    else:
+        p["max_pyramid_layers"] = 1
+
+    p["wl_mode"] = trial.suggest_categorical("wl_mode", [
+        "WL_NONE", "WL_DEEPEST_DISCOUNT", "WL_STRONGEST_MOMENTUM"
+    ])
+
+    # Take-profit / partial-exit block removed in V11 (worse in 4/4 prior studies; caps surges; costly DP on small lots).
+    p["tranche_floor"] = float(trial.suggest_categorical("tranche_floor", TRANCHE_FLOOR_CHOICES))
+
+    p["be_trigger_atr"] = trial.suggest_categorical("be_trigger_atr", [0.0, 1.5, 2.5, 3.5])
+    p["max_holding_bars"] = trial.suggest_int("max_holding_bars", 10, 250, step=5)
+    p["sl_mult"] = round(trial.suggest_float("sl_mult", 2.0, 9.0, step=0.2), 1)
+
+    if FORCE_TRAIL_STOP is True:
+        p["exit_type"] = trial.suggest_categorical("exit_type", [0, 3, 4, 5, 6, 7])
+        p["trail_pct"] = 0.0
+        p["trail_atr_mult"] = 0.0
+    else:
+        p["exit_type"] = trial.suggest_categorical("exit_type", [0, 1, 3, 4, 5, 6, 7])
+        if p["exit_type"] == 1:
+            p["trail_pct"] = round(trial.suggest_float("trail_pct", 5.0, 25.0, step=1.0), 1)
+            p["trail_atr_mult"] = 0.0
+        else:
+            p["trail_atr_mult"] = trial.suggest_categorical("trail_atr_mult", [0.0, 2.5, 3.5, 5.0, 6.5])
+
+    if p["exit_type"] == 3:
+        p["exit_ma_len"] = trial.suggest_int("exit_ma_len", 10, 150, step=5)
+        p["exit_ma_type"] = trial.suggest_categorical("exit_ma_type", [0, 1, 3])
+    elif p["exit_type"] == 4:
+        p["exit_rsi_f_len"] = trial.suggest_int("exit_rsi_f_len", 10, 60, step=2)
+        p["exit_rsi_f_smt"] = trial.suggest_int("exit_rsi_f_smt", 6, 30, step=2)
+        p["exit_rsi_s_len"] = trial.suggest_int("exit_rsi_s_len", 10, 60, step=2)
+        p["exit_rsi_s_smt"] = trial.suggest_int("exit_rsi_s_smt", 6, 30, step=2)
+    elif p["exit_type"] == 5:
+        p["exit_xover_short_len"] = trial.suggest_int("exit_xover_short_len", 10, 80, step=5)
+        p["exit_xover_short_type"] = trial.suggest_categorical("exit_xover_short_type", [0, 1, 3])
+        exit_gap = trial.suggest_int("exit_xover_gap", 10, 60, step=5)
+        p["exit_xover_gap"] = exit_gap
+        p["exit_xover_long_len"] = min(150, p["exit_xover_short_len"] + exit_gap)
+        p["exit_xover_long_type"] = trial.suggest_categorical("exit_xover_long_type", [0, 1, 3])
+    elif p["exit_type"] == 6:
+        p["exit_vol_ma_len"] = trial.suggest_int("exit_vol_ma_len", 10, 40, step=5)
+        p["exit_vol_mult"] = round(trial.suggest_float("exit_vol_mult", 0.8, 3.5, step=0.1), 1)
+    elif p["exit_type"] == 7:
+        p["bb_exit_len"] = trial.suggest_int("bb_exit_len", 10, 60, step=2)
+
+    return p
+
+
+def _canonical_func_source(fn) -> str:
+    """Extracts an AST dump of a function, stripping docstrings, comments, and whitespace formatting."""
+    try:
+        source = inspect.getsource(fn)
+        tree = ast.parse(source)
+        for node in ast.walk(tree):
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.Module)):
+                if (node.body and isinstance(node.body[0], ast.Expr) and
+                        isinstance(node.body[0].value, (ast.Constant, ast.Str))):
+                    node.body.pop(0)
+        return ast.dump(tree)
+    except Exception:
+        return inspect.getsource(fn)
+
+
+ENGINE_HASH_INPUT: str = (
+    _canonical_func_source(sample_hyperparameters) +
+    _canonical_func_source(calculate_metrics) +
+    _canonical_func_source(compile_signals_fast) +
+    _canonical_func_source(BacktestEngine) +
+    _canonical_func_source(FastIndicators) +
+    _canonical_func_source(calculate_benchmarks) +
+    _canonical_func_source(compute_max_affordable_tranche) +
+    _canonical_func_source(breakeven_exit_price) +
+    _canonical_func_source(repair_price_artifacts) +
+    _canonical_func_source(_year_returns) +
+    _canonical_func_source(compute_buy_cost_audited) +
+    _canonical_func_source(compute_sell_proceeds_audited) +
+    str([FORCE_MACRO_REGIME_FILTER, FORCE_TRAIL_STOP, START_YEAR, CRYPTO_EXCHANGE_FEE_RATE, LIQUIDITY_FLOOR_USD,
+         BRACKET_SLIPPAGE_BPS, BRACKET_IMPACT_COEF_BPS, TIER_ADV_LARGE_USD, TIER_ADV_MID_USD, VOL_BREAKOUT_SLIP_MULT, SLIPPAGE_SCALE,
+         TRANCHE_FLOOR_CHOICES, MAX_POSITION_EQUITY_PCT,
+         MAX_ADV_PARTICIPATION, DD_PENALTY_WEIGHT, MIN_CLOSED_TRADES, EOT_EXCESS_WEIGHT, ADV_WINDOW, ADV_MIN_PERIODS,
+         INITIAL_CAPITAL, MONTHLY_CONTRIBUTION, CASH_ANNUAL_YIELD, WL_MAX_AGE_BARS, BENCH_SYMBOL, BARS_PER_YEAR, TOP_N_COINS, DELIST_HAIRCUT,
+         OBJ_YEAR_EXCESS_CLIP, OBJ_SCORE_SCALE, OBJ_MIN_YEAR_BARS, STOP_EXECUTION, STOP_MARKET_SLIP_MULT, EXCLUDED_SYMBOLS, ALLOWED_PROVIDERS, PEGGED_BAND, PEGGED_SHARE, BASKET_INVESTABLE_ONLY, SPIKE_MIN_MOVE, CA_DROP_Q, CA_JUMP_Q, CA_GAP_EXPLAINS, CA_MARKET_DAY_MAX, MANUAL_CORPORATE_ACTIONS])
+)
+PARAM_SPACE_HASH: str = hashlib.sha256(ENGINE_HASH_INPUT.encode()).hexdigest()[:8]
+STUDY_NAME = f"crypto_swing_{ENGINE_VERSION.lower()}_{UNIVERSE_NAME.lower()}_{PARAM_SPACE_HASH}"
+
+
+def reconstitute_params(params: Dict[str, Any]) -> Dict[str, Any]:
+    """Rebuilds derived crossover lengths and guarantees all default configuration keys."""
+    p = copy.deepcopy(params)
+    for k in list(p.keys()):
+        if isinstance(p[k], float):
+            p[k] = round(p[k], 2)
+
+    if p.get("entry_type") == 2 and "xover_gap" in p:
+        p["xover_long_len"] = min(200, p["xover_short_len"] + p["xover_gap"])
+    if p.get("exit_type") == 5 and "exit_xover_gap" in p:
+        p["exit_xover_long_len"] = min(200, p["exit_xover_short_len"] + p["exit_xover_gap"])
+
+    # Fallback defaults for conditional parameters not sampled in trial.params
+    p.setdefault("use_market_macro_system", False if FORCE_MACRO_REGIME_FILTER is None else FORCE_MACRO_REGIME_FILTER)
+    p.setdefault("macro_active_exit", False)
+    p.setdefault("max_pyramid_layers", 1)
+    p.setdefault("adx_thresh", 0.0)
+    p.setdefault("be_trigger_atr", 0.0)
+    p.setdefault("trail_atr_mult", 0.0)
+    p.setdefault("wl_mode", "WL_NONE")
+    p.setdefault("tranche_floor", TRANCHE_FLOOR_USD)
+    for legacy in ("use_global_tp", "tp_mult", "tp_size_pct", "tp_move_sl_be"):
+        p.pop(legacy, None)
+    return p
+
+
+# ==============================================================================
+# TWR BETA, CAPTURE, ABLATIONS & PLACEBO SUITE
+# ==============================================================================
+def compute_twr_analytics(strategy_twr: np.ndarray, btc_daily_ret: np.ndarray) -> Dict[str, float]:
+    """Computes true daily strategy TWR correlation, beta, and capture ratios."""
+    if len(strategy_twr) <= 2 or len(btc_daily_ret) <= 2:
+        return {"twr_corr": 0.0, "twr_beta": 0.0, "up_capture": np.nan, "down_capture": np.nan}
+
+    strat_daily_ret = np.diff(strategy_twr) / np.maximum(1e-6, strategy_twr[:-1])
+    min_len = min(len(strat_daily_ret), len(btc_daily_ret))
+    r_s = strat_daily_ret[:min_len]
+    r_m = btc_daily_ret[:min_len]
+
+    cov_matrix = np.cov(r_s, r_m)
+    var_m = cov_matrix[1, 1]
+    cov_sm = cov_matrix[0, 1]
+    twr_beta = float(cov_sm / max(1e-9, var_m))
+
+    corr_matrix = np.corrcoef(r_s, r_m)
+    twr_corr = float(corr_matrix[0, 1])
+
+    up_idx = r_m > 0
+    down_idx = r_m < 0
+
+    up_capture = float((np.mean(r_s[up_idx]) / max(1e-9, np.mean(r_m[up_idx]))) * 100.0) if np.any(up_idx) else np.nan
+    down_capture = float((np.mean(r_s[down_idx]) / min(-1e-9, np.mean(r_m[down_idx]))) * 100.0) if np.any(down_idx) else np.nan
+
+    return {
+        "twr_corr": float(np.nan_to_num(twr_corr, nan=0.0)),
+        "twr_beta": float(np.nan_to_num(twr_beta, nan=0.0)),
+        "up_capture": float(up_capture),
+        "down_capture": float(down_capture),
+    }
+
+
+def run_matched_placebo_suite(grid: MarketGrid, p: Dict[str, Any], total_bars: int,
+                              start_bar: int, end_bar: int, benchmark_cagr: float,
+                              total_raw_triggers: int, n_seeds: int = 100, n_seeds_uncond: int = 30) -> Dict[str, Any]:
+    """Runs Unconditioned and Conditioned Placebos and preserves full empirical distributions."""
+    n_syms = len(grid.symbols)
+    raw_trigger_prob = max(0.001, total_raw_triggers / float(total_bars * n_syms))
+    np.random.seed(42)
+    unconditioned_cagrs = []
+    conditioned_cagrs = []
+    adx_t = p.get("adx_thresh", 0.0)
+
+    _, _, exit_mat, macro_ok, state_mat = compile_signals_fast(grid, p)
+    engine = BacktestEngine(params=p)
+
+    liq_thresh = np.maximum(grid.liq_floor, 1.0)[:, None]
+    for seed_i in range(n_seeds):
+        random_raw = (np.random.rand(n_syms, total_bars) < raw_trigger_prob)
+        placebo_raw = np.zeros((n_syms, len(grid.dates)), dtype=bool)
+        placebo_raw[:, start_bar:end_bar] = random_raw & grid.alive_mat[:, start_bar:end_bar]
+        liq_ok = grid.dvol30_mat >= liq_thresh
+
+        if seed_i < n_seeds_uncond:
+            uncond_entry = placebo_raw & macro_ok & liq_ok & grid.alive_mat
+            res_uncond = engine.run_interval(grid, placebo_raw, uncond_entry, exit_mat, macro_ok, start_bar, end_bar, state_mat=state_mat)
+            m_uncond = calculate_metrics(res_uncond, grid, start_bar, end_bar, benchmark_cagr)
+            unconditioned_cagrs.append(m_uncond["full"]["cagr"])
+
+        adx_ok = (grid.adx14_mat >= adx_t) if adx_t > 0.0 else True
+        cond_entry = placebo_raw & macro_ok & adx_ok & liq_ok & grid.alive_mat
+        res_cond = engine.run_interval(grid, placebo_raw, cond_entry, exit_mat, macro_ok, start_bar, end_bar, state_mat=state_mat)
+        m_cond = calculate_metrics(res_cond, grid, start_bar, end_bar, benchmark_cagr)
+        conditioned_cagrs.append(m_cond["full"]["cagr"])
+
+    return {
+        "unconditioned": (
+            float(np.median(unconditioned_cagrs)),
+            float(np.percentile(unconditioned_cagrs, 5)),
+            float(np.percentile(unconditioned_cagrs, 95))
+        ),
+        "conditioned": (
+            float(np.median(conditioned_cagrs)),
+            float(np.percentile(conditioned_cagrs, 5)),
+            float(np.percentile(conditioned_cagrs, 95))
+        ),
+        "unconditioned_samples": unconditioned_cagrs,
+        "conditioned_samples": conditioned_cagrs,
+    }
+
+
+def run_trailing_stop_ablation(grid: MarketGrid, p: Dict[str, Any], is_start: int, is_end: int,
+                               oos_start: int, oos_end: int, is_bench_cagr: float,
+                               oos_bench_cagr: float) -> str:
+    """Evaluates the contribution of trailing stop parameters vs a pure fixed stop."""
+    is_trail_active = (p.get("exit_type") == 1 and p.get("trail_pct", 0.0) > 0.0) or (p.get("trail_atr_mult", 0.0) > 0.0)
+    if not is_trail_active:
+        return "*Trailing Stop Ablation not applicable: The winning configuration does not employ a trailing stop mechanism.*\n"
+
+    ablated_params = copy.deepcopy(p)
+    if ablated_params.get("exit_type") == 1:
+        ablated_params["exit_type"] = 0
+        ablated_params["trail_pct"] = 0.0
+    ablated_params["trail_atr_mult"] = 0.0
+
+    raw_sig, entry_mat, exit_mat, macro_ok, state_mat = compile_signals_fast(grid, p)
+    raw_sig_abl, entry_abl, exit_abl, macro_abl, state_abl = compile_signals_fast(grid, ablated_params)
+
+    eng_base = BacktestEngine(params=p)
+    eng_abl = BacktestEngine(params=ablated_params)
+
+    r_is_base = eng_base.run_interval(grid, raw_sig, entry_mat, exit_mat, macro_ok, is_start, is_end, state_mat=state_mat)
+    r_is_abl = eng_abl.run_interval(grid, raw_sig_abl, entry_abl, exit_abl, macro_abl, is_start, is_end, state_mat=state_abl)
+    m_is_base = calculate_metrics(r_is_base, grid, is_start, is_end, is_bench_cagr)
+    m_is_abl = calculate_metrics(r_is_abl, grid, is_start, is_end, is_bench_cagr)
+
+    r_oos_base = eng_base.run_interval(grid, raw_sig, entry_mat, exit_mat, macro_ok, oos_start, oos_end, state_mat=state_mat)
+    r_oos_abl = eng_abl.run_interval(grid, raw_sig_abl, entry_abl, exit_abl, macro_abl, oos_start, oos_end, state_mat=state_abl)
+    m_oos_base = calculate_metrics(r_oos_base, grid, oos_start, oos_end, oos_bench_cagr, min_trades=0)
+    m_oos_abl = calculate_metrics(r_oos_abl, grid, oos_start, oos_end, oos_bench_cagr, min_trades=0)
+
+    active_trail_desc = f"trail_pct={p.get('trail_pct')}%" if p.get("exit_type") == 1 else f"trail_atr_mult={p.get('trail_atr_mult')}x"
+
+    return f"""| Window | Configuration | Strategy CAGR | Max DD | Profit Factor | Completed Trades | Realized PnL |
+| :--- | :--- | :--- | :--- | :--- | :--- | :--- |
+| **In-Sample** | **Winner ({active_trail_desc})** | **{m_is_base['full']['cagr']:.2f}%** | **{m_is_base['max_dd']:.2f}%** | **{m_is_base['full']['profit_factor']:.2f}** | **{m_is_base['full']['trades']}** | **{format_price(m_is_base['full']['net_pnl'])}** |
+| In-Sample | Ablated (No Trailing Stop) | {m_is_abl['full']['cagr']:.2f}% | {m_is_abl['max_dd']:.2f}% | {m_is_abl['full']['profit_factor']:.2f} | {m_is_abl['full']['trades']} | {format_price(m_is_abl['full']['net_pnl'])} |
+| **Out-of-Sample** | **Winner ({active_trail_desc})** | **{m_oos_base['full']['cagr']:.2f}%** | **{m_oos_base['max_dd']:.2f}%** | **{m_oos_base['full']['profit_factor']:.2f}** | **{m_oos_base['full']['trades']}** | **{format_price(m_oos_base['full']['net_pnl'])}** |
+| Out-of-Sample | Ablated (No Trailing Stop) | {m_oos_abl['full']['cagr']:.2f}% | {m_oos_abl['max_dd']:.2f}% | {m_oos_abl['full']['profit_factor']:.2f} | {m_oos_abl['full']['trades']} | {format_price(m_oos_abl['full']['net_pnl'])} |
+"""
+
+
+# ==============================================================================
+# AUDIT AND FORENSIC REPORTING PIPELINE
+# ==============================================================================
+# ==============================================================================
+# V11 HELPERS: data sanity, cached audit, timing robustness, gates, paste block
+# ==============================================================================
+from types import SimpleNamespace
+
+STAGE2_N: int = 8            # candidates that receive the expensive neighbor + timing battery
+
+
+def write_data_sanity(provenance_records: List[Dict[str, Any]], grid: MarketGrid) -> str:
+    df = pd.DataFrame(provenance_records)
+    try:
+        df.to_csv(SANITY_CSV_FILE, index=False)
+    except Exception:
+        pass
+    requested = load_universe_constituents(UNIVERSE_NAME)
+    missing = sorted(set(requested) - set(grid.symbols))
+    jumpy = df[df["max_1d_move_pct"] > 40.0].sort_values("max_1d_move_pct", ascending=False) if len(df) else df
+    short = df[df["total_bars"] < 750] if len(df) else df
+    by_b = df.groupby("bracket").size().to_dict() if len(df) else {}
+    logging.info(f"Universe: {len(grid.symbols)} of {len(requested)} constituents have usable history | brackets {by_b} | "
+                 f"{len(missing)} missing | {len(jumpy)} with a >40% one-day move (check for token swaps / redenominations) | {len(short)} short-history")
+    if len(jumpy):
+        logging.warning("Symbols with a >40% one-day close-to-close move (verify data adjustment): " +
+                        ", ".join(f"{r.symbol} {r.max_1d_move_pct:.0f}% on {r.max_1d_move_date}" for r in jumpy.head(12).itertuples()))
+    md = f"* Constituents requested: **{len(requested)}** | usable: **{len(grid.symbols)}** | by bracket: {by_b}\n"
+    md += f"* No usable exchange history for **{len(missing)}** symbols" + (f": {', '.join(missing[:40])}{' ...' if len(missing) > 40 else ''}" if missing else "") + "\n"
+    md += f"* Short history (<750 bars): **{len(short)}** symbols\n"
+    if len(jumpy):
+        md += "* **Check for token-swap / redenomination price artifacts** (one-day move > 40%): " + ", ".join(
+            f"{r.symbol} ({r.max_1d_move_pct:.0f}% on {r.max_1d_move_date})" for r in jumpy.head(15).itertuples()) + "\n"
+    else:
+        md += "* No one-day moves above 40% found.\n"
+    md += f"* Full per-symbol table: `{SANITY_CSV_FILE.name}`\n"
+    return md
+
+
+def run_causality_audit_cached(grid: MarketGrid) -> None:
+    try:
+        if AUDIT_STAMP_FILE.exists() and AUDIT_STAMP_FILE.read_text().strip() == PARAM_SPACE_HASH:
+            logging.info("Causality audit already passed for this engine hash; skipping re-run.")
+            return
+    except Exception:
+        pass
+    verify_behavioral_causality(grid)
+    try:
+        AUDIT_STAMP_FILE.write_text(PARAM_SPACE_HASH)
+    except Exception:
+        pass
+
+
+def run_timing_robustness(grid: MarketGrid, params: Dict[str, Any], start_bar: int, end_bar: int) -> Dict[str, Any]:
+    """Re-runs the config with the monthly deposit landing on different trading days and with shifted start dates."""
+    raw, ent, ext, mac, st = compile_signals_fast(grid, params)
+    eng = BacktestEngine(params=params)
+    rows = []
+    for shift in TIMING_START_SHIFTS:
+        s = start_bar + shift
+        if end_bar - s < 200:
+            continue
+        bench = calculate_benchmarks(grid, s, end_bar, mac)
+        for off in TIMING_CONTRIB_OFFSETS:
+            res = eng.run_interval(grid, raw, ent, ext, mac, s, end_bar, state_mat=st, contrib_offset=off)
+            m = calculate_metrics(res, grid, s, end_bar, bench)
+            rows.append({"shift": shift, "offset": off, "cagr": m["full"]["cagr"], "bench": bench["btc_twr_cagr"],
+                         "excess": m["excess_cagr"], "score": m["score"], "trades": m["full"]["trades"]})
+    if not rows:
+        return {"rows": [], "p10_score": -10.0, "median_score": -10.0, "worst_excess": -99.0, "median_excess": -99.0, "ok": False}
+    sc = np.array([r["score"] for r in rows]); ex = np.array([r["excess"] for r in rows])
+    return {"rows": rows, "p10_score": float(np.percentile(sc, 10)), "median_score": float(np.median(sc)),
+            "worst_excess": float(ex.min()), "median_excess": float(np.median(ex)), "ok": bool(np.percentile(sc, 10) > 0.0)}
+
+
+def segment_from_continuous(cont: Dict[str, Any], grid: MarketGrid, is_start: int, seg_start: int, seg_end: int) -> Dict[str, Any]:
+    """OOS as a slice of ONE continuous run (positions carried in, no restart, no forced liquidation at the split)."""
+    tw = cont["twr_curve"]
+    off_s, off_e = seg_start - is_start, seg_end - is_start
+    base = tw[off_s - 1] if off_s >= 1 else 1.0
+    seg = tw[off_s:off_e] / max(1e-9, base)
+    n = len(seg)
+    if n < 2:
+        return {"cagr": 0.0, "max_dd": 0.0, "trades": 0, "net_pnl": 0.0, "bars": n}
+    cagr = (seg[-1] ** (BARS_PER_YEAR / n) - 1.0) * 100.0
+    pk = np.maximum.accumulate(seg)
+    dd = float(np.max((pk - seg) / np.maximum(1e-9, pk))) * 100.0
+    tdf = cont["trades"]
+    if len(tdf):
+        xd = pd.to_datetime(tdf["exit_date"])
+        mask = (xd >= grid.dates[seg_start]) & (xd <= grid.dates[seg_end - 1]) & (tdf["reason"] != "END_OF_TEST")
+        nt, pnl = int(mask.sum()), float(tdf.loc[mask, "pnl"].sum())
+    else:
+        nt, pnl = 0, 0.0
+    return {"cagr": float(cagr), "max_dd": dd, "trades": nt, "net_pnl": pnl, "bars": n}
+
+
+def missed_swing_md(grid: MarketGrid, signal_log: List[Tuple[int, int, int, str]], horizon: int = 20) -> str:
+    """Consecutive-day signals on the same symbol are ONE swing episode (a 'close > MA' state fires every day)."""
+    if not signal_log:
+        return "*No signals recorded.*\n"
+    df = pd.DataFrame(signal_log, columns=["sid", "c_i", "sbar", "outcome"]).sort_values(["c_i", "sbar"]).reset_index(drop=True)
+    df["ep"] = ((df["c_i"] != df["c_i"].shift()) | ((df["sbar"] - df["sbar"].shift()) > 1)).cumsum()
+    order = ["executed", "slot_saturated", "cash_starved", "scrip_risk_cap", "expired_unfilled", "revalidation_dropped",
+             "anti_averaging_down", "pyramid_blocked", "liquidity_blocked", "adx_blocked", "macro_blocked", "open_at_end"]
+    prio = {o: i for i, o in enumerate(order)}
+    df["prio"] = df["outcome"].map(prio).fillna(len(order))
+    eps = df.groupby("ep").agg(c_i=("c_i", "first"), sbar=("sbar", "first"), prio=("prio", "min"), days=("sid", "count")).reset_index()
+    eps["outcome"] = eps["prio"].map({i: o for o, i in prio.items()}).fillna("other")
+    n_bars = len(grid.dates)
+    fwd = []
+    for r in eps.itertuples():
+        e = min(int(r.sbar) + horizon, n_bars - 1)
+        px0 = grid.open_mat[int(r.c_i), int(r.sbar)]
+        fwd.append(grid.close_mat[int(r.c_i), e] / px0 - 1.0 if (e > r.sbar and np.isfinite(px0) and px0 > 0) else np.nan)
+    eps["fwd"] = fwd
+    eps = eps.dropna(subset=["fwd"])
+    if eps.empty:
+        return "*No evaluable swing episodes.*\n"
+    g = eps.groupby("outcome")["fwd"].agg(["count", "mean", "median", lambda x: (x > 0.10).mean()])
+    g.columns = ["n", "mean", "median", "big"]
+    md = (f"*A swing episode = a run of consecutive daily signals on one symbol; its best disposition and the {horizon}-bar forward "
+          f"return from its first day are shown.*\n\n| Best Disposition of the Episode | Episodes | Mean {horizon}-bar Fwd Return | Median | Share > +10% |\n| :--- | :--- | :--- | :--- | :--- |\n")
+    for o in order:
+        if o in g.index:
+            r = g.loc[o]
+            md += f"| {o} | {int(r['n'])} | {r['mean']*100:+.2f}% | {r['median']*100:+.2f}% | {r['big']*100:.1f}% |\n"
+    big = eps[eps["fwd"] > 0.10]
+    if len(big) > 0:
+        md += f"\n* Of **{len(big)}** swing episodes that ran > +10% within {horizon} bars, **{(big['outcome'] == 'executed').mean() * 100:.1f}%** were bought "
+        md += f"(**{(big['outcome'].isin(['slot_saturated', 'cash_starved', 'scrip_risk_cap', 'expired_unfilled'])).mean() * 100:.1f}%** were lost to capital/slot limits, "
+        md += f"**{(big['outcome'].isin(['adx_blocked', 'liquidity_blocked', 'macro_blocked'])).mean() * 100:.1f}%** to the entry filters).\n"
+    cap = eps[eps["outcome"].isin(["cash_starved", "slot_saturated", "scrip_risk_cap", "expired_unfilled"])]
+    ex = eps[eps["outcome"] == "executed"]
+    if len(cap) > 20 and len(ex) > 20:
+        verdict = ("the ranking leaves better swings on the table" if cap["fwd"].mean() > ex["fwd"].mean() else "the ranking is choosing at least as well as the average dropped episode")
+        md += f"* Capital-driven drops average **{cap['fwd'].mean()*100:+.2f}%** vs **{ex['fwd'].mean()*100:+.2f}%** for bought episodes: {verdict}.\n"
+    return md
+
+
+def top_trades_md(trades: pd.DataFrame, n: int = 10) -> str:
+    if len(trades) == 0:
+        return "*No trades.*\n"
+    tot = float(trades["pnl"].sum())
+    t = trades.sort_values("pnl", ascending=False).head(n)
+    ev = {}
+    for r in DATA_REPAIR_LOG:
+        ev.setdefault(r["symbol"], []).append(pd.Timestamp(r["date"]))
+    md = "| Symbol | Entry | Exit | Bars | Return | Net PnL | Share of Total | Exit Reason | Data-event nearby |\n| :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- |\n"
+    for _, r in t.iterrows():
+        near = any(abs((pd.Timestamp(r["entry_date"]) - d).days) <= 5 or abs((pd.Timestamp(r["exit_date"]) - d).days) <= 5
+                   for d in ev.get(r["coin"], []))
+        md += (f"| {r['coin']} | {pd.Timestamp(r['entry_date']).date()} | {pd.Timestamp(r['exit_date']).date()} | {int(r['bars'])} | "
+               f"{r['ret']*100:+.1f}% | {format_price(r['pnl'])} | {(r['pnl']/tot*100 if tot > 0 else 0):.1f}% | {r['reason']} | {'YES - review' if near else 'no'} |\n")
+    if tot > 0:
+        md += (f"\n* Top-1 / top-3 / top-5 / top-10 trades = **{trades['pnl'].nlargest(1).sum()/tot:.1%} / {trades['pnl'].nlargest(3).sum()/tot:.1%} / "
+               f"{trades['pnl'].nlargest(5).sum()/tot:.1%} / {trades['pnl'].nlargest(10).sum()/tot:.1%}** of total profit.\n")
+    return md
+
+
+def repairs_md() -> str:
+    if not DATA_REPAIR_LOG:
+        return "* No data repairs were needed.\n"
+    df = pd.DataFrame(DATA_REPAIR_LOG)
+    cnt = df["type"].value_counts().to_dict()
+    md = f"* Repairs by type: {cnt}. Full list in `{REPAIRS_CSV_FILE.name}`.\n\n"
+    md += "| Type | Symbol | Date | Close ratio | Detail |\n| :--- | :--- | :--- | :--- | :--- |\n"
+    show = df[df["type"] != "LARGE_MOVE_KEPT"].head(25).to_dict("records") + df[df["type"] == "LARGE_MOVE_KEPT"].head(15).to_dict("records")
+    for r in show:
+        md += f"| {r['type']} | {r['symbol']} | {r['date']} | {r['ratio']:.3f} | {r['detail']} |\n"
+    return md
+
+
+def objective_sensitivity_md(m: Dict[str, Any]) -> str:
+    ye = np.array(m.get("year_excess_raw", []), dtype=float)
+    if len(ye) == 0:
+        return "*Not available.*\n"
+    md = "| Year-excess clip (log pts) | DD weight 0.15 | DD weight 0.25 | DD weight 0.40 |\n| :--- | :--- | :--- | :--- |\n"
+    over_dd = max(0.0, m["max_dd"] - m["bench_max_dd"])
+    for clip in OBJ_YEAR_CLIP_SENSITIVITY:
+        core = float(np.mean(np.clip(ye, -clip, clip))) * OBJ_SCORE_SCALE
+        md += f"| {clip:.0f} | " + " | ".join(f"{core - w * over_dd:+.2f}" for w in (0.15, 0.25, 0.40)) + " |\n"
+    return md + f"\n* Unclipped mean yearly excess vs the better of BTC/basket: **{float(np.mean(ye)):+.2f}** log-pts over {len(ye)} years; years beating that bar: **{int((ye > 0).sum())} of {len(ye)}**.\n"
+
+
+def bracket_breakdown_md(grid: MarketGrid, trades: pd.DataFrame) -> str:
+    if len(trades) == 0:
+        return "*No trades.*\n"
+    bmap = dict(zip(grid.symbols, grid.brackets))
+    t = trades.copy()
+    t["bracket"] = t["coin"].map(bmap)
+    g = t.groupby("bracket").agg(trades=("pnl", "count"), net=("pnl", "sum"), win=("pnl", lambda x: (x > 0).mean() * 100.0),
+                                 avg_ret=("ret", lambda x: x.mean() * 100.0), avg_cost=("cost_usd", "mean"))
+    md = "| Bracket | Trades | Net PnL | Win Rate | Avg Return / Trade | Avg Ticket |\n| :--- | :--- | :--- | :--- | :--- | :--- |\n"
+    for b in ("LARGE", "MID", "SMALL"):
+        if b in g.index:
+            r = g.loc[b]
+            md += f"| {b} | {int(r['trades'])} | {format_price(r['net'])} | {r['win']:.1f}% | {r['avg_ret']:+.2f}% | {format_price(r['avg_cost'])} |\n"
+    return md
+
+
+def slippage_sweep_md(grid: MarketGrid, p: Dict[str, Any], is_start: int, n_bars: int, compiled: Tuple[Any, ...]) -> str:
+    """Re-runs the continuous (IS + OOS) backtest of the champion at several multiples of the slippage model.
+    The report that sent this port: 6 bps flat slippage on a bar that traded 3.6x its volume average was optimistic. If the edge only exists at 0.5x
+    slippage it is a modelling artefact; a real edge should still beat BTC at 2x."""
+    raw_sig, entry_m, exit_m, macro_m, state_m = compiled
+    base = SLIPPAGE_SCALE
+    bench = calculate_benchmarks(grid, is_start, n_bars, macro_m)
+    md = "| Slippage multiple | Effective model | Strategy CAGR | BTC CAGR | Excess vs BTC | Max DD | Trades |\n| :--- | :--- | :--- | :--- | :--- | :--- | :--- |\n"
+    try:
+        for mult in SLIPPAGE_SWEEP:
+            globals()["SLIPPAGE_SCALE"] = base * mult
+            r = BacktestEngine(params=p).run_interval(grid, raw_sig, entry_m, exit_m, macro_m, is_start, n_bars, state_mat=state_m)
+            m = calculate_metrics(r, grid, is_start, n_bars, bench, min_trades=0)
+            eff = f"{BRACKET_SLIPPAGE_BPS['LARGE'] * base * mult:.0f}/{BRACKET_SLIPPAGE_BPS['MID'] * base * mult:.0f}/{BRACKET_SLIPPAGE_BPS['SMALL'] * base * mult:.0f} bps"
+            md += (f"| {mult:g}x | {eff} (LARGE/MID/SMALL base) | {m['full']['cagr']:.2f}% | {bench['btc_twr_cagr']:.2f}% | "
+                   f"{m['full']['cagr'] - bench['btc_twr_cagr']:+.2f} | {m['max_dd']:.1f}% | {m['full']['trades']} |\n")
+    except Exception as exc:
+        md += f"| error | {type(exc).__name__}: {exc} | | | | | |\n"
+    finally:
+        globals()["SLIPPAGE_SCALE"] = base
+    return md
+
+
+def stop_execution_ab_md(grid: MarketGrid, p: Dict[str, Any], is_start: int, n_bars: int, compiled: Tuple[Any, ...]) -> str:
+    """Runs the champion under both stop-execution models. NEXT_OPEN (judge on the close, sell at the next open) is the NSE convention; INTRADAY is a resting
+    stop-market order. In a 24/7 market the difference can be the whole strategy: a breakeven stop that is only recognised at the close exits several % below breakeven."""
+    raw_sig, entry_m, exit_m, macro_m, state_m = compiled
+    base = STOP_EXECUTION
+    bench = calculate_benchmarks(grid, is_start, n_bars, macro_m)
+    md = ("| Stop model | Strategy CAGR | BTC CAGR | Max DD | Trades | Breakeven exits | Avg breakeven-exit return | Net PnL |\n"
+          "| :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- |\n")
+    try:
+        for mode in ("NEXT_OPEN", "INTRADAY"):
+            globals()["STOP_EXECUTION"] = mode
+            r = BacktestEngine(params=p).run_interval(grid, raw_sig, entry_m, exit_m, macro_m, is_start, n_bars, state_mat=state_m)
+            m = calculate_metrics(r, grid, is_start, n_bars, bench, min_trades=0)
+            tdf_ = r["trades"]
+            be = tdf_[tdf_["reason"] == "BREAKEVEN_SL"] if len(tdf_) else tdf_
+            be_avg = f"{float(be['ret'].mean()) * 100:+.2f}%" if len(be) else "n/a"
+            md += (f"| {mode}{' (current setting)' if mode == base else ''} | {m['full']['cagr']:.2f}% | {bench['btc_twr_cagr']:.2f}% | {m['max_dd']:.1f}% | "
+                   f"{m['full']['trades']} | {len(be)} | {be_avg} | {format_price(float(tdf_['pnl'].sum()) if len(tdf_) else 0.0)} |\n")
+    except Exception as exc:
+        md += f"| error | {type(exc).__name__}: {exc} | | | | | | |\n"
+    finally:
+        globals()["STOP_EXECUTION"] = base
+    return md
+
+
+def fee_reality_md() -> str:
+    md = "| Ticket | Buy-side charges | Sell-side charges | Round trip | % of ticket |\n| :--- | :--- | :--- | :--- | :--- |\n"
+    for tk in (50, 100, 250, 500, 1000, 2500, 10000):
+        buy_total, _ = compute_buy_cost_audited(float(tk), 0.0)
+        net, _ = compute_sell_proceeds_audited(float(tk), 0.0)
+        b, s = buy_total - tk, tk - net
+        md += f"| {format_price(tk)} | {format_price(b)} | {format_price(s)} | {format_price(b + s)} | {(b + s) / tk * 100:.2f}% |\n"
+    return md
+
+
+def build_paste_block(best_params: Dict[str, Any], status: str, failing: List[str], seed_agree: int) -> str:
+    core_defaults = {"adx_thresh": 0.0, "use_market_macro_system": False, "macro_active_exit": False, "max_pyramid_layers": 1,
+                     "wl_mode": "WL_NONE", "be_trigger_atr": 0.0, "trail_atr_mult": 0.0, "tranche_floor": TRANCHE_FLOOR_USD}
+    cfg = dict(best_params)
+    for k, v in core_defaults.items():
+        cfg.setdefault(k, v)
+    order = ["entry_type", "adx_thresh"] + [k for k in cfg if k not in ("entry_type", "adx_thresh", "exit_type")] + ["exit_type"]
+    seen, lines = set(), []
+    for k in order:
+        if k in cfg and k not in seen:
+            seen.add(k)
+            lines.append(f"    {k!r}: {cfg[k]!r},")
+    hdr = (f"# ===== PASTE INTO lv_nse: replace the whole DEFAULT_CONFIG dict =====\n"
+           f"# status={status}  engine={ENGINE_VERSION}  universe={UNIVERSE_NAME}  param_hash={PARAM_SPACE_HASH}  seeds_agreeing={seed_agree}\n"
+           f"# generated={pd.Timestamp.now().isoformat(timespec='seconds')}\n")
+    if failing:
+        hdr += "# FAILED GATES: " + "; ".join(failing) + "\n"
+    hdr += (f"# liquidity floor (median 30d value): {LIQUIDITY_FLOOR_USD:,.0f} USD | tier slippage bps: {BRACKET_SLIPPAGE_BPS} | impact: {BRACKET_IMPACT_COEF_BPS}\n"
+            f"CONFIG_ENGINE_VERSION = {ENGINE_VERSION!r}\nCONFIG_PARAM_HASH = {PARAM_SPACE_HASH!r}\n")
+    return hdr + "DEFAULT_CONFIG = {\n" + "\n".join(lines) + "\n}\n"
+
+
+def eot_share_multi_cut(grid: MarketGrid, eng: Any, sigs: Tuple[Any, ...], is_start: int, is_end: int, base_share: float,
+                        base_organic: Optional[float] = None, base_basket: Optional[float] = None, base_headline: Optional[float] = None) -> Dict[str, Any]:
+    """V12.2/V12.4: how much of the in-sample result depends on unclosed terminal marks, with the IS window ending at the real cut AND at earlier cuts.
+    A long trend trade straddling one particular cut date must not decide promotion on its own.
+    rows     = (cut back-shift, rupee share of IS profit that is an unclosed mark)           [V12.2 measure, now information]
+    org_rows = (cut back-shift, organic CAGR, survivor-basket CAGR, headline CAGR)           [V12.4 gate measure, return terms]"""
+    raw_sig, entry_m, exit_m, macro_m, state_m = sigs
+    rows: List[Tuple[int, float]] = []
+    org_rows: List[Tuple[int, float, float, float]] = []
+    for b in EOT_CUT_BACKSHIFTS:
+        e = is_end - int(b)
+        if e - is_start < EOT_MIN_WINDOW_BARS:
+            continue
+        if b == 0 and base_organic is not None and base_basket is not None:
+            rows.append((0, float(base_share)))
+            org_rows.append((0, float(base_organic), float(base_basket), float(base_headline if base_headline is not None else base_organic)))
+            continue
+        try:
+            res = eng.run_interval(grid, raw_sig, entry_m, exit_m, macro_m, is_start, e, state_mat=state_m)
+            bm = calculate_benchmarks(grid, is_start, e, macro_m)
+            m = calculate_metrics(res, grid, is_start, e, bm, min_trades=0)
+            rows.append((int(b), float(m["eot_profit_share"])))
+            org_rows.append((int(b), float(m["cagr_organic"]), float(bm["basket_twr_cagr"]), float(m["full"]["cagr"])))
+        except Exception as exc:   # pragma: no cover - defensive
+            logging.warning(f"eot_share_multi_cut: cut -{b} failed: {exc}")
+    vals = [v for _, v in rows]
+    return {"rows": rows, "median": float(np.median(vals)) if vals else float(base_share), "max": float(max(vals)) if vals else float(base_share),
+            "org_rows": org_rows,
+            "org_median": float(np.median([r[1] for r in org_rows])) if org_rows else float("nan"),
+            "basket_median": float(np.median([r[2] for r in org_rows])) if org_rows else float("nan"),
+            "headline_median": float(np.median([r[3] for r in org_rows])) if org_rows else float("nan")}
+
+
+def evaluate_gates(*, oos_slice: Dict[str, Any], oos_bench_cagr: float, oos_basket_cagr: float, is_cond_pct: float,
+                   oos_cond_pct: float, is_metrics: Dict[str, Any], leave5_cagr: float, is_bench_cagr: float,
+                   cont_trades: pd.DataFrame, cont_year: Dict[int, float], idx_year: Dict[int, float],
+                   cont_max_dd: float, cont_bench_dd: float, stable: bool, timing_ok: bool, seed_agree: int,
+                   fresh_oos_cagr: Optional[float] = None, fresh_oos_trades: Optional[int] = None, eot_multi: Optional[Dict[str, Any]] = None,
+                   nb_pass_rate: Optional[float] = None, timing_p10: Optional[float] = None, n_timing: Optional[int] = None,
+                   fresh_oos_dd: Optional[float] = None, oos_basket_dd: Optional[float] = None, oos_index_dd: Optional[float] = None) -> List[Tuple[str, bool, str]]:
+    gates: List[Tuple[str, bool, str]] = []
+    gates.append(("Continuous-slice OOS beats BTC", oos_slice["cagr"] > oos_bench_cagr,
+                  f"OOS {oos_slice['cagr']:.2f}% vs benchmark {oos_bench_cagr:.2f}%"))
+    gates.append(("Continuous-slice OOS beats the equal-weight survivor basket of the same universe (survivorship-neutral)",
+                  oos_slice["cagr"] > oos_basket_cagr, f"OOS {oos_slice['cagr']:.2f}% vs basket {oos_basket_cagr:.2f}%"))
+    if fresh_oos_cagr is not None and GATE_FRESH_OOS_MUST_BEAT_INDEX:
+        gates.append(("Fresh-start OOS (cold restart on the OOS window, starting capital) beats BTC", fresh_oos_cagr > oos_bench_cagr,
+                      f"fresh OOS {fresh_oos_cagr:.2f}% vs benchmark {oos_bench_cagr:.2f}% (survivor basket {oos_basket_cagr:.2f}%)"
+                      + (f"; {fresh_oos_trades} trades" if fresh_oos_trades is not None else "")))
+    if GATE_FRESH_OOS_DD_VS_BASKET is not None and fresh_oos_dd is not None and oos_basket_dd is not None:
+        gates.append((f"Fresh-start OOS max drawdown <= {GATE_FRESH_OOS_DD_VS_BASKET:.2f}x the survivor basket's",
+                      fresh_oos_dd <= GATE_FRESH_OOS_DD_VS_BASKET * max(1.0, oos_basket_dd),
+                      f"{fresh_oos_dd:.1f}% vs basket {oos_basket_dd:.1f}%" + (f" (index {oos_index_dd:.1f}%)" if oos_index_dd is not None else "")))
+    gates.append((f"IS placebo rank >= {GATE_PLACEBO_IS_PCT:.0f}th", is_cond_pct >= GATE_PLACEBO_IS_PCT, f"{is_cond_pct:.1f}th percentile"))
+    gates.append((f"OOS placebo rank >= {GATE_PLACEBO_OOS_PCT:.0f}th", oos_cond_pct >= GATE_PLACEBO_OOS_PCT, f"{oos_cond_pct:.1f}th percentile"))
+    if eot_multi and eot_multi.get("rows"):
+        _share_txt = ", ".join(f"{'actual' if b_ == 0 else '-' + str(b_) + ' bars'} {s_:.1%}" for b_, s_ in eot_multi["rows"])
+        if GATE_EOT_MODE == "share" or not eot_multi.get("org_rows"):
+            gates.append((f"Unclosed terminal marks < {GATE_MAX_EOT_PROFIT_SHARE:.0%} of IS profit (median over {len(eot_multi['rows'])} cut dates)",
+                          eot_multi["median"] < GATE_MAX_EOT_PROFIT_SHARE,
+                          f"median {eot_multi['median']:.1%}, worst {eot_multi['max']:.1%}; by cut: " + _share_txt))
+        else:
+            _org = eot_multi["org_rows"]
+            gates.append((f"Organic IS CAGR (open gains at {EOT_EXCESS_WEIGHT:.0%} credit) still beats the survivor basket (median over {len(_org)} cut dates)",
+                          eot_multi["org_median"] > eot_multi["basket_median"],
+                          f"organic median {eot_multi['org_median']:.1f}% vs basket {eot_multi['basket_median']:.1f}% (headline {eot_multi['headline_median']:.1f}%); "
+                          f"by cut (organic vs basket): " + ", ".join(f"{'actual' if b_ == 0 else '-' + str(b_) + ' bars'} {o_:.1f}% vs {k_:.1f}%" for b_, o_, k_, _h in _org)
+                          + f"; dollar share of profit still open (information): median {eot_multi['median']:.1%}, worst {eot_multi['max']:.1%}"))
+    else:
+        gates.append((f"Unclosed terminal marks < {GATE_MAX_EOT_PROFIT_SHARE:.0%} of IS profit", is_metrics["eot_profit_share"] < GATE_MAX_EOT_PROFIT_SHARE,
+                      f"{is_metrics['eot_profit_share']:.1%}"))
+    gates.append(("Leave-top-5-out IS CAGR still beats benchmark", leave5_cagr > is_bench_cagr, f"{leave5_cagr:.2f}% vs {is_bench_cagr:.2f}%"))
+
+    # Year concentration on FLOW-STRIPPED log returns (rupee profit is biased toward late years in a compounding account)
+    lr = {y: float(np.log1p(max(-0.99, r / 100.0))) for y, r in cont_year.items()}
+    tot_lr = sum(lr.values())
+    if tot_lr > 0 and lr:
+        top_y = max(lr, key=lr.get)
+        share = lr[top_y] / tot_lr
+        gates.append((f"No single year > {GATE_MAX_YEAR_PROFIT_SHARE:.0%} of total log-return", share <= GATE_MAX_YEAR_PROFIT_SHARE,
+                      f"best year {top_y} = {share:.1%}"))
+    else:
+        gates.append((f"No single year > {GATE_MAX_YEAR_PROFIT_SHARE:.0%} of total log-return", False, "no positive total return"))
+
+    common = [y for y in cont_year if y in idx_year]
+    if common:
+        n_beat = sum(1 for y in common if cont_year[y] > idx_year[y])
+        gates.append((f"Beats BTC in >= {GATE_MIN_YEARS_BEATING:.0%} of calendar years (year-on-year goal)",
+                      n_beat / len(common) >= GATE_MIN_YEARS_BEATING, f"{n_beat} of {len(common)} years"))
+    else:
+        gates.append((f"Beats BTC in >= {GATE_MIN_YEARS_BEATING:.0%} of calendar years", False, "no comparable years"))
+
+    tot_pnl = float(cont_trades["pnl"].sum()) if len(cont_trades) else 0.0
+    if tot_pnl > 0:
+        top5 = float(cont_trades["pnl"].nlargest(5).sum() / tot_pnl)
+        gates.append((f"Lottery guard: top-5 trades <= {GATE_MAX_TOP5_TRADE_SHARE:.0%} of total profit", top5 <= GATE_MAX_TOP5_TRADE_SHARE, f"{top5:.1%}"))
+    else:
+        gates.append((f"Lottery guard: top-5 trades <= {GATE_MAX_TOP5_TRADE_SHARE:.0%} of total profit", False, "no positive total profit"))
+
+    gates.append((f"Max drawdown <= {GATE_MAX_DD_VS_INDEX:.2f}x benchmark's", cont_max_dd <= GATE_MAX_DD_VS_INDEX * max(1.0, cont_bench_dd),
+                  f"{cont_max_dd:.1f}% vs benchmark {cont_bench_dd:.1f}%"))
+    gates.append(("Neighborhood stable (all active params +/- 1 step, MA types, floor)", stable,
+                  (f"{nb_pass_rate:.0%} of neighbors beat the benchmark net of DD penalty (rule: >= 80%, median not far below the candidate, p10 > 0)"
+                   if nb_pass_rate is not None else "rule: >= 80% of neighbors beat the benchmark, median not far below the candidate, p10 > 0")))
+    gates.append(("Deposit-timing / start-date robust (p10 score > 0)", timing_ok,
+                  (f"p10 score {timing_p10:+.2f} over {n_timing} timing variants" if timing_p10 is not None and n_timing is not None else "timing variants")))
+    gates.append((f"Seeds agreeing on the strategy family >= {GATE_MIN_SEED_AGREEMENT}", seed_agree >= GATE_MIN_SEED_AGREEMENT, f"{seed_agree} of {len(SEEDS)} seeds"))
+    return gates
+
+
+def wasted_by_choice_md(allt: List[Any]) -> str:
+    """V12.4: for each choice, how many trials fall below the trade floor (truly wasted) and how many traded enough but scored <= -5 (poor configs).
+    Uses the closed-trade count recorded per trial; older studies without it fall back to a single 'score <= -5' column (cause not recorded)."""
+    if not allt:
+        return ""
+    known = all(getattr(t, "n_closed", None) is not None for t in allt)
+    rows_ = []
+    for t in allt:
+        d = {**t.params}
+        v = float(t.value)
+        if known:
+            d["_floor"] = bool(int(t.n_closed) < MIN_CLOSED_TRADES)
+            d["_poor"] = bool(v <= -5.0 and not d["_floor"])
+        else:
+            d["_le5"] = bool(v <= -5.0)
+        rows_.append(d)
+    df = pd.DataFrame(rows_)
+    def _bin(col: str, edges: List[float], labels: List[str]) -> None:
+        if col in df.columns:
+            df[col + "_band"] = pd.cut(pd.to_numeric(df[col], errors="coerce"), bins=edges, labels=labels, include_lowest=True)
+    _bin("max_concurrent_tranches", [0, 6, 9, 14, 100], ["4-6 slots", "7-9 slots", "10-14 slots", "15+ slots"])
+    _bin("max_holding_bars", [0, 60, 120, 180, 1000], ["10-60 bars", "61-120 bars", "121-180 bars", "181+ bars"])
+    if known:
+        md = (f"\n**Failure share by choice** ('Below trade floor' = fewer than {MIN_CLOSED_TRADES} closed trades, truly wasted; 'Poor' = traded enough but scored <= -5, "
+              f"i.e. a genuinely bad configuration):\n\n| Parameter | Choice | Trials | Below trade floor | Poor (<= -5) | Poor share |\n| :--- | :--- | :--- | :--- | :--- | :--- |\n")
+    else:
+        md = ("\n**Score <= -5 by choice** (this study did not record trade counts, so the cause is NOT known: a score <= -5 is either a trade-floor failure or a genuinely "
+              "poor configuration):\n\n| Parameter | Choice | Trials | Score <= -5 | Share |\n| :--- | :--- | :--- | :--- | :--- |\n")
+    for col in ("entry_type", "exit_type", "adx_thresh", "max_concurrent_tranches_band", "max_holding_bars_band", "tranche_floor"):
+        if col not in df.columns:
+            continue
+        sub = df.dropna(subset=[col])
+        if len(sub) < 20:
+            continue
+        if known:
+            g = sub.groupby(col, observed=True)[["_floor", "_poor"]].agg(["count", "sum"])
+            for ch_, r_ in g.iterrows():
+                n_ = int(r_[("_floor", "count")])
+                if n_ == 0:
+                    continue
+                md += f"| {col.replace('_band', '')} | {ch_} | {n_} | {int(r_[('_floor', 'sum')])} | {int(r_[('_poor', 'sum')])} | {r_[('_poor', 'sum')] / n_:.0%} |\n"
+        else:
+            g = sub.groupby(col, observed=True)["_le5"].agg(["count", "sum"])
+            for ch_, r_ in g.iterrows():
+                if int(r_["count"]) == 0:
+                    continue
+                md += f"| {col.replace('_band', '')} | {ch_} | {int(r_['count'])} | {int(r_['sum'])} | {r_['sum'] / r_['count']:.0%} |\n"
+    return md
+
+
+def search_diagnostics_md(seed_trials: Dict[int, List[Any]], seed_studies: Dict[int, Any]) -> str:
+    """Is the SEARCH healthy? (edge pile-ups, wasted trials, convergence, what actually drives the score)"""
+    allt = [t for trs in seed_trials.values() for t in trs]
+    if not allt:
+        return "*No trials.*\n"
+    vals = np.array([t.value for t in allt])
+    known = all(getattr(t, "n_closed", None) is not None for t in allt)
+    pos = float(np.mean(vals > 0.0))
+    if known:
+        nc = np.array([int(t.n_closed) for t in allt])
+        floor_fail = nc < MIN_CLOSED_TRADES
+        wasted = float(np.mean(floor_fail))
+        poor = float(np.mean((vals <= -5.0) & ~floor_fail))
+        mid = float(np.mean((vals > -5.0) & (vals <= 0.0)))
+        md = (f"* Trials: **{len(allt)}** over {len(seed_trials)} seeds. Below the {MIN_CLOSED_TRADES}-closed-trade floor (truly wasted budget): **{wasted:.0%}** | "
+              f"traded enough but scored <= -5 (genuinely poor configurations): **{poor:.0%}** | scored between -5 and 0: **{mid:.0%}** | beating the benchmark: **{pos:.0%}**.\n")
+        if wasted > 0.30:
+            md += "* **WARNING:** more than 30% of trials never trade enough to be scored. Some part of the space (very high ADX, very high floor, very few slots, very long holds) starves the strategy of trades; see the table below before narrowing it.\n"
+    else:
+        le5 = float(np.mean(vals <= -5.0))
+        mid = float(np.mean((vals > -5.0) & (vals <= 0.0)))
+        md = (f"* Trials: **{len(allt)}** over {len(seed_trials)} seeds. Score <= -5: **{le5:.0%}** (trade-floor failures AND genuinely poor configurations; this study did not record "
+              f"trade counts, so the split is unknown) | scored between -5 and 0: **{mid:.0%}** | beating the benchmark: **{pos:.0%}**.\n")
+
+    md += wasted_by_choice_md(allt)
+
+    md += "\n**Convergence** (best score found after X% of each seed's trials; if the last column is still rising the budget is too small):\n\n| Seed | 25% | 50% | 75% | 100% |\n| :--- | :--- | :--- | :--- | :--- |\n"
+    for sd, trs in seed_trials.items():
+        trs_o = sorted(trs, key=lambda z: z.tnum)
+        if not trs_o:
+            continue
+        cells = []
+        for frac in (0.25, 0.5, 0.75, 1.0):
+            k = max(1, int(round(len(trs_o) * frac)))
+            cells.append(f"{max(x.value for x in trs_o[:k]):+.2f}")
+        md += f"| {sd} | " + " | ".join(cells) + " |\n"
+
+    ok = [t for t in allt if t.value > -5.0]
+    if len(ok) >= 40:
+        top = sorted(ok, key=lambda x: x.value, reverse=True)[:max(30, int(0.05 * len(ok)))]
+        dists: Dict[str, Any] = {}
+        for t in allt:
+            for k, d_ in t.dists.items():
+                dists.setdefault(k, d_)
+        rows = []
+        for k, d_ in dists.items():
+            vs = [t.params[k] for t in top if k in t.params]
+            if len(vs) < 10:
+                continue
+            if hasattr(d_, "choices"):
+                if k.endswith("_type") or k in ("wl_mode", "use_rsi_trend_filter"):
+                    continue   # V12.1: nominal labels have no 'upper limit'; only ordinal/numeric choices are range-checked
+                ch = list(d_.choices)
+                if len(ch) < 3 or not all(isinstance(c_, (int, float)) and not isinstance(c_, bool) for c_ in ch):
+                    continue
+                pos_ = np.array([ch.index(v) / (len(ch) - 1) for v in vs if v in ch])
+            else:
+                lo, hi = float(d_.low), float(d_.high)
+                if hi <= lo:
+                    continue
+                pos_ = np.array([(float(v) - lo) / (hi - lo) for v in vs])
+            if len(pos_) < 10:
+                continue
+            up, dn = float(np.mean(pos_ >= 0.9)), float(np.mean(pos_ <= 0.1))
+            flag = "PILING AT UPPER LIMIT - widen or check data/objective" if up >= 0.4 else ("PILING AT LOWER LIMIT - widen or check data/objective" if dn >= 0.4 else "ok")
+            rows.append((k, float(np.median([float(v) for v in vs])), up, dn, flag))
+        md += f"\n**Range check** (where the best {len(top)} trials sit inside each numeric range):\n\n| Parameter | Median of best | In top 10% of range | In bottom 10% of range | Verdict |\n| :--- | :--- | :--- | :--- | :--- |\n"
+        for k, med, up, dn, flag in sorted(rows, key=lambda r: -max(r[2], r[3])):
+            md += f"| {k} | {med:.4g} | {up:.0%} | {dn:.0%} | {flag} |\n"
+
+        df = pd.DataFrame([{**t.params, "value": t.value} for t in ok])
+        for col in ("entry_type", "exit_type", "wl_mode", "use_market_macro_system", "tranche_floor", "max_pyramid_layers"):
+            if col in df.columns and df[col].notna().sum() > 20:
+                g = df.dropna(subset=[col]).groupby(col)["value"].agg(["count", "median", lambda x: x.quantile(0.9)])
+                md += f"\n**{col}** (score by choice, scored trials only)\n\n| Choice | Trials | Median | p90 |\n| :--- | :--- | :--- | :--- |\n"
+                for ch_, r_ in g.iterrows():
+                    md += f"| {ch_} | {int(r_['count'])} | {r_['median']:+.2f} | {r_.iloc[2]:+.2f} |\n"
+
+    try:
+        import optuna.importance as oimp
+        acc: Dict[str, List[float]] = {}
+        for sd, st in seed_studies.items():
+            imp = oimp.get_param_importances(st, target=lambda t_: max(float(t_.value), -5.0))
+            for k, v in imp.items():
+                acc.setdefault(k, []).append(float(v))
+        if acc:
+            top_imp = sorted(((k, float(np.mean(v))) for k, v in acc.items()), key=lambda kv: -kv[1])[:10]
+            md += "\n**Parameter importance** (fANOVA, averaged over seeds; what actually moves the score):\n\n| Parameter | Importance |\n| :--- | :--- |\n"
+            for k, v in top_imp:
+                md += f"| {k} | {v:.1%} |\n"
+    except Exception as exc:
+        md += f"\n*Parameter importance unavailable ({type(exc).__name__}); `pip install scikit-learn` enables it.*\n"
+    return md
+
+
+def _placebo_pct(cagr_val: float, dist: List[float]) -> float:
+    if not dist:
+        return 50.0
+    return float((np.sum(np.array(dist) < cagr_val) / len(dist)) * 100.0)
+
+
+def prescreen_gates(grid: MarketGrid, rec: Dict[str, Any], is_start: int, is_end: int, oos_start: int, oos_end: int, n_bars: int,
+                    full: bool = False, store: Optional[Dict[str, Any]] = None) -> Tuple[int, List[str]]:
+    """V12.1-V12.3: run the promotion gates for ONE shortlisted candidate.
+    full=False (default): every gate except the three expensive ones (both placebo gates, leave-top-5). Those three are NOT evaluated and are
+      NOT counted: the return is (gates passed among the EVALUATED gates, names of failed gates); evaluated = passed + len(failed).
+    full=True (V12.3): also runs the IS/OOS placebo suites and the leave-top-5-out run, so ALL gates are evaluated. The placebo suites are put
+      into `store` (keys placebo_is / placebo_oos) so the final report can reuse them instead of recomputing.
+    Never raises: on any error the candidate gets (0, ['prescreen error'])."""
+    try:
+        p = rec["params"]
+        raw_sig, entry_m, exit_m, macro_m, state_m = compile_signals_fast(grid, p)
+        eng = BacktestEngine(params=p)
+        isb = calculate_benchmarks(grid, is_start, is_end, macro_m)
+        oosb = calculate_benchmarks(grid, oos_start, oos_end, macro_m)
+        isr = eng.run_interval(grid, raw_sig, entry_m, exit_m, macro_m, is_start, is_end, state_mat=state_m)
+        ism = calculate_metrics(isr, grid, is_start, is_end, isb)
+        cr = eng.run_interval(grid, raw_sig, entry_m, exit_m, macro_m, is_start, n_bars, state_mat=state_m)
+        sl = segment_from_continuous(cr, grid, is_start, oos_start, oos_end)
+        cb = calculate_benchmarks(grid, is_start, n_bars, macro_m)
+        tw = cr["twr_curve"]
+        pk = np.maximum.accumulate(tw)
+        cdd = float(np.max((pk - tw) / np.maximum(1e-9, pk))) * 100.0 if len(tw) else 0.0
+        cy = _year_returns(tw, grid.years_arr[is_start:n_bars])
+        fr = eng.run_interval(grid, raw_sig, entry_m, exit_m, macro_m, oos_start, oos_end, state_mat=state_m)
+        frm = calculate_metrics(fr, grid, oos_start, oos_end, oosb, min_trades=0)
+        eotm = eot_share_multi_cut(grid, eng, (raw_sig, entry_m, exit_m, macro_m, state_m), is_start, is_end, float(ism["eot_profit_share"]),
+                                  base_organic=float(ism["cagr_organic"]), base_basket=float(isb["basket_twr_cagr"]), base_headline=float(ism["full"]["cagr"]))
+
+        is_cond_pct, oos_cond_pct, leave5 = 100.0, 100.0, float("inf")
+        if full:
+            is_pl = run_matched_placebo_suite(grid, p, is_end - is_start, is_start, is_end, isb, isr["funnel_stats"]["raw_triggers"],
+                                              n_seeds=PLACEBO_SEEDS_CONDITIONED, n_seeds_uncond=PLACEBO_SEEDS_UNCONDITIONED)
+            oos_pl = run_matched_placebo_suite(grid, p, oos_end - oos_start, oos_start, oos_end, oosb, fr["funnel_stats"]["raw_triggers"],
+                                               n_seeds=PLACEBO_SEEDS_CONDITIONED, n_seeds_uncond=PLACEBO_SEEDS_UNCONDITIONED)
+            is_cond_pct = _placebo_pct(ism["full"]["cagr"], is_pl["conditioned_samples"])
+            oos_cond_pct = _placebo_pct(frm["full"]["cagr"], oos_pl["conditioned_samples"])
+            mask = np.ones(len(grid.symbols), dtype=bool)
+            if len(isr["trades"]) >= 10:
+                top5 = isr["trades"].groupby("coin")["pnl"].sum().sort_values(ascending=False).head(5).index.tolist()
+                for s_ in top5:
+                    if s_ in grid.symbols:
+                        mask[grid.symbols.index(s_)] = False
+            r5 = eng.run_interval(grid, raw_sig, entry_m, exit_m, macro_m, is_start, is_end, active_symbols_mask=mask, state_mat=state_m)
+            leave5 = float(calculate_metrics(r5, grid, is_start, is_end, isb)["full"]["cagr"])
+            if store is not None:
+                store["placebo_is"], store["placebo_oos"] = is_pl, oos_pl
+
+        g = evaluate_gates(
+            oos_slice=sl, oos_bench_cagr=oosb["btc_twr_cagr"], oos_basket_cagr=oosb["basket_twr_cagr"],
+            is_cond_pct=is_cond_pct, oos_cond_pct=oos_cond_pct, is_metrics=ism, leave5_cagr=leave5,
+            is_bench_cagr=isb["btc_twr_cagr"], cont_trades=cr["trades"], cont_year=cy, idx_year=cb["idx_year"],
+            cont_max_dd=cdd, cont_bench_dd=cb["btc_max_dd"], stable=bool(rec["stable"]),
+            timing_ok=bool(rec["timing"] and rec["timing"]["ok"]), seed_agree=int(rec["seed_agree"]),
+            fresh_oos_cagr=float(frm["full"]["cagr"]), fresh_oos_trades=int(len(fr["trades"])), eot_multi=eotm,
+            fresh_oos_dd=float(frm["max_dd"]), oos_basket_dd=float(oosb["basket_max_dd"]), oos_index_dd=float(oosb["btc_max_dd"]))
+        if not full:   # V12.3: the three skipped gates are not evaluated, so they are neither passed nor failed
+            g = [x for x in g if not (x[0].startswith("IS placebo") or x[0].startswith("OOS placebo") or x[0].startswith("Leave-top-5"))]
+        return int(sum(1 for x in g if x[1])), [x[0] for x in g if not x[1]]
+    except Exception as exc:   # pragma: no cover - defensive
+        logging.warning(f"prescreen_gates failed for trial {rec['trial'].number}: {exc}")
+        return 0, ["prescreen error"]
+
+def run_optimization():
+    logging.info(f"Initializing Crypto Framework {ENGINE_VERSION}: Universe = {UNIVERSE_NAME}, Start Year = {START_YEAR}")
+    logging.info(f"Parameter Space Signature: {PARAM_SPACE_HASH} | Seeds: {SEEDS} x {N_TRIALS_PER_SEED} trials")
+    optuna.logging.set_verbosity(optuna.logging.WARNING)
+    grid, universe, macro_df, provenance_records = build_market_universe(UNIVERSE_NAME, START_YEAR, FORCE_REFRESH)
+    sanity_md = write_data_sanity(provenance_records, grid)
+    universe_sig = hashlib.sha256("|".join(f"{s}:{b}" for s, b in zip(grid.symbols, grid.brackets)).encode()).hexdigest()[:6]
+
+    run_causality_audit_cached(grid)
+
+    n_bars = len(grid.dates)
+    mature_coverage = np.sum(grid.alive_mat, axis=0)
+    mature_pct = mature_coverage / float(len(grid.symbols))
+    valid_start_indices = np.where(mature_pct >= 0.51)[0]
+
+    trading_start_bar = max(int(valid_start_indices[0]) if len(valid_start_indices) > 0 else WARMUP_BARS, WARMUP_BARS)
+
+    total_trading_bars = n_bars - trading_start_bar
+    split_offset = int(total_trading_bars * 0.75)
+    is_start, is_end = trading_start_bar, trading_start_bar + split_offset
+    oos_start, oos_end = is_end, n_bars
+    is_bars, oos_bars = is_end - is_start, oos_end - oos_start
+
+    logging.info(
+        f"Crypto Calendar (24/7): Total Bars = {n_bars} | "
+        f"Trading Starts = {grid.dates[trading_start_bar].date()} (Bar {trading_start_bar}) | "
+        f"IS Window = {is_bars} days [{grid.dates[is_start].date()} -> {grid.dates[is_end-1].date()}] | "
+        f"OOS Window = {oos_bars} days [{grid.dates[oos_start].date()} -> {grid.dates[oos_end-1].date()}]"
+    )
+
+    rough_macro_ma = FastIndicators.moving_average(grid.macro_close, 200, 0)
+    rough_macro_ok = (~np.isnan(rough_macro_ma)) & (grid.macro_close > rough_macro_ma)
+
+    is_bench = calculate_benchmarks(grid, is_start, is_end, rough_macro_ok)
+    oos_bench = calculate_benchmarks(grid, oos_start, oos_end, rough_macro_ok)
+
+    # ---- ONE consistent objective (no penalties inside the search; robustness is applied afterwards) ----
+    def objective(trial: optuna.Trial) -> float:
+        params = sample_hyperparameters(trial)
+        raw_sig, entry_mat, exit_mat, macro_ok, state_mat = compile_signals_fast(grid, params)
+        res = BacktestEngine(params=params).run_interval(grid, raw_sig, entry_mat, exit_mat, macro_ok, is_start, is_end, state_mat=state_mat)
+        trial.set_user_attr("n_closed", int(len(res["trades"])))   # V12.4: lets the diagnostics separate floor failures from poor configs
+        return float(calculate_metrics(res, grid, is_start, is_end, is_bench)["score"])
+
+    seed_trials: Dict[int, List[Any]] = {}
+    seed_studies: Dict[int, Any] = {}
+    for seed in SEEDS:
+        s_name = f"{STUDY_NAME}_{universe_sig}_s{seed}"
+        sampler = optuna.samplers.TPESampler(multivariate=True, group=True, seed=seed, n_startup_trials=N_STARTUP_TRIALS)
+        study = optuna.create_study(study_name=s_name, storage=STUDY_DB, load_if_exists=True, direction="maximize", sampler=sampler)
+        done = len([t for t in study.trials if t.state == optuna.trial.TrialState.COMPLETE])
+        n_remaining = max(0, N_TRIALS_PER_SEED - done)
+        if n_remaining > 0:
+            logging.info(f"[seed {seed}] running {n_remaining} trials in study '{s_name}'...")
+            study.optimize(objective, n_trials=n_remaining, show_progress_bar=True)
+        else:
+            logging.info(f"[seed {seed}] loaded completed study with {done} trials.")
+        seed_studies[seed] = study
+        seed_trials[seed] = [
+            SimpleNamespace(number=f"s{seed}-{t.number}", seed=seed, value=float(t.value), params=dict(t.params),
+                            dists=dict(t.distributions), tnum=int(t.number), n_closed=t.user_attrs.get("n_closed"))
+            for t in study.trials if t.state == optuna.trial.TrialState.COMPLETE and t.value is not None
+        ]
+
+    def _family(prm: Dict[str, Any]) -> Tuple[Any, Any, bool]:
+        return (prm.get("entry_type"), prm.get("exit_type"), bool(prm.get("use_market_macro_system", False)))
+
+    seed_top_fams = {
+        sd: {_family(t.params) for t in sorted([x for x in trs if x.value > -5.0], key=lambda z: z.value, reverse=True)[:25]}
+        for sd, trs in seed_trials.items()
+    }
+
+    pool = sorted([t for trs in seed_trials.values() for t in trs if t.value > -5.0], key=lambda z: z.value, reverse=True)
+    if not pool:
+        pool = sorted([t for trs in seed_trials.values() for t in trs], key=lambda z: z.value, reverse=True)[:1]
+    selected, seen_keys, bucket_counts = [], set(), {}
+    for t in pool:
+        key = json.dumps(t.params, sort_keys=True, default=str)
+        if key in seen_keys:
+            continue
+        seen_keys.add(key)
+        fam4 = _family(t.params) + (t.params.get("tranche_floor"),)
+        if bucket_counts.get(fam4, 0) >= 4:       # keep the shortlist diverse, not 25 clones of one region
+            continue
+        bucket_counts[fam4] = bucket_counts.get(fam4, 0) + 1
+        selected.append(t)
+        if len(selected) >= TOP_K_POSTHOC:
+            break
+    logging.info(f"Shortlisted {len(selected)} distinct candidates from {len(pool)} scored trials across {len(SEEDS)} seeds.")
+
+    # ---- Stage 1: three disjoint temporal folds for every shortlisted candidate ----
+    step_f = total_trading_bars // 3
+    f1_s, f1_e = trading_start_bar, trading_start_bar + step_f
+    f2_s, f2_e = trading_start_bar + step_f, trading_start_bar + 2 * step_f
+    f3_s, f3_e = trading_start_bar + 2 * step_f, n_bars
+
+    scored_candidates = []
+    for t_cand in selected:
+        p_cand = reconstitute_params(t_cand.params)
+        cand_eng = BacktestEngine(params=p_cand)
+        raw_c, ent_c, ext_c, mac_c, st_c = compile_signals_fast(grid, p_cand)
+        fold_vals = []
+        for (fs, fe) in ((f1_s, f1_e), (f2_s, f2_e), (f3_s, f3_e)):
+            b_f = calculate_benchmarks(grid, fs, fe, mac_c)
+            r_f = cand_eng.run_interval(grid, raw_c, ent_c, ext_c, mac_c, fs, fe, state_mat=st_c)
+            m_f = calculate_metrics(r_f, grid, fs, fe, b_f)
+            fold_vals.append((m_f["full"]["cagr"], b_f["btc_twr_cagr"]))
+        (c1, i1), (c2, i2), (c3, i3) = fold_vals
+        fam = _family(t_cand.params)
+        scored_candidates.append({
+            "trial": t_cand, "params": p_cand, "score": t_cand.value,
+            "beats_all": bool(c1 > i1 and c2 > i2 and c3 > i3), "beats_recent": bool(c3 > i3), "recent_margin": float(c3 - i3),
+            "c1": c1, "c2": c2, "c3": c3, "i1": i1, "i2": i2, "i3": i3,
+            "seed_agree": int(sum(1 for sd in SEEDS if fam in seed_top_fams.get(sd, set()))),
+            "stable": None, "plateau": None, "pass_rate": None, "timing": None,
+        })
+
+    scored_candidates.sort(key=lambda x: (x["beats_all"], x["beats_recent"], x["recent_margin"], x["score"]), reverse=True)
+
+    # ---- Stage 2: full neighborhood (all active params, MA types, floor) + deposit-timing battery ----
+    stage2 = scored_candidates[:STAGE2_N]
+    for rec in stage2:
+        logging.info(f"Stage-2 battery for {rec['trial'].number} (score {rec['score']:.2f}) ...")
+        is_stable, plateau, pass_rate, _ = evaluate_neighborhood_stability(
+            params=rec["params"], candidate_score=rec["score"], grid=grid,
+            start_bar=is_start, end_bar=is_end, benchmark_cagr=is_bench)
+        rec["stable"], rec["plateau"], rec["pass_rate"] = bool(is_stable), float(plateau), float(pass_rate)
+        rec["timing"] = run_timing_robustness(grid, rec["params"], is_start, is_end)
+
+    for rec in stage2:
+        rec["gates_passed"], rec["gates_failed"] = prescreen_gates(grid, rec, is_start, is_end, oos_start, oos_end, n_bars)
+        logging.info(f"Pre-screen trial {rec['trial'].number}: {rec['gates_passed']} of {rec['gates_passed'] + len(rec['gates_failed'])} cheap gates passed; failing: {rec['gates_failed']}")
+
+    def _checks(r):
+        return int(bool(r["stable"])) + int(bool(r["timing"] and r["timing"]["ok"])) + int(r["beats_all"]) + int(r["seed_agree"] >= GATE_MIN_SEED_AGREEMENT)
+
+    def _rank_key(r):
+        # V12.3: (fully clean on ALL gates, fewest known failing gates, passed checks, score). Candidates that failed a cheap gate keep the V12.2 order among themselves.
+        full_done = "full_failed" in r
+        failed = r["full_failed"] if full_done else r["gates_failed"]
+        return (int(full_done and not failed), -len(failed), _checks(r), r["score"])
+
+    stage2.sort(key=_rank_key, reverse=True)
+    # V12.3: full gate set (placebos + leave-top-5) for the best cheap-gate-clean candidates, so a clean runner-up can win
+    if FULL_GATE_TOP_N > 0:
+        for rec in [r for r in stage2 if not r["gates_failed"]][:FULL_GATE_TOP_N]:
+            _store: Dict[str, Any] = {}
+            _fp, _ff = prescreen_gates(grid, rec, is_start, is_end, oos_start, oos_end, n_bars, full=True, store=_store)
+            rec["full_passed"], rec["full_failed"], rec["cache"] = _fp, _ff, _store
+            logging.info(f"Full-gate test trial {rec['trial'].number}: {_fp} of {_fp + len(_ff)} gates passed; failing: {_ff}")
+        stage2.sort(key=_rank_key, reverse=True)
+    best_candidate_record = stage2[0]
+    best_trial = best_candidate_record["trial"]
+    best_params = best_candidate_record["params"]
+
+    n_beat_all = sum(1 for c in scored_candidates if c["beats_all"])
+    n_beat_recent = sum(1 for c in scored_candidates if c["beats_recent"])
+    pool_size = len(scored_candidates)
+    n_stable = sum(1 for c in stage2 if c["stable"])
+    _full_done = [r_ for r_ in stage2 if "full_failed" in r_]
+    selection_diagnosis_msg = (
+        f"{n_beat_all} of {pool_size} shortlisted candidates beat the benchmark in all 3 folds ({n_beat_recent} in the latest fold); "
+        f"{n_stable} of {len(stage2)} stage-2 candidates passed the neighborhood test. "
+        f"Champion {best_trial.number} chosen by (1) being clean on ALL gates when the full test was run, (2) fewest known failing gates, (3) number of passed checks (stable / timing-robust / all-folds / seed-agreement), (4) score. "
+        f"Cheap pre-screen (every gate except the placebo and leave-top-5 ones; passed of evaluated): " + "; ".join(
+            f"#{r_['trial'].number}: {r_.get('gates_passed', 0)}/{r_.get('gates_passed', 0) + len(r_.get('gates_failed', []))}"
+            + (f" fails [{'; '.join(_g.split(' (')[0].split(':')[0][:60].strip() for _g in r_['gates_failed'])}]" if r_.get("gates_failed") else "")
+            for r_ in stage2) + ". "
+        + (("Full gate test (placebo and leave-top-5 included) was run for " + str(len(_full_done)) + " candidate(s) that cleared every cheap gate: " + "; ".join(
+            f"#{r_['trial'].number}: {r_['full_passed']}/{r_['full_passed'] + len(r_['full_failed'])}"
+            + (f" fails [{'; '.join(_g.split(' (')[0].split(':')[0][:60].strip() for _g in r_['full_failed'])}]" if r_["full_failed"] else " ALL PASS") for r_ in _full_done) + ".")
+           if _full_done else "No candidate cleared every cheap gate, so the full test was not run and no candidate can be promoted from this shortlist.")
+    )
+    logging.info(f"Champion selection: {selection_diagnosis_msg}")
+    logging.info(f"Optimization Complete. Champion search score: {best_trial.value:.4f}")
+
+
+    raw_sig_final, entry_final, exit_final, macro_final, state_final = compile_signals_fast(grid, best_params)
+    final_engine = BacktestEngine(params=best_params)
+
+    is_bench = calculate_benchmarks(grid, is_start, is_end, macro_final)
+    oos_bench = calculate_benchmarks(grid, oos_start, oos_end, macro_final)
+
+    # 1. RUN IN-SAMPLE
+    is_results = final_engine.run_interval(grid, raw_sig_final, entry_final, exit_final, macro_final, is_start, is_end, state_mat=state_final)
+    is_metrics = calculate_metrics(is_results, grid, is_start, is_end, is_bench)
+
+    # 2. RUN FRESH OUT-OF-SAMPLE
+    oos_results = final_engine.run_interval(grid, raw_sig_final, entry_final, exit_final, macro_final, oos_start, oos_end, state_mat=state_final)
+    oos_metrics = calculate_metrics(oos_results, grid, oos_start, oos_end, oos_bench, min_trades=0)
+
+    # 3. RUN UNIFIED CONTINUOUS BACKTEST FOR MULTI-CRISIS STRESS AUDIT
+    continuous_results = final_engine.run_interval(grid, raw_sig_final, entry_final, exit_final, macro_final, is_start, n_bars, state_mat=state_final, record_signals=True)
+    cont_trades = continuous_results["trades"]
+    cont_twr = continuous_results["twr_curve"]
+
+    stress_rows_md = ""
+    for s_name, (s_start_str, s_end_str) in STRESS_WINDOWS.items():
+        s_start_ts, s_end_ts = pd.Timestamp(s_start_str), pd.Timestamp(s_end_str)
+        s_indices = np.where((grid.dates >= s_start_ts) & (grid.dates <= s_end_ts))[0]
+        if len(s_indices) > 20:
+            b_s, b_e = int(s_indices[0]), int(s_indices[-1]) + 1
+            if b_s >= is_start:
+                s_off_s, s_off_e = b_s - is_start, b_e - is_start
+                s_twr_slice = cont_twr[s_off_s:s_off_e]
+                s_ret = ((s_twr_slice[-1] / max(1e-6, s_twr_slice[0])) - 1.0) * 100.0
+                peak_w = np.maximum.accumulate(s_twr_slice)
+                dd_w = np.where(peak_w > 0, (peak_w - s_twr_slice) / peak_w, 0.0)
+                s_dd = float(np.max(dd_w)) * 100.0
+
+                s_b = calculate_benchmarks(grid, b_s, b_e, macro_final)
+                risk_mask = (pd.to_datetime(cont_trades["entry_date"]) <= s_end_ts) & (pd.to_datetime(cont_trades["exit_date"]) >= s_start_ts)
+                n_active_trades = int(risk_mask.sum())
+
+                stress_rows_md += f"| **{s_name}** | {s_ret:+.2f}% | {s_dd:.2f}% | {s_b['btc_total_return']:+.2f}% | {s_b['btc_max_dd']:.2f}% | {s_b['timed_btc_total_return']:+.2f}% | {n_active_trades} |\n"
+
+    all_trades = pd.concat([is_results["trades"], oos_results["trades"]], ignore_index=True)
+
+    # 4. TWR ANALYTICS & DUAL PLACEBO SUITE
+    is_twr_analytics = compute_twr_analytics(is_results["twr_curve"], is_bench["btc_daily_ret"])
+    oos_twr_analytics = compute_twr_analytics(oos_results["twr_curve"], oos_bench["btc_daily_ret"])
+
+    _pc = best_candidate_record.get("cache") or {}
+    is_placebo_suite = _pc.get("placebo_is") or run_matched_placebo_suite(
+        grid, best_params, is_bars, is_start, is_end,
+        is_bench, is_results["funnel_stats"]["raw_triggers"],
+        n_seeds=PLACEBO_SEEDS_CONDITIONED, n_seeds_uncond=PLACEBO_SEEDS_UNCONDITIONED
+    )
+
+    oos_placebo_suite = _pc.get("placebo_oos") or run_matched_placebo_suite(
+        grid, best_params, oos_bars, oos_start, oos_end,
+        oos_bench, oos_results["funnel_stats"]["raw_triggers"],
+        n_seeds=PLACEBO_SEEDS_CONDITIONED, n_seeds_uncond=PLACEBO_SEEDS_UNCONDITIONED
+    )
+
+    def calc_percentile(cagr_val: float, dist: List[float]) -> float:
+        if not dist:
+            return 50.0
+        return float((np.sum(np.array(dist) < cagr_val) / len(dist)) * 100.0)
+
+    is_cond_pct = calc_percentile(is_metrics["full"]["cagr"], is_placebo_suite["conditioned_samples"])
+    oos_cond_pct = calc_percentile(oos_metrics["full"]["cagr"], oos_placebo_suite["conditioned_samples"])
+
+    # Leave-Top-5-Survivors-Out Scrip Breakdown
+    leave5_table_md = ""
+    top_5_scrips = []
+    if len(is_results["trades"]) >= 10:
+        symbol_pnl = is_results["trades"].groupby("coin").agg(
+            net_pnl=("pnl", "sum"),
+            trades=("pnl", "count"),
+            win_rate=("pnl", lambda x: (x > 0).mean() * 100.0)
+        ).sort_values("net_pnl", ascending=False)
+
+        top_5_summary = symbol_pnl.head(5).reset_index()
+        top_5_scrips = top_5_summary["coin"].tolist()
+        total_is_pnl = is_results["trades"]["pnl"].sum()
+
+        leave5_table_md = "| Rank | Symbol | Net Profit (USD) | Trade Count | Win Rate (%) | Share of IS Profit |\n| :--- | :--- | :--- | :--- | :--- | :--- |\n"
+        for rank_i, r in top_5_summary.iterrows():
+            share_pnl = (r["net_pnl"] / max(1.0, total_is_pnl)) * 100.0
+            leave5_table_md += f"| #{rank_i+1} | **{r['coin']}** | {format_price(r['net_pnl'])} | {int(r['trades'])} | {r['win_rate']:.1f}% | {share_pnl:.1f}% |\n"
+
+        active_mask = np.ones(len(grid.symbols), dtype=bool)
+        for s in top_5_scrips:
+            if s in grid.symbols:
+                active_mask[grid.symbols.index(s)] = False
+    else:
+        active_mask = np.ones(len(grid.symbols), dtype=bool)
+
+    res_leave5 = final_engine.run_interval(grid, raw_sig_final, entry_final, exit_final, macro_final, is_start, is_end, active_symbols_mask=active_mask, state_mat=state_final)
+    m_leave5 = calculate_metrics(res_leave5, grid, is_start, is_end, is_bench)
+    leave5_cagr = m_leave5["full"]["cagr"]
+
+    # Dual-Window Macro-Active Exit Ablation
+    if best_params.get("use_market_macro_system", False):
+        ablation_params = copy.deepcopy(best_params)
+        ablation_params["macro_active_exit"] = not best_params.get("macro_active_exit", False)
+        raw_sig_abl, entry_abl, exit_abl, macro_abl, state_abl = compile_signals_fast(grid, ablation_params)
+        ablation_engine = BacktestEngine(params=ablation_params)
+
+        res_abl_is = ablation_engine.run_interval(grid, raw_sig_abl, entry_abl, exit_abl, macro_abl, is_start, is_end, state_mat=state_abl)
+        m_abl_is = calculate_metrics(res_abl_is, grid, is_start, is_end, is_bench)
+
+        res_abl_oos = ablation_engine.run_interval(grid, raw_sig_abl, entry_abl, exit_abl, macro_abl, oos_start, oos_end, state_mat=state_abl)
+        m_abl_oos = calculate_metrics(res_abl_oos, grid, oos_start, oos_end, oos_bench, min_trades=0)
+
+        macro_ablation_md = f"""| Window | Configuration | Strategy CAGR | Max Drawdown | Profit Factor | Completed Trades |
+| :--- | :--- | :--- | :--- | :--- | :--- |
+| **In-Sample** | **Winner (macro_active_exit={best_params.get('macro_active_exit', False)})** | **{is_metrics['full']['cagr']:.2f}%** | **{is_metrics['max_dd']:.2f}%** | **{is_metrics['full']['profit_factor']:.2f}** | **{is_metrics['full']['trades']}** |
+| In-Sample | Ablated (macro_active_exit={ablation_params.get('macro_active_exit', False)}) | {m_abl_is['full']['cagr']:.2f}% | {m_abl_is['max_dd']:.2f}% | {m_abl_is['full']['profit_factor']:.2f} | {m_abl_is['full']['trades']} |
+| **Out-of-Sample** | **Winner (macro_active_exit={best_params.get('macro_active_exit', False)})** | **{oos_metrics['full']['cagr']:.2f}%** | **{oos_metrics['max_dd']:.2f}%** | **{oos_metrics['full']['profit_factor']:.2f}** | **{oos_metrics['full']['trades']}** |
+| Out-of-Sample | Ablated (macro_active_exit={ablation_params.get('macro_active_exit', False)}) | {m_abl_oos['full']['cagr']:.2f}% | {m_abl_oos['max_dd']:.2f}% | {m_abl_oos['full']['profit_factor']:.2f} | {m_abl_oos['full']['trades']} |
+"""
+    else:
+        macro_ablation_md = "*Macro-Active Exit Ablation not applicable: The winning configuration has `use_market_macro_system = False` (market regime filter is disabled, so macro exits never trigger).*\n"
+
+    # Trailing Stop Mechanism Ablation
+    trailing_ablation_md = run_trailing_stop_ablation(
+        grid, best_params, is_start, is_end, oos_start, oos_end,
+        is_bench, oos_bench
+    )
+
+    # Post-Tax estimate for an Indian resident: Virtual Digital Asset regime = flat 30% + 4% cess on EVERY profitable transfer,
+    # losses cannot be set off against gains or carried forward. (1% TDS is a pre-payment of this tax, not an extra cost.)  ASSUMPTION: verify with a CA.
+    def _compute_post_tax(tdf: pd.DataFrame, full_twr_series: np.ndarray, n_bars: int) -> Tuple[float, float]:
+        if len(tdf) == 0 or len(full_twr_series) == 0:
+            return 0.0, 0.0
+        gains = float(tdf.loc[tdf["pnl"] > 0, "pnl"].sum())
+        cum_tax = gains * TAX_VDA_RATE * (1.0 + TAX_VDA_CESS)
+        total_pre_tax_pnl = float(tdf["pnl"].sum())
+        post_tax_pnl = total_pre_tax_pnl - cum_tax
+        pre_tax_twr_end = full_twr_series[-1] if len(full_twr_series) > 0 else 1.0
+        if total_pre_tax_pnl > 0 and pre_tax_twr_end > 1.0:
+            tax_retention = max(0.0, post_tax_pnl / total_pre_tax_pnl)
+            post_tax_twr_end = 1.0 + (pre_tax_twr_end - 1.0) * tax_retention
+            post_tax_cagr = ((post_tax_twr_end ** (BARS_PER_YEAR / max(1, n_bars))) - 1.0) * 100.0
+        else:
+            post_tax_cagr = ((pre_tax_twr_end ** (BARS_PER_YEAR / max(1, n_bars))) - 1.0) * 100.0
+        return float(post_tax_pnl), float(post_tax_cagr)
+
+    is_tax_pnl, is_tax_cagr = _compute_post_tax(is_results["trades"], is_results["twr_curve"], is_bars)
+    oos_tax_pnl, oos_tax_cagr = _compute_post_tax(oos_results["trades"], oos_results["twr_curve"], oos_bars)
+
+    # 7. TOP-K WALK-FORWARD STABILITY MATRIX (With Guaranteed Champion Visibility)
+    f1_label = f"{grid.dates[f1_s].year}-{str(grid.dates[f1_e - 1].year)[2:]}"
+    f2_label = f"{grid.dates[f2_s].year}-{str(grid.dates[f2_e - 1].year)[2:]}"
+    f3_label = f"{grid.dates[f3_s].year}-{str(grid.dates[f3_e - 1].year)[2:]}"
+
+    wf_folds_md = (
+        f"| Candidate | Search Score | Fold 1 ({f1_label}) | Bench F1 | Fold 2 ({f2_label}) | Bench F2 | Fold 3 ({f3_label}) | Bench F3 | Neighbors Beating Index | Timing p10 Score (IS window) | Seeds | Status |\n"
+        f"| :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- |\n"
+    )
+    _stage2_ids = {id(r) for r in stage2}
+    _wf_rows = list(stage2) + [r for r in scored_candidates if id(r) not in _stage2_ids][:4]
+    for rank_idx, rec in enumerate(_wf_rows, start=1):
+        is_champ = (rank_idx == 1)
+        st_txt = "All-Era Champion" if rec["beats_all"] else ("Recent Outperformer" if rec["beats_recent"] else "Regime Sensitive")
+        nb_txt = f"{rec['pass_rate']*100:.0f}% ({'stable' if rec['stable'] else 'UNSTABLE'})" if rec["pass_rate"] is not None else "not run"
+        tm_txt = f"{rec['timing']['p10_score']:+.2f}" if rec["timing"] else "not run"
+        lab = f"**★ CHAMPION ({rec['trial'].number})**" if is_champ else f"#{rank_idx} ({rec['trial'].number})"
+        wf_folds_md += (
+            f"| {lab} | {rec['score']:.2f} | {rec['c1']:.1f}% | {rec['i1']:.1f}% | {rec['c2']:.1f}% | {rec['i2']:.1f}% | "
+            f"{rec['c3']:.1f}% | {rec['i3']:.1f}% | {nb_txt} | {tm_txt} | {rec['seed_agree']}/{len(SEEDS)} | {st_txt} |\n"
+        )
+
+    # 8. Exposure Telemetry
+    def _compute_exposure_telemetry(tdf: pd.DataFrame, peak_stock_pct: float) -> Dict[str, Any]:
+        if len(tdf) == 0:
+            return {"distinct_scrips": 0, "max_single_stock_pct": 0.0, "top5_share": 0.0}
+        n_distinct = int(tdf["coin"].nunique())
+        
+        pnl_by_coin = tdf.groupby("coin")["pnl"].sum()
+        pos_pnl_coins = pnl_by_coin[pnl_by_coin > 0]
+        tot_pos_pnl = float(pos_pnl_coins.sum()) if len(pos_pnl_coins) > 0 else 1.0
+        top5_profit = float(pos_pnl_coins.nlargest(5).sum()) if len(pos_pnl_coins) > 0 else 0.0
+        top5_share = float((top5_profit / tot_pos_pnl) * 100.0)
+
+        return {
+            "distinct_scrips": n_distinct,
+            "max_single_stock_pct": peak_stock_pct,
+            "top5_share": top5_share
+        }
+
+    is_exp_telemetry = _compute_exposure_telemetry(is_results["trades"], is_results["peak_single_stock_pct"])
+    oos_exp_telemetry = _compute_exposure_telemetry(oos_results["trades"], oos_results["peak_single_stock_pct"])
+
+    def _fmt_cap(val: float) -> str:
+        return f"{val:.1f}%" if np.isfinite(val) else "N/A"
+
+    # ---- Continuous-slice OOS, full-window timing battery, PROMOTION GATES ----
+    oos_slice = segment_from_continuous(continuous_results, grid, is_start, oos_start, oos_end)
+    cont_bench_full = calculate_benchmarks(grid, is_start, n_bars, macro_final)
+    _tw = continuous_results["twr_curve"]
+    _pk = np.maximum.accumulate(_tw)
+    cont_max_dd = float(np.max((_pk - _tw) / np.maximum(1e-9, _pk))) * 100.0 if len(_tw) else 0.0
+    final_timing = run_timing_robustness(grid, best_params, is_start, n_bars)
+    cont_year = _year_returns(continuous_results["twr_curve"], grid.years_arr[is_start:n_bars])
+    try:
+        cont_trades.drop(columns=["frictions"], errors="ignore").to_csv(CONT_TRADES_FILE, index=False)
+    except Exception:
+        pass
+
+    eot_multi = eot_share_multi_cut(grid, final_engine, (raw_sig_final, entry_final, exit_final, macro_final, state_final), is_start, is_end,
+                                    float(is_metrics["eot_profit_share"]), base_organic=float(is_metrics["cagr_organic"]),
+                                    base_basket=float(is_bench["basket_twr_cagr"]), base_headline=float(is_metrics["full"]["cagr"]))
+    gates = evaluate_gates(
+        oos_slice=oos_slice, oos_bench_cagr=oos_bench["btc_twr_cagr"], oos_basket_cagr=oos_bench["basket_twr_cagr"],
+        is_cond_pct=is_cond_pct, oos_cond_pct=oos_cond_pct,
+        is_metrics=is_metrics, leave5_cagr=leave5_cagr, is_bench_cagr=is_bench["btc_twr_cagr"], cont_trades=cont_trades,
+        cont_year=cont_year, idx_year=cont_bench_full["idx_year"],
+        cont_max_dd=cont_max_dd, cont_bench_dd=cont_bench_full["btc_max_dd"],
+        stable=bool(best_candidate_record["stable"]), timing_ok=bool(final_timing["ok"]), seed_agree=int(best_candidate_record["seed_agree"]),
+        fresh_oos_cagr=float(oos_metrics["full"]["cagr"]), fresh_oos_trades=int(len(oos_results["trades"])), eot_multi=eot_multi,
+        nb_pass_rate=(float(best_candidate_record["pass_rate"]) if best_candidate_record["pass_rate"] is not None else None),
+        timing_p10=float(final_timing["p10_score"]), n_timing=int(len(final_timing["rows"])),
+        fresh_oos_dd=float(oos_metrics["max_dd"]), oos_basket_dd=float(oos_bench["basket_max_dd"]), oos_index_dd=float(oos_bench["btc_max_dd"]))
+    all_pass = all(g[1] for g in gates)
+    failing = [f"{g[0]} [{g[2]}]" for g in gates if not g[1]]
+    status = "PROMOTED" if all_pass else "NOT PROMOTED"
+    gate_md = "| Gate | Result | Detail |\n| :--- | :--- | :--- |\n" + "".join(
+        f"| {g[0]} | {'PASS' if g[1] else '**FAIL**'} | {g[2]} |\n" for g in gates)
+    try:
+        _sp = cont_trades.groupby("coin")["pnl"].sum().sort_values(ascending=False)
+        _conc_md = (f"*Concentration by symbol (information, continuous run): top symbol {_sp.index[0]} = {_sp.iloc[0] / max(1.0, float(_sp.sum())):.1%} of net profit, "
+                    f"top 2 symbols = {_sp.head(2).sum() / max(1.0, float(_sp.sum())):.1%}, top 5 = {_sp.head(5).sum() / max(1.0, float(_sp.sum())):.1%}; "
+                    f"{len(_sp)} symbols traded, {len(cont_trades)} trades. A stock bought in several layers counts once here.*\n\n") if len(_sp) else ""
+    except Exception:
+        _conc_md = ""
+    _eot_md = ("*Unclosed gains at the in-sample cut, by cut date (information): " +
+               ", ".join(f"{'actual cut' if b == 0 else '-' + str(b) + ' bars'} {s:.1%}" for b, s in eot_multi["rows"]) + ".*\n\n") if eot_multi.get("rows") else ""
+    if eot_multi.get("org_rows"):
+        _eot_md += (f"*Open-gain dependence in return terms (the gate when GATE_EOT_MODE is 'return'): organic IS CAGR (open gains at {EOT_EXCESS_WEIGHT:.0%} credit) vs survivor basket by cut: "
+                    + ", ".join(f"{'actual cut' if b_ == 0 else '-' + str(b_) + ' bars'} {o_:.1f}% vs {k_:.1f}% (headline {h_:.1f}%)" for b_, o_, k_, h_ in eot_multi["org_rows"]) + ".*\n\n")
+    _dd_md = (f"*Drawdown reality check (information): fresh-start OOS max drawdown **{oos_metrics['max_dd']:.1f}%** vs BTC {oos_bench['btc_max_dd']:.1f}% vs "
+              f"equal-weight survivor basket {oos_bench['basket_max_dd']:.1f}%; continuous-slice OOS {oos_slice['max_dd']:.1f}%; whole continuous run {cont_max_dd:.1f}% "
+              f"(BTC {cont_bench_full['btc_max_dd']:.1f}%). The max-drawdown gate above reads the continuous run only. "
+              + (f"The optional fresh-OOS drawdown gate is ON ({GATE_FRESH_OOS_DD_VS_BASKET:.2f}x basket)." if GATE_FRESH_OOS_DD_VS_BASKET is not None
+                 else "The optional fresh-OOS drawdown gate is OFF (set GATE_FRESH_OOS_DD_VS_BASKET to enable it).") + "*\n\n")
+    gate_section_md = (f"## 0. Promotion Gates — Status: **{status}**\n"
+                       f"{'All gates passed: winner.json and PASTE_INTO_LIVE.txt were written.' if all_pass else 'One or more gates failed: winner.json was NOT written and any earlier winner.json is preserved. The config is saved as winner_candidate.json / PASTE_INTO_LIVE_NOT_PROMOTED.txt for inspection only.'}\n\n{gate_md}\n{_conc_md}{_eot_md}{_dd_md}")
+
+    winner_data = {
+        "version": ENGINE_VERSION,
+        "param_hash": PARAM_SPACE_HASH,
+        "study_name": STUDY_NAME,
+        "universe": UNIVERSE_NAME,
+        "status": status,
+        "gates": [{"name": g[0], "pass": g[1], "detail": g[2]} for g in gates],
+        "is_score": float(is_metrics["score"]),
+        "is_metrics": is_metrics,
+        "oos_metrics": oos_metrics,
+        "oos_continuous_slice": oos_slice,
+        "is_post_tax": {"pnl": is_tax_pnl, "cagr": is_tax_cagr},
+        "oos_post_tax": {"pnl": oos_tax_pnl, "cagr": oos_tax_cagr},
+        "is_twr_analytics": is_twr_analytics,
+        "oos_twr_analytics": oos_twr_analytics,
+        "leave5_cagr": leave5_cagr,
+        "top_5_scrips": top_5_scrips,
+        "is_placebo_suite": {k: v for k, v in is_placebo_suite.items() if not k.endswith("_samples")},
+        "oos_placebo_suite": {k: v for k, v in oos_placebo_suite.items() if not k.endswith("_samples")},
+        "is_exposure_telemetry": is_exp_telemetry,
+        "oos_exposure_telemetry": oos_exp_telemetry,
+        "seed_agreement": int(best_candidate_record["seed_agree"]),
+        "data_repairs": {t_: sum(1 for r in DATA_REPAIR_LOG if r["type"] == t_) for t_ in ("SPIKE_REVERT_FIXED", "CORP_ACTION_REBASED", "LARGE_MOVE_KEPT")},
+        "continuous_year_returns": cont_year,
+        "best_params": best_params,
+        "updated_at": pd.Timestamp.now().isoformat(),
+    }
+
+    with open(CURRENT_WINNER_FILE, "w", encoding="utf-8") as f:
+        json.dump(winner_data, f, indent=4, default=str)
+
+    paste_txt = build_paste_block(best_params, status, failing, int(best_candidate_record["seed_agree"]))
+    if all_pass:
+        logging.info("ALL PROMOTION GATES PASSED -> writing winner.json and PASTE_INTO_LIVE.txt")
+        with open(FINAL_WINNER_FILE, "w", encoding="utf-8") as f:
+            json.dump(winner_data, f, indent=4, default=str)
+        PASTE_FILE.write_text(paste_txt, encoding="utf-8")
+    else:
+        logging.warning("PROMOTION GATES FAILED: " + " | ".join(failing))
+        PASTE_FILE.with_name("PASTE_INTO_LIVE_NOT_PROMOTED.txt").write_text(paste_txt, encoding="utf-8")
+
+    export_df = all_trades.copy()
+    if len(export_df) > 0 and "frictions" in export_df.columns:
+        export_df["fee_exchange"] = export_df["frictions"].apply(lambda f: f.exchange_fee)
+        export_df["fee_slippage"] = export_df["frictions"].apply(lambda f: f.slippage_cost)
+        export_df = export_df.drop(columns=["frictions"])
+    export_df.to_csv(TRADES_CSV_FILE, index=False)
+
+    f_disp = is_results["funnel_stats"]
+    funnel_table_md = f"""| Stage in Funnel | Unique Signals | Disposition Description |
+| :--- | :--- | :--- |
+| **Total Raw Technical Triggers** | **{f_disp['raw_triggers']}** | Close > HHV, RSI cross, or MA trigger |
+| ├── Macro Gate Blocked | -{f_disp['macro_blocked']} | BTC below Macro Moving Average |
+| ├── Liquidity Floor Blocked | -{f_disp['liquidity_blocked']} | Median 30d traded value below the floor ({format_price(LIQUIDITY_FLOOR_USD)}) or fewer than {ADV_MIN_PERIODS} live bars |
+| ├── ADX Trend Blocked | -{f_disp['adx_blocked']} | ADX < Selected Threshold |
+| ├── Pyramid Limit Blocked | -{f_disp['pyramid_blocked']} | Scrip already at max tranches or averaging down |
+| ├── Revalidation Dropped | -{f_disp['revalidation_dropped']} | Failed macro/ADX/state check at fill time |
+| ├── Slot Saturated Dropped | -{f_disp['slot_saturated_dropped']} | No open portfolio slots available |
+| ├── Cash Starved Dropped | -{f_disp['cash_starved_dropped']} | Cash below tranche floor ({format_price(best_params.get('tranche_floor', TRANCHE_FLOOR_USD))}) |
+| ├── Scrip Risk Cap Dropped | -{f_disp['risk_cap_dropped']} | Exceeded single-stock 25% exposure ceiling |
+| ├── Expired in Watchlist | -{f_disp['expired_unfilled']} | Exceeded {WL_MAX_AGE_BARS} bars or shadow stop |
+| **Executed Trades on Ledger** | **{f_disp['executed_fills']}** | Successfully filled and audited |
+| **Checksum Reconciliation** | **{sum([f_disp['macro_blocked'], f_disp['liquidity_blocked'], f_disp['adx_blocked'], f_disp['pyramid_blocked'], f_disp['revalidation_dropped'], f_disp['slot_saturated_dropped'], f_disp['cash_starved_dropped'], f_disp['risk_cap_dropped'], f_disp['expired_unfilled'], f_disp['executed_fills']])}** | Must strictly equal Total Raw Triggers ({f_disp['raw_triggers']}) |
+"""
+
+    def _render_excursion(tdf: pd.DataFrame) -> str:
+        if len(tdf) == 0:
+            return "| Sub-Population | Average MFE (%) | Average MAE (%) | Peak Bar Location | Realized Win Efficiency |\n| :--- | :--- | :--- | :--- | :--- |\n| *No closed trades* | 0.0% | 0.0% | Bar 0 | 0.0% |\n"
+        
+        wins = tdf[tdf["pnl"] > 0]
+        losses = tdf[tdf["pnl"] <= 0]
+
+        win_mfe_str = f"+{wins['mfe_pct'].mean():.2f}%" if len(wins) > 0 and np.isfinite(wins['mfe_pct'].mean()) else "N/A"
+        win_mae_str = f"{wins['mae_pct'].mean():.2f}%" if len(wins) > 0 and np.isfinite(wins['mae_pct'].mean()) else "N/A"
+        win_peak_str = f"Bar {wins['bars_to_peak'].mean():.1f}" if len(wins) > 0 and np.isfinite(wins['bars_to_peak'].mean()) else "N/A"
+        win_eff_str = f"{(wins['ret'].mean() * 100) / max(0.01, wins['mfe_pct'].mean()) * 100:.1f}%" if len(wins) > 0 and np.isfinite(wins['ret'].mean()) and wins['mfe_pct'].mean() > 0 else "N/A"
+
+        loss_mfe_str = f"+{losses['mfe_pct'].mean():.2f}%" if len(losses) > 0 and np.isfinite(losses['mfe_pct'].mean()) else "N/A"
+        loss_mae_str = f"{losses['mae_pct'].mean():.2f}%" if len(losses) > 0 and np.isfinite(losses['mae_pct'].mean()) else "N/A"
+        loss_peak_str = f"Bar {losses['bars_to_peak'].mean():.1f}" if len(losses) > 0 and np.isfinite(losses['bars_to_peak'].mean()) else "N/A"
+
+        tot_mfe_str = f"+{tdf['mfe_pct'].mean():.2f}%" if np.isfinite(tdf['mfe_pct'].mean()) else "N/A"
+        tot_mae_str = f"{tdf['mae_pct'].mean():.2f}%" if np.isfinite(tdf['mae_pct'].mean()) else "N/A"
+        tot_peak_str = f"Bar {tdf['bars_to_peak'].mean():.1f}" if np.isfinite(tdf['bars_to_peak'].mean()) else "N/A"
+        tot_eff_str = f"Realized: {tdf['ret'].mean()*100:.2f}%" if np.isfinite(tdf['ret'].mean()) else "N/A"
+
+        return f"""| Sub-Population | Average MFE (%) | Average MAE (%) | Peak Bar Location | Realized Win Efficiency |
+| :--- | :--- | :--- | :--- | :--- |
+| **Winning Positions** | {win_mfe_str} | {win_mae_str} | {win_peak_str} | {win_eff_str} |
+| **Losing Positions** | {loss_mfe_str} | {loss_mae_str} | {loss_peak_str} | N/A (Loss Stop) |
+| **Total Population** | {tot_mfe_str} | {tot_mae_str} | {tot_peak_str} | {tot_eff_str} |
+"""
+
+    is_excursion_md = _render_excursion(is_results["trades"])
+    oos_excursion_md = _render_excursion(oos_results["trades"])
+
+    def _render_frictions(tdf: pd.DataFrame) -> str:
+        if len(tdf) == 0:
+            return ""
+        tot_exch = sum(tr["frictions"].exchange_fee for _, tr in tdf.iterrows())
+        tot_slip = sum(tr["frictions"].slippage_cost for _, tr in tdf.iterrows())
+        tot_frictions = tot_exch + tot_slip
+        return f"""| Operational Cost (spot, both sides) | In-Sample Paid | Drag per Trade |
+| :--- | :--- | :--- |
+| **Exchange Taker Fees ({CRYPTO_EXCHANGE_FEE_RATE*1e4:.0f} bps per side)** | {format_price(tot_exch)} | {format_price(tot_exch/max(1, len(tdf)))} |
+| **Tiered Spread + Impact Slippage (x{SLIPPAGE_SCALE:g}; volume-breakout entries x{VOL_BREAKOUT_SLIP_MULT:g})** | {format_price(tot_slip)} | {format_price(tot_slip/max(1, len(tdf)))} |
+| **Total Realized Operational Cost** | **{format_price(tot_frictions)}** | **{format_price(tot_frictions/max(1, len(tdf)))}** |
+"""
+
+    frictions_md = _render_frictions(is_results["trades"])
+
+    yearly_md = "| Calendar Year | Strategy TWR | BTC Index Return | Equal-Weight Basket | Completed Trades | Win Rate |\n| :--- | :--- | :--- | :--- | :--- | :--- |\n"
+    for yr in sorted(cont_year):
+        _ib = cont_bench_full["idx_year"].get(yr, float("nan"))
+        _bb = cont_bench_full["bsk_year"].get(yr, float("nan"))
+        yr_trades = cont_trades[pd.to_datetime(cont_trades["exit_date"]).dt.year == yr]
+        yr_wr = (yr_trades["pnl"] > 0).mean() * 100.0 if len(yr_trades) > 0 else 0.0
+        _first = int(np.flatnonzero(grid.years_arr == yr)[0])
+        _lab = f"{yr} (partial)" if (_first < is_start or int(np.sum(grid.years_arr[is_start:] == yr)) < 200) else f"{yr}"
+        yearly_md += f"| **{_lab}** | {cont_year[yr]:+.2f}% | {_ib:+.2f}% | {_bb:+.2f}% | {len(yr_trades)} | {yr_wr:.1f}% |\n"
+
+    _cy = cont_year
+    _common = [y for y in _cy if y in cont_bench_full["idx_year"]]
+    if _common:
+        _b_idx = sum(1 for y in _common if _cy[y] > cont_bench_full["idx_year"][y])
+        _b_bsk = sum(1 for y in _common if _cy[y] > cont_bench_full["bsk_year"].get(y, 1e9))
+        yearly_md += (f"\n* Years beating BTC: **{_b_idx} of {len(_common)}**; years beating the equal-weight survivor basket: **{_b_bsk} of {len(_common)}**. "
+                      f"(Counts use flow-stripped calendar-year TWR; years with fewer than {OBJ_MIN_YEAR_BARS} days are excluded.)\n")
+
+    def _render_reasons(tdf: pd.DataFrame) -> str:
+        if len(tdf) == 0:
+            return ""
+        reason_summary = tdf.groupby("reason").agg(
+            trades=("pnl", "count"), net_pnl=("pnl", "sum"), win_rate=("pnl", lambda x: (x > 0).mean() * 100.0)
+        ).reset_index()
+        reason_summary["share"] = (reason_summary["trades"] / len(tdf)) * 100.0
+        out = "| Exit Reason | Trades | Share (%) | Net PnL | Win Rate (%) | Intended Nature |\n| :--- | :--- | :--- | :--- | :--- | :--- |\n"
+        for _, r in reason_summary.iterrows():
+            nature = "Defensive Breakeven Stop" if "BREAKEVEN" in r['reason'] else ("Profit Taking / Timeout" if "HOLDING" in r['reason'] or "TP" in r['reason'] else "Risk Control Exit")
+            out += f"| {r['reason']} | {int(r['trades'])} | {r['share']:.1f}% | {format_price(r['net_pnl'])} | {r['win_rate']:.1f}% | {nature} |\n"
+        return out
+
+    is_reason_md = _render_reasons(is_results["trades"])
+    oos_reason_md = _render_reasons(oos_results["trades"])
+
+    concurrency_md = "| Active Concurrent Slots | Total Days (IS) | Time Proportion (%) |\n| :--- | :--- | :--- |\n"
+    tot_bars_is = sum(is_results["concurrency_hist"])
+    for slots, b_cnt in enumerate(is_results["concurrency_hist"]):
+        concurrency_md += f"| **{slots} Positions Active** | {b_cnt} days | {(b_cnt/max(1, tot_bars_is))*100:.1f}% |\n"
+
+    beats_index_is = bool(is_metrics['full']['cagr'] > is_bench['btc_twr_cagr'])
+    beats_index_oos = bool(oos_metrics['full']['cagr'] > oos_bench['btc_twr_cagr'])
+    beats_placebo_is = bool(is_metrics['full']['cagr'] > is_placebo_suite['conditioned'][0])
+    beats_placebo_oos = bool(oos_metrics['full']['cagr'] > oos_placebo_suite['conditioned'][0])
+
+    is_alpha_diff = is_metrics['full']['cagr'] - is_bench['btc_twr_cagr']
+    oos_alpha_diff = oos_metrics['full']['cagr'] - oos_bench['btc_twr_cagr']
+
+    _bm = np.abs(np.diff(grid.bench_close) / np.maximum(1e-9, grid.bench_close[:-1]))
+    bench_max_move = float(np.max(_bm)) * 100.0 if len(_bm) else 0.0
+    _bpk = np.maximum.accumulate(grid.bench_close)
+    bench_full_dd = float(np.max((_bpk - grid.bench_close) / np.maximum(1e-9, _bpk))) * 100.0
+    repairs_section_md = repairs_md()
+    try:
+        _rc = pd.Timestamp(grid.dates[-10])
+        _rr = [r_ for r_ in DATA_REPAIR_LOG if pd.Timestamp(r_["date"]) >= _rc]
+        if _rr:
+            repairs_section_md += ("\n* **Large moves in the last 10 days (the final bar can be a partial or bad print; check the chart):** "
+                                   + ", ".join(f"{r_['symbol']} {pd.Timestamp(r_['date']).date()} ({r_['type']}, close ratio {r_['ratio']:.2f})" for r_ in _rr) + "\n")
+    except Exception:
+        pass
+    diag_md = search_diagnostics_md(seed_trials, seed_studies)
+    sens_md = objective_sensitivity_md(is_metrics)
+    toptr_md = top_trades_md(cont_trades)
+    timing_md = "| Start shift | Deposit day | Strategy CAGR | Benchmark CAGR | Excess | Score | Trades |\n| :--- | :--- | :--- | :--- | :--- | :--- | :--- |\n" + "".join(
+        f"| +{r['shift']} bars | day {r['offset']+1} | {r['cagr']:.2f}% | {r['bench']:.2f}% | {r['excess']:+.2f} | {r['score']:+.2f} | {r['trades']} |\n"
+        for r in final_timing["rows"]) + f"\n* p10 score **{final_timing['p10_score']:+.2f}**, median **{final_timing['median_score']:+.2f}**, worst excess CAGR **{final_timing['worst_excess']:+.2f}** points.\n"
+    nb_pass_txt = f"{best_candidate_record['pass_rate']*100:.0f}% of neighbors beat the index net of DD penalty ({'stable' if best_candidate_record['stable'] else 'UNSTABLE'})" if best_candidate_record["pass_rate"] is not None else "not run"
+    missed_md = missed_swing_md(grid, continuous_results.get("signal_log", []))
+    bracket_md = bracket_breakdown_md(grid, cont_trades)
+    fee_md = fee_reality_md()
+    stop_ab_md = stop_execution_ab_md(grid, best_params, is_start, n_bars, (raw_sig_final, entry_final, exit_final, macro_final, state_final))
+    slip_sweep_md = slippage_sweep_md(grid, best_params, is_start, n_bars, (raw_sig_final, entry_final, exit_final, macro_final, state_final))
+
+    report_md = f"""# Crypto Quantitative Strategy Audit Dossier ({ENGINE_VERSION}) — {UNIVERSE_NAME}
+
+{gate_section_md}
+## 1. Segregated Performance Accounting (Pure Flow-Stripped TWR)
+
+### A. Performance Baseline & Generalization Check
+| Performance Metric | In-Sample ({is_bars} days) | Out-of-Sample ({oos_bars} days, Fresh Seed) | Generalization Ratio (OOS / IS) |
+| :--- | :--- | :--- | :--- |
+| **Beats Literal Index CAGR?** | **{'PASSED (+' + f"{is_alpha_diff:.2f}%" + ')' if beats_index_is else 'FAILED (' + f"{is_alpha_diff:.2f}%" + ')'}** | **{'PASSED (+' + f"{oos_alpha_diff:.2f}%" + ')' if beats_index_oos else 'FAILED (' + f"{oos_alpha_diff:.2f}%" + ')'}** | Direct Alpha over Buy & Hold BTC |
+| **Conditioned Placebo Alpha Rank** | **{is_cond_pct:.1f}th Percentile** | **{oos_cond_pct:.1f}th Percentile** | Empirical rank in {PLACEBO_SEEDS_CONDITIONED} ADX-conditioned placebo seeds |
+| **Beats Conditioned Placebo Median? (weaker than the rank gate)** | **{'PASSED' if beats_placebo_is else 'FAILED'}** | **{'PASSED' if beats_placebo_oos else 'FAILED'}** | OOS median of random triggers {oos_placebo_suite['conditioned'][0]:.2f}%; promotion needs rank >= {GATE_PLACEBO_IS_PCT:.0f}th (IS) / {GATE_PLACEBO_OOS_PCT:.0f}th (OOS) |
+| **Rule-Closed Net Profit (Pre-Tax)** | **{format_price(is_metrics['full']['net_pnl'])}** | **{format_price(oos_metrics['full']['net_pnl'])}** | — |
+| **Estimated Post-Tax Net Profit (India VDA)** | {format_price(is_tax_pnl)} | {format_price(oos_tax_pnl)} | 30% + 4% cess per profitable transfer, no loss set-off; the {TDS_RATE_INFO:.0%} TDS is a pre-payment of it |
+| **Strategy Annualized TWR (CAGR)** | **{is_metrics['full']['cagr']:.2f}%** | **{oos_metrics['full']['cagr']:.2f}%** | {oos_metrics['full']['cagr']/max(0.01, is_metrics['full']['cagr']):.2f}x |
+| **Continuous-Slice OOS CAGR (no restart, positions carried in)** | — | **{oos_slice['cagr']:.2f}%** | Max DD {oos_slice['max_dd']:.2f}% | {oos_slice['trades']} closed trades |
+| **Organic CAGR (Anti-Cheat)** | {is_metrics['cagr_organic']:.2f}% | {oos_metrics['cagr_organic']:.2f}% | Terminal unclosed gains receive only {EOT_EXCESS_WEIGHT:.0%} incremental credit |
+| **Estimated Post-Tax CAGR** | {is_tax_cagr:.2f}% | {oos_tax_cagr:.2f}% | VDA regime (verify with a CA) |
+| **Literal BTC Index CAGR** | {is_bench['btc_twr_cagr']:.2f}% | {oos_bench['btc_twr_cagr']:.2f}% | Buy-and-Hold index |
+| **Reference 200-SMA Timed Index CAGR** | {is_bench['ref_200sma_timed_cagr']:.2f}% | {oos_bench['ref_200sma_timed_cagr']:.2f}% | Fixed trend-following benchmark |
+| **Equal-Weight Survivor Basket CAGR** | {is_bench['basket_twr_cagr']:.2f}% | {oos_bench['basket_twr_cagr']:.2f}% | Unweighted survivor basket |
+| **Strategy TWR Max Drawdown** | **{is_metrics['max_dd']:.2f}%** | **{oos_metrics['max_dd']:.2f}%** | Pure flow-stripped drop |
+| **Closed-Trade Cumulative Drawdown** | {is_metrics['closed_trade_dd_pct']:.2f}% | {oos_metrics['closed_trade_dd_pct']:.2f}% | Contemporaneous peak equity denominator |
+| **Literal BTC Index Max Drawdown** | {is_bench['btc_max_dd']:.2f}% | {oos_bench['btc_max_dd']:.2f}% | Index stress baseline |
+| **Capital Utilization (Active / Equity)** | {is_metrics['utilization']:.2f}% | {oos_metrics['utilization']:.2f}% | Zero cash interest credit |
+| **Trade Split (Win % / BE % / Loss %)** | **{is_metrics['full']['pure_win_rate']:.1f}% / {is_metrics['full']['be_rate']:.1f}% / {is_metrics['full']['loss_rate']:.1f}%** | **{oos_metrics['full']['pure_win_rate']:.1f}% / {oos_metrics['full']['be_rate']:.1f}% / {oos_metrics['full']['loss_rate']:.1f}%** | Breakeven stops (|ret|<=0.25%) isolated |
+| **Nominal Win Rate (PnL > 0)** | {is_metrics['full']['win_rate']:.2f}% | {oos_metrics['full']['win_rate']:.2f}% | Includes marginal wins |
+| **Strategy Profit Factor** | {is_metrics['full']['profit_factor']:.2f} | {oos_metrics['full']['profit_factor']:.2f} | Full trade population audited |
+| **Completed Trades** | {is_metrics['full']['trades']} | {oos_metrics['full']['trades']} | Trade volume |
+| **Raw Composite Fitness Score** | {is_metrics['score']:.4f} | {oos_metrics['score']:.4f} | Annual excess vs the better of BTC / equal-weight basket (each year clipped) minus drawdown-beyond-benchmark penalty. OOS column is not subject to the minimum-trade cliff |
+
+### B. Distinct Ticker & Point-in-Time Exposure Telemetry
+| Concentration Metric | In-Sample (IS) | Out-of-Sample (OOS) | Operational Risk Assessment |
+| :--- | :--- | :--- | :--- |
+| **Distinct Tickers Traded** | {is_exp_telemetry['distinct_scrips']} symbols | {oos_exp_telemetry['distinct_scrips']} symbols | Breadth of execution basket |
+| **Contemporaneous Peak Scrip Exposure** | {is_exp_telemetry['max_single_stock_pct']:.1f}% | {oos_exp_telemetry['max_single_stock_pct']:.1f}% | Sized at <=25% at entry; organic price growth floats above |
+| **Top 5 Symbol Profit Share** | {is_exp_telemetry['top5_share']:.1f}% | {oos_exp_telemetry['top5_share']:.1f}% | Share of total profitable symbols |
+
+## 2. Comprehensive Multi-Crisis Stress Audit (Continuous Pre-Invested Book)
+| Crisis Period | Strategy TWR | Strategy Max DD | BTC Return | BTC Max DD | BTC timed by the champion's macro filter (= BTC if filter off) | Active Trades |
+| :--- | :--- | :--- | :--- | :--- | :--- | :--- |
+{stress_rows_md}
+## 3. Macro & Trailing Stop Ablation Audits
+### A. Macro-Active Exit Ablation
+{macro_ablation_md}
+### B. Trailing Stop Mechanism Ablation
+{trailing_ablation_md}
+## 4. Top-K Walk-Forward Stability Matrix (3 Sequential Disjoint Folds)
+> **Champion Promotion Diagnostic:** {selection_diagnosis_msg}
+> 
+> **Methodological Note (Fold 3 vs Literal OOS):** Fold 3 covers the final 33% of all available days ({f3_label}), spanning the late In-Sample bull market plus the entire Out-of-Sample test window. Literal OOS strictly isolates the final 25% of trading history. An algorithm can produce positive alpha over the pure OOS test window while still trailing the index during the broader bull run embedded in Fold 3.
+>
+> **Score note:** *Search Score* is the plain objective (trimmed excess CAGR vs benchmark, minus a penalty for drawdown beyond the benchmark's). No penalties are applied inside the search; neighborhood, deposit-timing and seed-agreement checks are applied afterwards to the shortlisted candidates and shown in the columns to the right.
+
+{wf_folds_md}
+*Timing p10 in this table is measured on the in-sample window for every candidate; the promotion gate in section 0 uses the full window (section 12), so the champion's two numbers can differ.*
+
+## 5. TWR Beta, Capture Ratios & Dual Placebo Suite
+| Metric | In-Sample Value | Out-of-Sample Value | Context / Benchmark Baseline |
+| :--- | :--- | :--- | :--- |
+| **Strategy TWR Beta to BTC** | {is_twr_analytics['twr_beta']:.3f} | {oos_twr_analytics['twr_beta']:.3f} | Regression on daily returns |
+| **TWR Correlation to BTC** | {is_twr_analytics['twr_corr']:.3f} | {oos_twr_analytics['twr_corr']:.3f} | Market co-movement |
+| **Up-Market Capture Ratio** | {_fmt_cap(is_twr_analytics['up_capture'])} | {_fmt_cap(oos_twr_analytics['up_capture'])} | Performance on positive BTC days |
+| **Down-Market Capture Ratio** | {_fmt_cap(is_twr_analytics['down_capture'])} | {_fmt_cap(oos_twr_analytics['down_capture'])} | Absorption on negative BTC days |
+| **Leave-Top-5-Survivors-Out CAGR** | **{leave5_cagr:.2f}%** | N/A | Compare to BTC ({is_bench['btc_twr_cagr']:.2f}%) |
+| **Unconditioned Placebo Median** | **{is_placebo_suite['unconditioned'][0]:.2f}%** | **{oos_placebo_suite['unconditioned'][0]:.2f}%** | Pure random entry without ADX gate |
+| **Conditioned Placebo Median** | **{is_placebo_suite['conditioned'][0]:.2f}%** | **{oos_placebo_suite['conditioned'][0]:.2f}%** | Matched ADX trend gate baseline |
+
+### Top 5 Survivor Profit Drivers (Leave-Top-5-Out Breakdown)
+{leave5_table_md}
+
+## 6. Signal Funnel & Opportunity Attrition Matrix
+{funnel_table_md}
+
+## 7. Trade Excursion & Timing Decay Analysis (MFE / MAE)
+### In-Sample Excursions
+{is_excursion_md}
+### Out-of-Sample Excursions
+{oos_excursion_md}
+
+## 8. Realized Statutory Frictions & Depository Drag
+{frictions_md}
+
+## 9. Annual Pure Time-Weighted Return (TWR) Attribution
+{yearly_md}
+
+## 10. Portfolio Slot Concurrency Distribution
+{concurrency_md}
+
+## 11. Trade-Reason Population Breakdown
+### In-Sample Exits
+{is_reason_md}
+### Out-of-Sample Exits
+{oos_reason_md}
+
+## 12. Robustness Battery (Champion)
+### A. Deposit-timing and start-date variants (monthly deposit lands on trading day N; start shifted by S bars; full window)
+{timing_md}
+* Neighborhood test perturbs every active parameter by one step (lengths, multipliers, MA types, tranche floor, toggles): pass-rate {nb_pass_txt}.
+
+## 13. Missed-Swing Analysis (all raw signals in the continuous run)
+{missed_md}
+
+## 14. Where The Profit Came From (Bracket Breakdown, continuous run)
+{bracket_md}
+
+## 15. Fee Reality Check (current constants, zero slippage)
+{fee_md}
+
+## 15b. Slippage Sweep (continuous run; does the edge survive harsher fills?)
+{slip_sweep_md}
+
+## 15c. Stop Execution A/B (close-then-next-open vs resting intraday stop)
+{stop_ab_md}
+
+## 16. Data Integrity & Sanity
+{sanity_md}
+* Benchmark series check: largest single-day move in the BTC series actually used = **{bench_max_move:.2f}%**, max drawdown over the full history = **{bench_full_dd:.1f}%** (a value above ~45% would mean a bad print survived).
+
+### Repairs applied before any indicator was computed
+{repairs_section_md}
+
+## 17. Objective Sensitivity (champion, in-sample)
+{sens_md}
+
+## 18. Top Trades of the Continuous Run (concentration check)
+{toptr_md}
+
+## 19. Search Diagnostics (is Optuna's search healthy?)
+{diag_md}
+
+## 20. Discovered Optimal Parameter Set
+```json
+{json.dumps(best_params, indent=4)}
+"""
+    report_md = report_md.replace("BTC", "BTC")
+    with open(REPORT_FILE, "w", encoding="utf-8") as f:
+        f.write(report_md)
+    logging.info(f"{ENGINE_VERSION} audit dossier written to {REPORT_FILE}")
+
+
+if __name__ == "__main__":
+    run_optimization()
