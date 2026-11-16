@@ -1,43 +1,39 @@
 #!/usr/bin/env python3
 """
-CRYPTO QUANTITATIVE SWING-TRADING FRAMEWORK  --  V12.4-CRYPTO
+CRYPTO QUANTITATIVE SWING-TRADING FRAMEWORK  --  V13.0-CRYPTO
 ==============================================================
-Port of the NSE framework (bt_nse_12, engine V12.4) to the crypto spot market, following PROJECT_LIFECYCLE_REPORT.md.
-The crypto script was still on the V10.2 engine, so every NSE improvement since then is carried over here:
+Crypto port of the NSE V13 framework (bt_nse_13: NO SLOT CAP, WEIGHT-RAMP SIZING, PLATEAU-AWARE SEARCH) on top of the crypto V12.5 work.
+Calendar: 365 bars per year (24/7). Every crypto-specific adaptation is marked "CRYPTO:" in the comments.
 
-EXECUTION REALISM (NSE V11)
-  * Every signal AND every stop is DECIDED on the close of bar t-1 and FILLED at the open of bar t. A stop breach on
-    bar t's close sets `pending_stop`; the sale happens at bar t+1's open (gaps included). Day-1 stops follow the same rule.
-  * Breakeven stop sits at the true cost-covering exit price (fees + slippage), not entry x 1.002.
-  * Take-profit / partial-exit block removed. DEMA and RMA moving averages removed (kinds allowed: 0=SMA, 1=EMA, 3=WMA).
-  * Costs: median-ADV liquidity (new listings with too little history FAIL the floor instead of passing it), per-bar liquidity-tier
-    slippage + impact, extra slippage on volume-breakout entries (the 6 bps flat assumption was optimistic after a 3x volume spike).
+CARRIED OVER FROM NSE V13
+  A. WATCHLIST: one entry per coin (wl_dedupe); no age cap (an item leaves when its shadow position would have exited); fill-time revalidation
+     (trend / ADX / macro) is an Optuna on/off choice; fills record wait_bars and gap_vs_trigger_pct.
+  B. SIZING: max_concurrent_tranches is gone. Size = max(floor, equity x w); w is constant within a day (even batches), ramps slowly while cash idles
+     above a reserve, eases back while candidates wait for cash; no runts. Crypto is fractional, so units are fractional (no whole-share rule).
+  C. ENTRIES: type 3 is a pure breakout (volume confirmation optional); type 5 is a buying-pressure surge (buy volume >= ratio x sell volume, estimated
+     from where the close sits in the day's range). Both buy into a spike, so they pay VOL_BREAKOUT_SLIP_MULT x slippage.
+  D. ANTI-AVERAGING: up to avg_down_free_adds add-ons below the last entry price are allowed; up to 3 pyramid layers.
+  E. LOTTERY GUARD measured in percent of equity at entry.
+  F. SEARCH: in-sample plateau penalty for top-decile trials (soft, capped, raw score stored); OOS is never used inside the search.
+  G. SPEED: placebo seeds run in parallel processes (serial fallback); every slow validation phase logs its time.
+  H. CLEANUP: shared engine helpers (evaluate_entry, make_tranche, tranche_open_exit_reason, tranche_eod_update) that the live bot mirrors.
 
-DATA INTEGRITY (NSE V12)
-  * repair_price_artifacts(): spike-and-revert bad prints are rescaled; unadjusted token swaps / redenominations / ticker
-    migrations are rebased. In a 24/7 market the open of a daily bar sits on the previous close, so a large OPEN gap is a data
-    seam, not a market move. Direction test (open and close moved the same way), calm-BTC-day test, manual override dicts.
-  * Delisted coins are liquidated at the last valid close with a haircut instead of a silent total loss.
-  * New listings sit out LISTING_COOLDOWN_BARS bars (initial listing pumps are not a tradable edge).
-
-OBJECTIVE V2 + PROMOTION GATES (NSE V12.x)
-  * Objective V2: per calendar year, strategy TWR minus the BETTER of (BTC buy-and-hold, equal-weight survivor basket of the
-    universe), each year clipped to +/- OBJ_YEAR_EXCESS_CLIP points, averaged; drawdown penalised only beyond BTC's own drawdown.
-  * 3 seeds x N_TRIALS_PER_SEED, shortlist, three disjoint folds, stage-2 neighbourhood + deposit-timing battery,
-    cheap pre-screen of every gate, FULL gate set (placebos + leave-top-5) for the best clean candidates, champion = fewest failing gates.
-  * Gates: continuous-slice OOS vs BTC and vs basket, fresh-start OOS vs BTC, IS/OOS placebo rank, EOT organic-return gate (multi-cut),
-    leave-top-5-out, year concentration, years beating BTC, top-5 trade share, drawdown vs BTC, neighbourhood, timing p10, seed agreement.
-  * Report: gates table, deposit-timing table, missed swings, liquidity-tier breakdown, fee reality check, slippage sweep,
-    drawdown reality check, India VDA tax estimate, search diagnostics.
-
-Crypto-specific adaptations are marked "CRYPTO:" in comments. Calendar: 365 bars per year (24/7), not 248.
+CRYPTO-SPECIFIC (kept from V12.5, adapted to the V13 engine)
+  * Costs: CRYPTO_EXCHANGE_FEE_RATE per side (CoinDCX: spending 1000 buys about 994 = 0.6%), per-bar liquidity tiers (LARGE / MID / SMALL) from the
+    30-day MEDIAN traded value, slippage + impact, extra slippage on breakout / surge entries, delisted coins liquidated at the last close less a haircut.
+  * The max-affordable order size is exact (cost = tranche x (1+slip) x (1+fee)); the old additive form made cash-limited orders cost slightly more than
+    the cash and rejected them as "cash starved" (visible at 0.6% fees).
+  * Data integrity: spike-and-revert repair (24/7 aware: a genuine intraday crash opens near the previous close), unadjusted token-swap rebase, universe
+    hygiene (stablecoins, non-exchange feeds), investable survivor basket, India VDA tax estimate in the report.
+  * Objective V2 in LOG POINTS per calendar year versus the better of BTC and the survivor basket, rescaled to the NSE score scale so the -5 / -10 / -50
+    thresholds keep their meaning; the trade-floor penalty is relative to the config's own score (an absolute ramp made 39 trades beat everything).
+  * Stops: judged on the close, sold at the next open (the live bot only generates signals and paper trades). The V12.5 intraday-stop A/B was removed.
 """
 
 from __future__ import annotations
 
 import os
 import io
-import sys
 import ast
 import copy
 import json
@@ -48,8 +44,10 @@ import logging
 import urllib.request
 from pathlib import Path
 from dataclasses import dataclass, field
-from concurrent.futures import ThreadPoolExecutor, as_completed
-from typing import Dict, List, Tuple, Any, Optional, Set
+import functools
+import multiprocessing as mp
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
+from typing import Dict, List, Tuple, Any, Optional, Set, Iterable
 
 import numpy as np
 import pandas as pd
@@ -62,7 +60,7 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(me
 # USER CONTROL PANEL
 # ==============================================================================
 
-ENGINE_VERSION: str = "V12.5-CRYPTO"
+ENGINE_VERSION: str = "V13.0-CRYPTO"
 UNIVERSE_NAME: str = "TOP_CRYPTO_LIQUID"
 TOP_N_COINS: int = 50                       # top coins by market cap / volume (stablecoins, wrappers, staking derivatives filtered out)
 
@@ -91,7 +89,28 @@ TOP_K_POSTHOC: int = 25                     # distinct top trials that get the f
 PARALLEL_DOWNLOAD_WORKERS: int = 8
 FORCE_REFRESH: bool = False
 CACHE_MAX_AGE_HOURS: float = 48.0
-WL_MAX_AGE_BARS: int = 15
+# ---- V13 engine rules ----
+# V13_FIXED_RULES are decided by the owner and never searched. ENGINE_DEFAULTS fill in anything a config does not carry
+# (the search records only what it samples, so reconstitute_params and the engine both start from these).
+V13_FIXED_RULES: Dict[str, Any] = {
+    "wl_dedupe": True,            # one watchlist entry per stock
+    "wl_max_age_bars": 0,         # 0 = no age cap: an item leaves only when its shadow position would have exited
+    "whole_shares": False,        # CRYPTO: fractional units
+}
+ENGINE_DEFAULTS: Dict[str, Any] = {
+    **V13_FIXED_RULES,
+    "wl_revalidate": True,        # re-check macro/ADX/trend state at fill time (searched)
+    "avg_down_free_adds": 0,      # add-ons allowed below the last entry price before the anti-averaging guard bites (searched)
+    "size_w0": 0.05, "size_w_max": 0.15, "size_reserve": 0.10, "size_ramp": 0.05,   # sizing (searched)
+}
+
+# ---- V13 sizing search choices (WEIGHT_RAMP). w = per-entry weight as a fraction of equity. ----
+SIZE_W0_CHOICES: List[float] = [0.02, 0.03, 0.05, 0.08]        # starting weight; also the weight it eases back to
+SIZE_W_MAX_CHOICES: List[float] = [0.10, 0.15, 0.25]           # ceiling the ramp may reach
+SIZE_RESERVE_CHOICES: List[float] = [0.05, 0.10, 0.20]         # idle-cash share of equity tolerated before ramping up
+SIZE_RAMP_CHOICES: List[float] = [0.02, 0.05, 0.10]            # daily multiplicative change of w
+SIZE_RUNT_FRACTION: float = 0.6                                # an entry below this share of the target is not made
+MAX_TRACKED_POSITIONS: int = 300                               # concurrency histogram length only (not a limit)
 
 # --- Liquidity: MEDIAN daily traded value (USD) over ADV_WINDOW bars. NaN (insufficient history) -> 0, so a new listing FAILS the floor.
 ADV_WINDOW: int = 30
@@ -109,7 +128,6 @@ SLIPPAGE_SWEEP: Tuple[float, ...] = (0.5, 1.0, 2.0, 3.0)
 
 TRANCHE_FLOOR_USD: float = 50.0             # default; Optuna picks from TRANCHE_FLOOR_CHOICES
 TRANCHE_FLOOR_CHOICES: List[float] = [50.0, 100.0, 150.0]
-DEFAULT_MAX_CONCURRENT_TRANCHES: int = 12
 MAX_POSITION_EQUITY_PCT: float = 0.25       # Hard cap on aggregate allocation per coin at entry
 MAX_ADV_PARTICIPATION: float = 0.015
 
@@ -124,11 +142,6 @@ OBJ_SCORE_SCALE: float = 25.0 / OBJ_YEAR_EXCESS_CLIP   # maps the clipped yearly
 OBJ_YEAR_CLIP_SENSITIVITY: Tuple[float, ...] = (50.0, 75.0, 100.0)
 OBJ_MIN_YEAR_BARS: int = 90                 # a (partial) calendar year needs this many bars to count (NSE: 60 of 248)
 
-# --- Execution of stops (V12.5). The NSE convention is NEXT_OPEN: a stop is judged on the CLOSE and sold at the next open. A 24/7 exchange can run a resting
-#     stop-market order instead (INTRADAY): the stop fills the bar the LOW touches it, at min(open, stop) with STOP_MARKET_SLIP_MULT x the normal slippage.
-#     Which one is right depends on how the live bot places stops. The report A/B-tests both for the champion.
-STOP_EXECUTION: str = "NEXT_OPEN"           # "NEXT_OPEN" | "INTRADAY"
-STOP_MARKET_SLIP_MULT: float = 2.0
 
 # --- Universe hygiene (V12.5)
 EXCLUDED_SYMBOLS: Set[str] = {"USD1", "USDS", "FIGR_HELOC", "SUSDS", "SUSDE", "USDG", "USDY", "USDTB", "BUIDL", "USYC", "BFUSD"}   # stablecoins / tokenised funds the list filter missed
@@ -170,13 +183,21 @@ LISTING_COOLDOWN_BARS: int = 30             # CRYPTO: documentation constant; en
 DELIST_HAIRCUT: float = 0.50                # CRYPTO: a coin whose data ends is liquidated at its last valid close x (1 - haircut)
 PLACEBO_SEEDS_CONDITIONED: int = 100
 PLACEBO_SEEDS_UNCONDITIONED: int = 30
+# ---- In-loop robustness (in-sample ONLY: an OOS check inside the search would turn OOS into training data) ----
+PLATEAU_IN_LOOP: bool = True                 # penalise fragile peaks while searching so TPE drifts toward plateaus
+PLATEAU_TOP_QUANTILE: float = 0.90           # only trials whose raw score reaches this quantile of the study so far are checked
+PLATEAU_MIN_COMPLETED: int = 40              # no checks until this many trials are complete
+PLATEAU_MAX_NEIGHBORS: int = 12              # seeded sample of the +/-1 step neighbours (cost control; post-hoc test uses all)
+PLATEAU_PENALTY_WEIGHT: float = 0.5          # score -= weight * max(0, raw - plateau)
+PLATEAU_PENALTY_CAP: float = 0.5             # ... but never more than this share of |raw|; raw score is always stored
+PLACEBO_WORKERS: int = 4                     # parallel processes for placebo seeds; 1 = serial. Falls back to serial on any failure.
 
 # --- Installment-timing / start-date robustness (contribution lands on bar N of each calendar month)
 TIMING_CONTRIB_OFFSETS: List[int] = [0, 7, 14, 21, 27]     # CRYPTO: calendar days (NSE: trading days 0/5/10/15/20)
 TIMING_START_SHIFTS: List[int] = [0, 30, 60]
 
-# --- Spot exchange fees (taker, both sides). Verify against YOUR exchange's fee tier.
-CRYPTO_EXCHANGE_FEE_RATE: float = 0.0010
+# --- Spot exchange fees, both sides. CoinDCX (INR): spending 1000 buys about 994 of coins = 0.6% per side (V12.5b; was 0.10%, a Binance-like fee). Keep equal to lv_crypto_12.py.
+CRYPTO_EXCHANGE_FEE_RATE: float = 0.0060
 EFFECTIVE_BUY_FEE_RATE: float = CRYPTO_EXCHANGE_FEE_RATE
 EFFECTIVE_SELL_FEE_RATE: float = CRYPTO_EXCHANGE_FEE_RATE
 FLAT_SELL_FIXED_USD: float = 0.0
@@ -293,6 +314,8 @@ def format_price(px: float) -> str:
         return "$0.00"
     sign = "-" if px < 0 else ""
     abs_px = abs(px)
+    if abs_px < 1e-9:
+        return "$0.00"
     if abs_px >= 1.0:
         return f"{sign}${abs_px:,.2f}"
     elif abs_px >= 0.01:
@@ -422,11 +445,13 @@ def compute_max_affordable_tranche(cash: float, adv_30d: float, base_bps: float,
     clean_adv = adv_30d if np.isfinite(adv_30d) else LIQUIDITY_FLOOR_USD
     adv = max(clean_adv, LIQUIDITY_FLOOR_USD)
     usable_cash = max(0.0, cash)
-    tranche_guess = usable_cash / (1.0 + EFFECTIVE_BUY_FEE_RATE + base_bps / 10000.0)
+    tranche_guess = usable_cash / ((1.0 + EFFECTIVE_BUY_FEE_RATE) * (1.0 + base_bps / 10000.0))
     for _ in range(3):
         part_rate = min(1.0, max(0.0, tranche_guess / adv))
         slip_mult = (base_bps + impact_bps * np.sqrt(part_rate)) / 10000.0
-        tranche_guess = usable_cash / (1.0 + EFFECTIVE_BUY_FEE_RATE + slip_mult)
+        # exact: cost = tranche x (1 + slip) x (1 + fee). The old additive form left the cross-term uncovered, so a cash-limited order cost slightly
+        # MORE than the cash and the engine rejected it as 'cash starved' (visible at 0.6% fees).
+        tranche_guess = usable_cash / ((1.0 + EFFECTIVE_BUY_FEE_RATE) * (1.0 + slip_mult))
     return float(np.nan_to_num(tranche_guess * (1.0 - 1e-6), nan=0.0))
 
 
@@ -436,9 +461,16 @@ def breakeven_exit_price(total_cost: float, units: float, slip_mult: float) -> f
     return (total_cost + FLAT_SELL_FIXED_USD) / max(1e-9, denom)
 
 
-def _buy_fill_audited(tranche_usd: float, ref_open_price: float, slip_mult: float) -> Tuple[float, float, float, FeeBreakdown]:
+def _buy_fill_audited(tranche_usd: float, ref_open_price: float, slip_mult: float,
+                      whole_shares: bool = False) -> Tuple[float, float, float, FeeBreakdown]:
     fill_px = ref_open_price * (1.0 + slip_mult)
     units = tranche_usd / ref_open_price if ref_open_price > 0 else 0.0
+    if whole_shares:
+        # Live buys whole shares. If not even one share fits the target, allow ONE share only when it costs
+        # at most twice the target; otherwise the entry is unaffordable (units = 0).
+        units = float(np.floor(units))
+        if units < 1.0 and ref_open_price > 0 and ref_open_price <= 2.0 * tranche_usd:
+            units = 1.0
     gross_at_slip = units * fill_px
     slip_cost = units * (fill_px - ref_open_price)
     total_cash_cost, fees = compute_buy_cost_audited(gross_at_slip, slip_cost)
@@ -918,8 +950,15 @@ def tier_cost_arrays(dvol: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarr
     return slip.astype(np.float64), imp.astype(np.float64), code
 
 
-def build_market_universe(universe_name: str, start_year: int, refresh: bool) -> Tuple[MarketGrid, Dict[str, pd.DataFrame], pd.DataFrame, List[Dict[str, Any]]]:
-    symbols = load_universe_constituents(universe_name, top_n=TOP_N_COINS)
+def build_market_universe(universe_name: str, start_year: int, refresh: bool,
+                          extra_symbols: Optional[Iterable[str]] = None) -> Tuple[MarketGrid, Dict[str, pd.DataFrame], pd.DataFrame, List[Dict[str, Any]]]:
+    symbols = list(load_universe_constituents(universe_name, top_n=TOP_N_COINS))
+    held_only: Set[str] = set()
+    for _s in (extra_symbols or ()):                      # live bot: coins you hold that are not in the list still need rule evaluation
+        _s = str(_s).upper().strip()
+        if _s and _s not in symbols:
+            symbols.append(_s)
+            held_only.add(_s)
     _, macro_df, macro_prov = fetch_single_crypto(MACRO_INDEX_TICKER, start_year, refresh)
     if macro_df is None:
         raise RuntimeError(f"Failed to load crypto macro benchmark: {MACRO_INDEX_TICKER}")
@@ -941,7 +980,7 @@ def build_market_universe(universe_name: str, start_year: int, refresh: bool) ->
     # ---- UNIVERSE HYGIENE (V12.5): the list filter misses new stablecoins / tokenised funds, and aggregator candles carry un-tradable volume ----
     dropped: List[str] = []
     for sym_h in list(raw_universe.keys()):
-        if sym_h == MACRO_INDEX_TICKER:
+        if sym_h == MACRO_INDEX_TICKER or sym_h in held_only:
             continue
         cl_h = raw_universe[sym_h]["close"].dropna()
         why = ""
@@ -1084,6 +1123,24 @@ def build_market_universe(universe_name: str, start_year: int, refresh: bool) ->
 # ==============================================================================
 # COMPILE SIGNALS & FUNNEL ATTRIBUTES
 # ==============================================================================
+def buy_sell_volume_split(h: np.ndarray, l: np.ndarray, c: np.ndarray, v: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+    """Daily-bar proxy for buy vs sell volume: buy = V*(C-L)/(H-L). Circuit days (H == L): all buy if C >= previous C, else all sell."""
+    rng = h - l
+    safe = np.where(rng > 0, rng, 1.0)
+    frac = np.where(rng > 0, (c - l) / safe, np.where(c >= shift_1d(c), 1.0, 0.0))
+    frac = np.clip(np.nan_to_num(frac, nan=0.0), 0.0, 1.0)
+    buy = v * frac
+    return buy, v - buy
+
+
+def buy_pressure_mask(h: np.ndarray, l: np.ndarray, c: np.ndarray, v: np.ndarray,
+                      vol_ma_len: int, vol_mult: float, ratio: float) -> np.ndarray:
+    """Entry type 5: volume above vol_mult x its prior average AND buy volume >= ratio x sell volume (completed bar)."""
+    buy, sell = buy_sell_volume_split(h, l, c, v)
+    vma = np_rolling_mean(shift_1d(v), int(vol_ma_len))
+    return (~np.isnan(vma)) & (v > 0) & (v > vol_mult * vma) & (buy >= ratio * sell)
+
+
 def compile_signals_fast(grid: MarketGrid, p: Dict[str, Any]) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     n_syms, n_bars = grid.close_mat.shape
 
@@ -1106,6 +1163,7 @@ def compile_signals_fast(grid: MarketGrid, p: Dict[str, Any]) -> Tuple[np.ndarra
         c_arr = grid.close_mat[i, :]
         o_arr = grid.open_mat[i, :]
         h_arr = grid.high_mat[i, :]
+        l_arr = grid.low_mat[i, :]
         v_arr = grid.volume_mat[i, :]
         raw_entry = np.zeros(n_bars, dtype=bool)
         state_entry = np.zeros(n_bars, dtype=bool)
@@ -1130,18 +1188,22 @@ def compile_signals_fast(grid: MarketGrid, p: Dict[str, Any]) -> Tuple[np.ndarra
             raw_entry = (~np.isnan(s_ma)) & (~np.isnan(l_ma)) & (s_ma > l_ma) & (shift_1d(s_ma) <= shift_1d(l_ma))
             state_entry = (~np.isnan(s_ma)) & (~np.isnan(l_ma)) & (s_ma > l_ma)
         elif et == 3:
-            v_shifted = shift_1d(v_arr)
-            vma = np_rolling_mean(v_shifted, int(p["vol_ma_len"]))
             h_shifted = shift_1d(h_arr)
             hhv = np_rolling_max(h_shifted, int(p["price_lookback"]))
             body = c_arr - o_arr
-            raw_entry = (~np.isnan(vma)) & (~np.isnan(hhv)) & (v_arr > (p["vol_mult"] * vma)) & (c_arr > hhv) & (body >= (p["body_atr_mult"] * grid.atr14_mat[i, :]))
+            raw_entry = (~np.isnan(hhv)) & (c_arr > hhv) & (body >= (p["body_atr_mult"] * grid.atr14_mat[i, :]))
+            if float(p["vol_mult"]) > 0.0:      # vol_mult = 0 -> pure breakout; legacy configs always have vol_mult >= 1.5
+                vma = np_rolling_mean(shift_1d(v_arr), int(p["vol_ma_len"]))
+                raw_entry = raw_entry & (~np.isnan(vma)) & (v_arr > (p["vol_mult"] * vma))
             base_ma = FastIndicators.moving_average(c_arr, int(p["price_lookback"]), 0)
             state_entry = (~np.isnan(base_ma)) & (c_arr > base_ma)
         elif et == 4:
             b_up, b_mid, _ = FastIndicators.bollinger_bands(c_arr, p["bb_entry_len"], p["bb_entry_std"])
             raw_entry = (~np.isnan(b_up)) & (c_arr > b_up) & (shift_1d(c_arr) <= shift_1d(b_up))
             state_entry = (~np.isnan(b_mid)) & (c_arr > b_mid)
+        elif et == 5:
+            raw_entry = buy_pressure_mask(h_arr, l_arr, c_arr, v_arr, p["bp_vol_ma_len"], p["bp_vol_mult"], p["bp_ratio"])
+            state_entry = np.ones(n_bars, dtype=bool)      # a buying-pressure dip has no trend state to re-check at fill time
 
         raw_signal_mat[i, :] = raw_entry & grid.alive_mat[i, :]
         liq_ok = grid.dvol30_mat[i, :] >= max(float(grid.liq_floor[i]), 1.0)
@@ -1177,7 +1239,6 @@ def compile_signals_fast(grid: MarketGrid, p: Dict[str, Any]) -> Tuple[np.ndarra
 # ==============================================================================
 @dataclass
 class Tranche:
-    tid: int
     coin: str
     coin_idx: int
     entry_bar: int
@@ -1192,13 +1253,13 @@ class Tranche:
     highest_high: float
     lowest_low: float
     peak_bar: int
-    trough_bar: int
-    layer: int
     be_price: float = 0.0
     pending_stop: bool = False
     pending_reason: str = ""
     from_watchlist: bool = False
     wait_days: int = 0
+    trigger_px: float = 0.0
+    entry_equity: float = 0.0
     proceeds: float = 0.0
     fee_acc: FeeBreakdown = field(default_factory=FeeBreakdown)
 
@@ -1206,6 +1267,119 @@ class Tranche:
 def _accumulate_fees(dst: FeeBreakdown, src: FeeBreakdown) -> None:
     dst.exchange_fee += src.exchange_fee
     dst.slippage_cost += src.slippage_cost
+
+
+def slip_fraction(grid: MarketGrid, c_i: int, part_rate: float, bar: int, mult: float = 1.0) -> float:
+    # CRYPTO: tier slippage/impact are read at the signal bar (bar = t-1, causal). mult > 1 only for volume-breakout ENTRIES.
+    b = max(0, bar)
+    return SLIPPAGE_SCALE * mult * (grid.slip_bps[c_i, b] + grid.impact_bps[c_i, b] * np.sqrt(part_rate)) / 10000.0
+
+
+def make_tranche(grid: MarketGrid, c_i: int, t: int, fill_px: float, units: float, total_cost: float, fee_buy: FeeBreakdown,
+                 slip_mult: float, entry_atr: float, sl_mult: float, from_watchlist: bool = False, wait_days: int = 0,
+                 trigger_px: float = 0.0, entry_equity: float = 0.0) -> Tranche:
+    """A position opened at the open of bar t. Its day-1 stop is judged on bar t's close and filled at the next open."""
+    sl_price = fill_px - (sl_mult * entry_atr)
+    return Tranche(
+        coin=grid.symbols[c_i], coin_idx=c_i, entry_bar=t, entry_date=grid.dates[t],
+        entry_price=fill_px, initial_units=units, units=units, cost_usd=total_cost,
+        entry_atr=entry_atr, current_sl=sl_price, stop_reason="STOP_LOSS",
+        highest_high=max(fill_px, grid.high_mat[c_i, t]), lowest_low=min(fill_px, grid.low_mat[c_i, t]),
+        peak_bar=t, be_price=breakeven_exit_price(total_cost, units, slip_mult),
+        pending_stop=bool(grid.close_mat[c_i, t] <= sl_price), pending_reason="STOP_LOSS",
+        from_watchlist=from_watchlist, wait_days=wait_days, trigger_px=trigger_px,
+        entry_equity=entry_equity, proceeds=0.0, fee_acc=fee_buy)
+
+
+def tranche_open_exit_reason(tr: Tranche, t: int, grid: MarketGrid, exit_mat: np.ndarray, macro_bear_confirmed: bool,
+                             xt: int, max_holding_bars: int) -> str:
+    """Exit decided on information up to bar t-1 and filled at the open of bar t. Empty string = keep holding."""
+    bars_held = t - tr.entry_bar
+    if tr.pending_stop:
+        return tr.pending_reason
+    if macro_bear_confirmed:
+        return "MACRO_REGIME_EXIT"
+    if bars_held >= max_holding_bars:
+        return "MAX_HOLDING_TIME"
+    if xt in (3, 4, 5, 6, 7) and exit_mat[tr.coin_idx, t - 1]:
+        if bars_held >= 3 or (tr.highest_high - tr.entry_price) >= (1.0 * tr.entry_atr):
+            return f"SIGNAL_EXIT_TYPE_{xt}"
+    return ""
+
+
+def tranche_eod_update(tr: Tranche, t: int, grid: MarketGrid, xt: int, be_trigger_mult: float,
+                       trail_pct_mult: float, trail_mult: float) -> None:
+    """End-of-bar evaluation of a position that survived the open. A stop is judged on the CLOSE and sold at the next open."""
+    c_i = tr.coin_idx
+    h_bar, l_bar, c_bar = grid.high_mat[c_i, t], grid.low_mat[c_i, t], grid.close_mat[c_i, t]
+    if h_bar > tr.highest_high:
+        tr.highest_high = h_bar
+        tr.peak_bar = t
+    if l_bar < tr.lowest_low:
+        tr.lowest_low = l_bar
+    if c_bar <= tr.current_sl:
+        tr.pending_stop = True
+        tr.pending_reason = tr.stop_reason
+        return
+    if be_trigger_mult > 0.0 and tr.current_sl < tr.be_price:
+        be_target = tr.entry_price + (be_trigger_mult * tr.entry_atr)
+        if tr.highest_high >= be_target:
+            tr.current_sl = max(tr.current_sl, tr.be_price)
+            tr.stop_reason = "BREAKEVEN_SL"
+    if xt == 1:
+        pct_floor = tr.highest_high * trail_pct_mult
+        if pct_floor > tr.current_sl:
+            tr.current_sl = pct_floor
+            tr.stop_reason = "TRAIL_PCT_STOP"
+    elif trail_mult > 0.0:
+        atr_floor = tr.highest_high - (trail_mult * grid.atr14_mat[c_i, t - 1])
+        if atr_floor > tr.current_sl:
+            tr.current_sl = atr_floor
+            tr.stop_reason = "TRAIL_ATR_STOP"
+
+
+def evaluate_entry(grid: MarketGrid, c_i: int, t: int, today_open: float, entry_atr: float, cash: float,
+                   live_tranches: List[Tranche], day_equity: float, day_target: float, floor_usd: float,
+                   free_adds: int, max_pyramid: int, whole_shares: bool, entry_mult: float = 1.0) -> Dict[str, Any]:
+    """Sizing and fill decision for one entry candidate at the open of bar t. Changes no state.
+    The backtest passes the real open; the live bot passes its estimate of tomorrow's open."""
+    coin_layers = sum(1 for tr in live_tranches if tr.coin_idx == c_i)
+    if coin_layers > free_adds:
+        highest_prior_entry = max(tr.entry_price for tr in live_tranches if tr.coin_idx == c_i)
+        if today_open <= highest_prior_entry * 1.005:
+            return {"ok": False, "reason": "anti_averaging_down", "starved": False}
+    if cash < floor_usd:
+        return {"ok": False, "reason": "cash_starved", "starved": True}
+    max_pos_cap = day_equity * MAX_POSITION_EQUITY_PCT
+    dynamic_slot_target = min(max_pos_cap, day_target)
+    current_scrip_exposure = sum(tr.units * today_open for tr in live_tranches if tr.coin_idx == c_i)
+    remaining_scrip_capacity = max(0.0, max_pos_cap - current_scrip_exposure)
+    if remaining_scrip_capacity < floor_usd:
+        return {"ok": False, "reason": "scrip_risk_cap", "starved": False}
+    adv_30d = max(grid.dvol30_mat[c_i, t - 1], LIQUIDITY_FLOOR_USD)
+    liquidity_cap_usd = adv_30d * MAX_ADV_PARTICIPATION
+    target_usd = min(dynamic_slot_target, liquidity_cap_usd, remaining_scrip_capacity)
+    max_affordable = compute_max_affordable_tranche(cash, adv_30d, float(SLIPPAGE_SCALE * entry_mult * grid.slip_bps[c_i, t - 1]), float(SLIPPAGE_SCALE * entry_mult * grid.impact_bps[c_i, t - 1]))
+    tranche_usd = min(max_affordable, max(floor_usd, target_usd))
+    runt = tranche_usd < SIZE_RUNT_FRACTION * max(floor_usd, target_usd)
+    slip_mult = slip_fraction(grid, c_i, min(1.0, max(0.0, tranche_usd / adv_30d)), t - 1, entry_mult)
+    fill_px, units, total_cost, fee_buy = _buy_fill_audited(tranche_usd, today_open, slip_mult, whole_shares)
+    if cash >= total_cost and tranche_usd >= floor_usd and units > 0 and not runt and coin_layers < max_pyramid:
+        if max_affordable < target_usd:
+            binding = "cash_constrained"
+        elif target_usd == liquidity_cap_usd:
+            binding = "liquidity_cap"
+        elif target_usd < floor_usd:
+            binding = "tranche_floor"
+        else:
+            binding = "equity_slot"
+        return {"ok": True, "binding": binding, "tranche_usd": tranche_usd, "fill_px": fill_px, "units": units,
+                "total_cost": total_cost, "fee_buy": fee_buy, "slip_mult": slip_mult}
+    if coin_layers >= max_pyramid:
+        return {"ok": False, "reason": "pyramid_blocked", "starved": False}
+    if units <= 0:
+        return {"ok": False, "reason": "unaffordable", "starved": False}
+    return {"ok": False, "reason": "cash_starved", "starved": True}      # cash short, below the floor, or a runt
 
 
 class BacktestEngine:
@@ -1230,7 +1404,10 @@ class BacktestEngine:
         p = self.p
         dates = grid.dates
         max_holding_bars = p.get("max_holding_bars", 20)
-        max_slots = p.get("max_concurrent_tranches", DEFAULT_MAX_CONCURRENT_TRANCHES)
+        cfg = {**ENGINE_DEFAULTS, **p}
+        size_w0, size_w_max = float(cfg["size_w0"]), float(cfg["size_w_max"])
+        size_reserve, size_ramp = float(cfg["size_reserve"]), float(cfg["size_ramp"])
+        size_w = size_w0
         be_trigger_mult = p.get("be_trigger_atr", 0.0)
         macro_active_exit = p.get("macro_active_exit", False)
         adx_t = p.get("adx_thresh", 0.0)
@@ -1239,7 +1416,6 @@ class BacktestEngine:
 
         active_state_mat = state_mat if state_mat is not None else entry_mat
 
-        n_syms = len(grid.symbols)
         cash = INITIAL_CAPITAL
         total_inflow = INITIAL_CAPITAL
         live_tranches: List[Tranche] = []
@@ -1250,9 +1426,10 @@ class BacktestEngine:
         active_capital_curve = np.zeros(n_interval, dtype=np.float64)
         total_equity_curve = np.zeros(n_interval, dtype=np.float64)
         twr_curve = np.zeros(n_interval, dtype=np.float64)
-        concurrency_hist = np.zeros(max_slots + 1, dtype=np.int64)
+        concurrency_hist = np.zeros(MAX_TRACKED_POSITIONS + 1, dtype=np.int64)
+        size_w_curve = np.zeros(n_interval, dtype=np.float64)
+        idle_cash_curve = np.zeros(n_interval, dtype=np.float64)
 
-        tid_counter = 0
         sig_id_counter = 0
         sig_meta: Dict[int, Tuple[int, int]] = {}
         sig_outcome: Dict[int, str] = {}
@@ -1260,8 +1437,9 @@ class BacktestEngine:
         funnel_dispositions = {
             "raw_triggers": 0, "macro_blocked": 0, "liquidity_blocked": 0,
             "adx_blocked": 0, "pyramid_blocked": 0, "revalidation_dropped": 0,
-            "slot_saturated_dropped": 0, "cash_starved_dropped": 0,
-            "risk_cap_dropped": 0, "expired_unfilled": 0, "executed_fills": 0
+            "cash_starved_dropped": 0,
+            "risk_cap_dropped": 0, "expired_unfilled": 0, "executed_fills": 0,
+            "wl_duplicate_dropped": 0, "unaffordable_dropped": 0
         }
 
         binding_stats = {"tranche_ceiling": 0, "liquidity_cap": 0, "equity_slot": 0, "tranche_floor": 0, "cash_constrained": 0}
@@ -1270,13 +1448,16 @@ class BacktestEngine:
         trail_pct_mult = (1.0 - (p.get("trail_pct", 10.0) / 100.0))
         xt = p["exit_type"]
         wl_mode = p.get("wl_mode", "WL_NONE")
+        wl_dedupe = bool(cfg["wl_dedupe"])
+        wl_max_age = int(cfg["wl_max_age_bars"])
+        wl_revalidate = bool(cfg["wl_revalidate"])
+        free_adds = int(cfg["avg_down_free_adds"])
+        whole_shares = bool(cfg["whole_shares"])
 
-        entry_slip_mult = VOL_BREAKOUT_SLIP_MULT if int(p["entry_type"]) == 3 else 1.0
+        entry_slip_mult = VOL_BREAKOUT_SLIP_MULT if int(p.get("entry_type", 0)) in (3, 5) else 1.0   # types 3 and 5 buy INTO a breakout / volume surge
 
         def _slip(c_i: int, part_rate: float, bar: int, mult: float = 1.0) -> float:
-            # CRYPTO: tier slippage/impact are read at the signal bar (bar-1, causal). mult>1 only for volume-breakout ENTRIES.
-            b = max(0, bar)
-            return SLIPPAGE_SCALE * mult * (grid.slip_bps[c_i, b] + grid.impact_bps[c_i, b] * np.sqrt(part_rate)) / 10000.0
+            return slip_fraction(grid, c_i, part_rate, bar, mult)
 
         def _set_outcome(item: Dict[str, Any], outcome: str) -> None:
             if record_signals:
@@ -1316,7 +1497,7 @@ class BacktestEngine:
             surviving_tranches = []
             for tr in live_tranches:
                 if grid.delist_mat[tr.coin_idx, t]:
-                    # CRYPTO: the coin's data ended. Liquidate at the last valid close less DELIST_HAIRCUT (no fee/slippage model exists for a dead market).
+                    # CRYPTO: the coin's data ended. Liquidate at the last valid close less DELIST_HAIRCUT (no market model exists for a dead market).
                     px_last = grid.close_mat[tr.coin_idx, t]
                     liq_proceeds = tr.units * px_last * (1.0 - DELIST_HAIRCUT) if (np.isfinite(px_last) and px_last > 0) else 0.0
                     cash += liq_proceeds
@@ -1332,6 +1513,8 @@ class BacktestEngine:
                         "entry_price": tr.entry_price, "exit_price": vwap_exit,
                         "cost_usd": tr.cost_usd, "proceeds": tr.proceeds,
                         "frictions": tr.fee_acc, "from_watchlist": tr.from_watchlist,
+                        "wait_bars": tr.wait_days, "entry_equity": tr.entry_equity,
+                        "gap_vs_trigger_pct": ((tr.entry_price / tr.trigger_px - 1.0) * 100.0) if tr.trigger_px > 0 else 0.0,
                     })
                 else:
                     surviving_tranches.append(tr)
@@ -1352,40 +1535,15 @@ class BacktestEngine:
 
                 adv = max(grid.dvol30_mat[c_i, t - 1], LIQUIDITY_FLOOR_USD)
                 o_bar = grid.open_mat[c_i, t]
-                h_bar = grid.high_mat[c_i, t]
-                l_bar = grid.low_mat[c_i, t]
                 bars_held = t - tr.entry_bar
 
-                exit_triggered = False
-                exit_reason = ""
                 raw_exit_px = o_bar
-                exit_slip_mult = 1.0
-
-                # Phase 2A: Open exits. A stop decided on yesterday's close is filled at today's open.
-                if tr.pending_stop:
-                    exit_triggered = True
-                    exit_reason = tr.pending_reason
-                elif macro_bear_confirmed:
-                    exit_triggered = True
-                    exit_reason = "MACRO_REGIME_EXIT"
-                elif bars_held >= max_holding_bars:
-                    exit_triggered = True
-                    exit_reason = "MAX_HOLDING_TIME"
-                elif xt in (3, 4, 5, 6, 7) and exit_mat[c_i, t - 1]:
-                    if bars_held >= 3 or (tr.highest_high - tr.entry_price) >= (1.0 * tr.entry_atr):
-                        exit_triggered = True
-                        exit_reason = f"SIGNAL_EXIT_TYPE_{xt}"
-
-                # INTRADAY stop-market model: the stop level was fixed at yesterday's close, so today's low touching it is causal.
-                if (not exit_triggered) and STOP_EXECUTION == "INTRADAY" and np.isfinite(l_bar) and l_bar <= tr.current_sl:
-                    exit_triggered = True
-                    exit_reason = tr.stop_reason
-                    raw_exit_px = min(o_bar, tr.current_sl)          # a gap through the stop fills at the open
-                    exit_slip_mult = STOP_MARKET_SLIP_MULT
+                exit_reason = tranche_open_exit_reason(tr, t, grid, exit_mat, macro_bear_confirmed, xt, max_holding_bars)
+                exit_triggered = bool(exit_reason)
 
                 if exit_triggered:
                     part_rate_exit = min(1.0, max(0.0, (tr.units * raw_exit_px) / adv))
-                    slip_exit = _slip(c_i, part_rate_exit, t - 1, exit_slip_mult)
+                    slip_exit = _slip(c_i, part_rate_exit, t - 1)
                     fill_px, proceeds, fee_exit = _sell_fill_audited(tr.units, raw_exit_px, slip_exit)
 
                     cash += proceeds
@@ -1403,39 +1561,11 @@ class BacktestEngine:
                         "entry_price": tr.entry_price, "exit_price": vwap_exit,
                         "cost_usd": tr.cost_usd, "proceeds": total_proceeds,
                         "frictions": tr.fee_acc, "from_watchlist": tr.from_watchlist,
+                        "wait_bars": tr.wait_days, "entry_equity": tr.entry_equity,
+                        "gap_vs_trigger_pct": ((tr.entry_price / tr.trigger_px - 1.0) * 100.0) if tr.trigger_px > 0 else 0.0,
                     })
                 else:
-                    # Phase 2B: end-of-day evaluation. Stop is judged on the CLOSE; exit happens next open.
-                    c_bar = grid.close_mat[c_i, t]
-                    if h_bar > tr.highest_high:
-                        tr.highest_high = h_bar
-                        tr.peak_bar = t
-                    if l_bar < tr.lowest_low:
-                        tr.lowest_low = l_bar
-                        tr.trough_bar = t
-
-                    if STOP_EXECUTION == "NEXT_OPEN" and c_bar <= tr.current_sl:
-                        tr.pending_stop = True
-                        tr.pending_reason = tr.stop_reason
-                    else:
-                        if be_trigger_mult > 0.0 and tr.current_sl < tr.be_price:
-                            be_target = tr.entry_price + (be_trigger_mult * tr.entry_atr)
-                            if tr.highest_high >= be_target:
-                                tr.current_sl = max(tr.current_sl, tr.be_price)
-                                tr.stop_reason = "BREAKEVEN_SL"
-
-                        if xt == 1:
-                            pct_floor = tr.highest_high * trail_pct_mult
-                            if pct_floor > tr.current_sl:
-                                tr.current_sl = pct_floor
-                                tr.stop_reason = "TRAIL_PCT_STOP"
-                        elif trail_mult > 0.0:
-                            atr_bar_trailing = grid.atr14_mat[c_i, t - 1]
-                            atr_floor = tr.highest_high - (trail_mult * atr_bar_trailing)
-                            if atr_floor > tr.current_sl:
-                                tr.current_sl = atr_floor
-                                tr.stop_reason = "TRAIL_ATR_STOP"
-
+                    tranche_eod_update(tr, t, grid, xt, be_trigger_mult, trail_pct_mult, trail_mult)
                     surviving_tranches.append(tr)
             live_tranches = surviving_tranches
 
@@ -1445,13 +1575,15 @@ class BacktestEngine:
                 active_counts[tr.coin_idx] += 1
 
             new_candidates = []
+            starved_today = False
+            wl_coins = {it["coin_idx"] for it in watchlist} if wl_dedupe else set()
             sig_idx = np.flatnonzero(raw_signal_mat[:, t - 1])
             if active_symbols_mask is not None and len(sig_idx):
                 sig_idx = sig_idx[active_symbols_mask[sig_idx]]
 
             # Fast path: on a day when NO order can be placed (no cash / no slot) and signals do not wait,
             # every filtered signal is dropped for the same reason -> count them vectorised (identical accounting).
-            if (wl_mode == "WL_NONE") and (not record_signals) and (cash < floor_usd or len(live_tranches) >= max_slots) and len(sig_idx):
+            if (wl_mode == "WL_NONE") and (not record_signals) and cash < floor_usd and len(sig_idx):
                 n_sig = int(len(sig_idx))
                 funnel_dispositions["raw_triggers"] += n_sig
                 sig_id_counter += n_sig
@@ -1471,10 +1603,8 @@ class BacktestEngine:
                             n_pyr = 0
                         funnel_dispositions["pyramid_blocked"] += n_pyr
                         n_rest = len(rem) - n_pyr
-                        if cash < floor_usd:
-                            funnel_dispositions["cash_starved_dropped"] += n_rest
-                        else:
-                            funnel_dispositions["slot_saturated_dropped"] += n_rest
+                        funnel_dispositions["cash_starved_dropped"] += n_rest
+                        starved_today = starved_today or n_rest > 0
                 sig_idx = sig_idx[:0]
 
             for c_i in sig_idx:
@@ -1501,6 +1631,10 @@ class BacktestEngine:
                         funnel_dispositions["pyramid_blocked"] += 1
                         if record_signals: sig_outcome[sig_id_counter] = "pyramid_blocked"
                         continue
+                    if wl_dedupe and c_i in wl_coins:
+                        funnel_dispositions["wl_duplicate_dropped"] += 1
+                        if record_signals: sig_outcome[sig_id_counter] = "wl_duplicate"
+                        continue
 
                     o_today = grid.open_mat[c_i, t]
                     a_yesterday = grid.atr14_mat[c_i, t - 1]
@@ -1513,6 +1647,7 @@ class BacktestEngine:
                         "highest_high": o_today, "breakout_quality": breakout_strength,
                         "entry_atr": a_yesterday, "unfilled_reason": None
                     })
+                    wl_coins.add(c_i)
 
             new_candidates.sort(key=lambda x: x["breakout_quality"], reverse=True)
             watchlist.extend(new_candidates)
@@ -1528,19 +1663,22 @@ class BacktestEngine:
                     funnel_dispositions["pyramid_blocked"] += 1
                 elif reason == "scrip_risk_cap":
                     funnel_dispositions["risk_cap_dropped"] += 1
-                elif reason == "slot_saturated":
-                    funnel_dispositions["slot_saturated_dropped"] += 1
+                elif reason == "unaffordable":
+                    funnel_dispositions["unaffordable_dropped"] += 1
                 else:
                     funnel_dispositions[default_bucket] += 1
                 _set_outcome(item, reason if reason else default_bucket)
 
-            if watchlist and cash >= floor_usd and len(live_tranches) < max_slots:
+            if watchlist and cash >= floor_usd:
                 if wl_mode == "WL_DEEPEST_DISCOUNT":
                     watchlist.sort(key=lambda x: (x["trigger_price"] - grid.close_mat[x["coin_idx"], t - 1]) / max(1e-6, x["trigger_price"]), reverse=True)
                 elif wl_mode == "WL_STRONGEST_MOMENTUM":
                     watchlist.sort(key=lambda x: x["breakout_quality"], reverse=True)
 
                 unfilled = []
+                # one equity snapshot and one target per day -> every entry of the batch gets the same size
+                day_equity = cash + sum(tr.units * grid.open_mat[tr.coin_idx, t] for tr in live_tranches)
+                day_target = max(floor_usd, day_equity * size_w)
                 for item in watchlist:
                     c_i = item["coin_idx"]
 
@@ -1549,7 +1687,7 @@ class BacktestEngine:
                         _set_outcome(item, "revalidation_dropped")
                         continue
 
-                    if t > item["signal_bar"]:
+                    if wl_revalidate and t > item["signal_bar"]:
                         if not macro_ok[t - 1]:
                             funnel_dispositions["revalidation_dropped"] += 1
                             _set_outcome(item, "revalidation_dropped")
@@ -1563,102 +1701,31 @@ class BacktestEngine:
                             _set_outcome(item, "revalidation_dropped")
                             continue
 
-                    coin_layers = sum(1 for tr in live_tranches if tr.coin_idx == c_i)
-                    today_open = grid.open_mat[c_i, t]
-
-                    # Anti-Averaging Down Rule
-                    if coin_layers > 0:
-                        highest_prior_entry = max(tr.entry_price for tr in live_tranches if tr.coin_idx == c_i)
-                        if today_open <= highest_prior_entry * 1.005:
-                            item["unfilled_reason"] = "anti_averaging_down"
-                            unfilled.append(item)
-                            continue
-
-                    open_slots = max(1, max_slots - len(live_tranches))
-                    if len(live_tranches) >= max_slots:
-                        item["unfilled_reason"] = "slot_saturated"
-                        unfilled.append(item)
-                        continue
-                    if cash < floor_usd:
-                        item["unfilled_reason"] = "cash_starved"
-                        unfilled.append(item)
-                        continue
-
-                    open_active_cap = sum(tr.units * grid.open_mat[tr.coin_idx, t] for tr in live_tranches)
-                    current_equity = cash + open_active_cap
-                    max_pos_cap = current_equity * MAX_POSITION_EQUITY_PCT
-                    dynamic_slot_target = min(max_pos_cap, cash / float(open_slots))
-
-                    current_scrip_exposure = sum(tr.units * today_open for tr in live_tranches if tr.coin_idx == c_i)
-                    remaining_scrip_capacity = max(0.0, max_pos_cap - current_scrip_exposure)
-                    if remaining_scrip_capacity < floor_usd:
-                        item["unfilled_reason"] = "scrip_risk_cap"
-                        unfilled.append(item)
-                        continue
-
-                    adv_30d = max(grid.dvol30_mat[c_i, t - 1], LIQUIDITY_FLOOR_USD)
-                    liquidity_cap_usd = adv_30d * MAX_ADV_PARTICIPATION
-                    target_usd = min(dynamic_slot_target, liquidity_cap_usd, remaining_scrip_capacity)
-
-                    max_affordable = compute_max_affordable_tranche(cash, adv_30d, float(SLIPPAGE_SCALE * entry_slip_mult * grid.slip_bps[c_i, t - 1]), float(SLIPPAGE_SCALE * entry_slip_mult * grid.impact_bps[c_i, t - 1]))
-                    tranche_usd = min(max_affordable, max(floor_usd, target_usd))
-
-                    part_rate = min(1.0, max(0.0, tranche_usd / adv_30d))
-                    slip_mult = _slip(c_i, part_rate, t - 1, entry_slip_mult)
-
-                    fill_px, units, total_cost, fee_buy = _buy_fill_audited(tranche_usd, today_open, slip_mult)
-
-                    if (cash >= total_cost and tranche_usd >= floor_usd and units > 0 and
-                            len(live_tranches) < max_slots and coin_layers < max_pyramid):
-
-                        if max_affordable < target_usd:
-                            binding_stats["cash_constrained"] += 1
-                        elif target_usd == liquidity_cap_usd:
-                            binding_stats["liquidity_cap"] += 1
-                        elif target_usd < floor_usd:
-                            binding_stats["tranche_floor"] += 1
-                        else:
-                            binding_stats["equity_slot"] += 1
-
-                        sl_price = fill_px - (sl_mult_p * item["entry_atr"])
-                        cash -= total_cost
-                        tid_counter += 1
+                    dec = evaluate_entry(grid, c_i, t, grid.open_mat[c_i, t], item["entry_atr"], cash, live_tranches,
+                                         day_equity, day_target, floor_usd, free_adds, max_pyramid, whole_shares, entry_slip_mult)
+                    if dec["ok"]:
+                        binding_stats[dec["binding"]] += 1
+                        cash -= dec["total_cost"]
                         funnel_dispositions["executed_fills"] += 1
                         _set_outcome(item, "executed")
-
-                        h_today = grid.high_mat[c_i, t]
-                        l_today = grid.low_mat[c_i, t]
-                        c_today = grid.close_mat[c_i, t]
-
-                        # Day-1 stop: judged on today's close, filled at tomorrow's open (pending_stop).
-                        live_tranches.append(Tranche(
-                            tid=tid_counter, coin=item["coin"], coin_idx=c_i, entry_bar=t, entry_date=curr_date,
-                            entry_price=fill_px, initial_units=units, units=units, cost_usd=total_cost,
-                            entry_atr=item["entry_atr"], current_sl=sl_price, stop_reason="STOP_LOSS",
-                            highest_high=max(fill_px, h_today), lowest_low=min(fill_px, l_today),
-                            peak_bar=t, trough_bar=t, layer=coin_layers + 1,
-                            be_price=breakeven_exit_price(total_cost, units, slip_mult),
-                            pending_stop=bool(c_today <= sl_price), pending_reason="STOP_LOSS",
-                            from_watchlist=(t > item["signal_bar"]), wait_days=(t - item["signal_bar"]),
-                            proceeds=0.0, fee_acc=fee_buy
-                        ))
+                        live_tranches.append(make_tranche(
+                            grid, c_i, t, dec["fill_px"], dec["units"], dec["total_cost"], dec["fee_buy"], dec["slip_mult"],
+                            item["entry_atr"], sl_mult_p, from_watchlist=(t > item["signal_bar"]),
+                            wait_days=(t - item["signal_bar"]), trigger_px=float(item["trigger_price"]), entry_equity=day_equity))
                     else:
-                        if coin_layers >= max_pyramid:
-                            item["unfilled_reason"] = "pyramid_blocked"
-                        elif cash < total_cost or tranche_usd < floor_usd:
-                            item["unfilled_reason"] = "cash_starved"
-                        else:
-                            item["unfilled_reason"] = "slot_saturated"
+                        item["unfilled_reason"] = dec["reason"]
+                        starved_today = starved_today or dec["starved"]
                         unfilled.append(item)
                 watchlist = unfilled
             elif watchlist:
-                # Nothing could be attempted today: remember WHY (capital vs slots) for disposition accounting.
-                day_block_cause = "cash_starved" if cash < floor_usd else "slot_saturated"
+                # Nothing could be attempted today: cash is below the floor. Remember it for disposition accounting.
+                day_block_cause = "cash_starved"
+                starved_today = True
 
             # Terminal disposition accounting for single-day watchlist modes
             if wl_mode == "WL_NONE" and watchlist:
                 for item in watchlist:
-                    _record_unfilled_disposition(item, default_bucket="slot_saturated_dropped")
+                    _record_unfilled_disposition(item)
                 watchlist = []
 
             # 5. Causal watchlist lifecycle update (EOD on unfilled items only)
@@ -1670,7 +1737,7 @@ class BacktestEngine:
 
                     shadow_stopped = (l_bar <= item["shadow_stop"])
                     shadow_exited = (xt in (3, 4, 5, 6, 7)) and exit_mat[c_i, t]
-                    shadow_expired = (t - item["signal_bar"]) >= WL_MAX_AGE_BARS
+                    shadow_expired = wl_max_age > 0 and (t - item["signal_bar"]) >= wl_max_age
 
                     if shadow_expired or shadow_stopped or shadow_exited:
                         _record_unfilled_disposition(item, default_bucket="expired_unfilled")
@@ -1715,6 +1782,8 @@ class BacktestEngine:
                             "entry_price": tr.entry_price, "exit_price": vwap_exit,
                             "cost_usd": tr.cost_usd, "proceeds": total_proceeds,
                             "frictions": tr.fee_acc, "from_watchlist": tr.from_watchlist,
+                        "wait_bars": tr.wait_days, "entry_equity": tr.entry_equity,
+                        "gap_vs_trigger_pct": ((tr.entry_price / tr.trigger_px - 1.0) * 100.0) if tr.trigger_px > 0 else 0.0,
                         })
                 live_tranches = []
 
@@ -1743,7 +1812,14 @@ class BacktestEngine:
             active_capital_curve[idx] = current_active
             total_equity_curve[idx] = eod_equity
             twr_curve[idx] = current_twr
-            concurrency_hist[min(len(live_tranches), max_slots)] += 1
+            idle_cash_curve[idx] = cash / eod_equity if eod_equity > 0 else 0.0
+            # sizing weight: decided on today's close, used for tomorrow's orders (causal)
+            size_w_curve[idx] = size_w
+            if starved_today:
+                size_w = max(size_w0, size_w * (1.0 - size_ramp))
+            elif eod_equity > 0 and cash / eod_equity > size_reserve:
+                size_w = min(size_w_max, size_w * (1.0 + size_ramp))
+            concurrency_hist[min(len(live_tranches), len(concurrency_hist) - 1)] += 1
 
         signal_log = []
         if record_signals:
@@ -1761,6 +1837,8 @@ class BacktestEngine:
             "binding_stats": binding_stats,
             "funnel_stats": funnel_dispositions,
             "concurrency_hist": concurrency_hist,
+            "size_w_curve": size_w_curve,
+            "idle_cash_curve": idle_cash_curve,
             "peak_single_stock_pct": float(peak_single_stock_pct * 100.0),
             "signal_log": signal_log,
         }
@@ -2020,6 +2098,20 @@ def calculate_metrics(results: Dict[str, Any], grid: MarketGrid, start_bar: int,
 # ==============================================================================
 # ANTI-OVERFITTING: MULTI-ARCH CAUSALITY & NEIGHBORHOOD AUDIT
 # ==============================================================================
+def logged_phase(name: str):
+    """Logs start and elapsed time of a slow validation phase so the console never goes silent."""
+    def deco(fn):
+        @functools.wraps(fn)
+        def wrapper(*a, **k):
+            t0 = time.time()
+            logging.info(f"[phase] {name} ...")
+            out = fn(*a, **k)
+            logging.info(f"[phase] {name} done in {time.time() - t0:.0f}s")
+            return out
+        return wrapper
+    return deco
+
+
 def dynamic_parameter_neighbors(base_p: Dict[str, Any]) -> List[Dict[str, Any]]:
     steps = {
         "entry_ma_len": 5, "rsi_f_len": 2, "rsi_f_smt": 2, "rsi_s_len": 2, "rsi_s_smt": 2,
@@ -2029,13 +2121,13 @@ def dynamic_parameter_neighbors(base_p: Dict[str, Any]) -> List[Dict[str, Any]]:
         "trail_atr_mult": 0.5, "max_holding_bars": 5, "trail_pct": 2.0, "exit_ma_len": 5,
         "exit_rsi_f_len": 2, "exit_rsi_f_smt": 2, "exit_rsi_s_len": 2, "exit_rsi_s_smt": 2,
         "exit_xover_short_len": 5, "exit_xover_gap": 5, "exit_vol_ma_len": 5,
-        "exit_vol_mult": 0.2, "bb_exit_len": 2, "max_concurrent_tranches": 1,
+        "exit_vol_mult": 0.2, "bb_exit_len": 2, "bp_vol_ma_len": 2, "bp_vol_mult": 0.25, "bp_ratio": 0.5,
         "adx_thresh": 5.0, "be_trigger_atr": 1.0
     }
 
     neighbors = []
     for k, step in steps.items():
-        if k not in base_p:
+        if k not in base_p or (k == "vol_mult" and float(base_p[k]) == 0.0):   # vol_mult 0 = volume confirmation off; a +step would switch it on
             continue
         for mult in (+1, -1):
             cand = copy.deepcopy(base_p)
@@ -2069,6 +2161,21 @@ def dynamic_parameter_neighbors(base_p: Dict[str, Any]) -> List[Dict[str, Any]]:
                 cand_f["tranche_floor"] = TRANCHE_FLOOR_CHOICES[j_f]
                 neighbors.append(cand_f)
 
+    for k_c, choices in (("size_w0", SIZE_W0_CHOICES), ("size_w_max", SIZE_W_MAX_CHOICES),
+                         ("size_reserve", SIZE_RESERVE_CHOICES), ("size_ramp", SIZE_RAMP_CHOICES)):
+        if k_c in base_p and float(base_p[k_c]) in choices:
+            i_c = choices.index(float(base_p[k_c]))
+            for j_c in (i_c - 1, i_c + 1):
+                if 0 <= j_c < len(choices):
+                    cand_c = copy.deepcopy(base_p)
+                    cand_c[k_c] = choices[j_c]
+                    neighbors.append(cand_c)
+    for k_b in ("wl_revalidate",):
+        if k_b in base_p:
+            cand_b = copy.deepcopy(base_p)
+            cand_b[k_b] = not cand_b[k_b]
+            neighbors.append(cand_b)
+
     if "macro_active_exit" in base_p:
         cand_macro = copy.deepcopy(base_p)
         cand_macro["macro_active_exit"] = not cand_macro["macro_active_exit"]
@@ -2083,8 +2190,13 @@ def dynamic_parameter_neighbors(base_p: Dict[str, Any]) -> List[Dict[str, Any]]:
 
 
 def evaluate_neighborhood_stability(params: Dict[str, Any], candidate_score: float, grid: MarketGrid,
-                                     start_bar: int, end_bar: int, benchmark_cagr: float) -> Tuple[bool, float, float, List[float]]:
+                                     start_bar: int, end_bar: int, benchmark_cagr: float,
+                                     max_neighbors: Optional[int] = None) -> Tuple[bool, float, float, List[float]]:
     neighbors = dynamic_parameter_neighbors(params)
+    if max_neighbors is not None and len(neighbors) > max_neighbors:      # deterministic: same params -> same sample
+        _seed = int(hashlib.sha256(json.dumps(params, sort_keys=True, default=str).encode()).hexdigest()[:8], 16)
+        _pick = np.random.default_rng(_seed).choice(len(neighbors), size=max_neighbors, replace=False)
+        neighbors = [neighbors[i] for i in sorted(_pick)]
     neighbor_scores = []
     for n_p in neighbors:
         raw_sig, n_entry, n_exit, n_macro, n_state = compile_signals_fast(grid, n_p)
@@ -2135,7 +2247,7 @@ def slice_market_grid(grid: MarketGrid, cutoff_bar: int) -> MarketGrid:
 
 
 def verify_behavioral_causality(grid: MarketGrid):
-    logging.info("Executing Complete 5-Archetype Prefix-Invariance Causality Audit (Comparing Row Data)...")
+    logging.info("Executing Complete 6-Archetype Prefix-Invariance Causality Audit (Comparing Row Data)...")
     n_bars = len(grid.dates)
     if n_bars < 500:
         return
@@ -2149,28 +2261,31 @@ def verify_behavioral_causality(grid: MarketGrid):
     test_cfgs = [
         {"entry_type": 0, "entry_ma_len": 50, "entry_ma_type": 1, "use_market_macro_system": True,
          "macro_ma_len": 100, "macro_ma_type": 0, "macro_active_exit": False, "adx_thresh": 0.0,
-         "max_pyramid_layers": 1, "wl_mode": "WL_NONE", "max_concurrent_tranches": 6,
-         "max_holding_bars": 25, "sl_mult": 3.0, "exit_type": 0, "trail_atr_mult": 0.0, "tranche_floor": 5000.0},
+         "max_pyramid_layers": 1, "wl_mode": "WL_NONE",
+         "max_holding_bars": 25, "sl_mult": 3.0, "exit_type": 0, "trail_atr_mult": 0.0, "tranche_floor": 50.0},
         {"entry_type": 1, "rsi_f_len": 14, "rsi_f_smt": 6, "rsi_s_len": 40, "rsi_s_smt": 10,
          "use_rsi_trend_filter": False, "use_market_macro_system": True, "macro_ma_len": 100,
          "macro_ma_type": 0, "macro_active_exit": True, "adx_thresh": 20.0,
-         "max_pyramid_layers": 1, "wl_mode": "WL_DEEPEST_DISCOUNT", "max_concurrent_tranches": 6,
-         "be_trigger_atr": 1.5, "tranche_floor": 10000.0,
+         "max_pyramid_layers": 1, "wl_mode": "WL_DEEPEST_DISCOUNT",
+         "be_trigger_atr": 1.5, "tranche_floor": 100.0,
          "max_holding_bars": 35, "sl_mult": 4.5, "exit_type": 1, "trail_pct": 20.0, "trail_atr_mult": 0.0},
         {"entry_type": 2, "xover_short_len": 15, "xover_short_type": 0, "xover_long_len": 60, "xover_long_type": 0, "xover_gap": 45,
          "use_market_macro_system": True, "macro_ma_len": 100, "macro_ma_type": 0, "macro_active_exit": False, "adx_thresh": 0.0,
-         "max_pyramid_layers": 1, "wl_mode": "WL_NONE", "max_concurrent_tranches": 6,
+         "max_pyramid_layers": 1, "wl_mode": "WL_NONE",
          "max_holding_bars": 20, "sl_mult": 3.0, "exit_type": 5, "trail_atr_mult": 0.0,
          "exit_xover_short_len": 15, "exit_xover_short_type": 0, "exit_xover_long_len": 60, "exit_xover_long_type": 0, "exit_xover_gap": 45},
         {"entry_type": 3, "vol_ma_len": 20, "vol_mult": 2.5, "price_lookback": 20, "body_atr_mult": 0.8,
          "use_market_macro_system": True, "macro_ma_len": 100, "macro_ma_type": 0, "macro_active_exit": False, "adx_thresh": 0.0,
-         "max_pyramid_layers": 1, "wl_mode": "WL_NONE", "max_concurrent_tranches": 6,
+         "max_pyramid_layers": 1, "wl_mode": "WL_NONE",
          "max_holding_bars": 20, "sl_mult": 3.0, "exit_type": 6, "trail_atr_mult": 0.0,
          "exit_vol_ma_len": 20, "exit_vol_mult": 1.5},
         {"entry_type": 4, "bb_entry_len": 50, "bb_entry_std": 3.0, "use_market_macro_system": False,
-         "adx_thresh": 25.0, "max_pyramid_layers": 2, "wl_mode": "WL_NONE", "max_concurrent_tranches": 11,
-         "max_holding_bars": 55, "sl_mult": 9.0, "be_trigger_atr": 2.5, "tranche_floor": 15000.0, "exit_type": 1, "trail_pct": 29.0, "trail_atr_mult": 0.0,
+         "adx_thresh": 25.0, "max_pyramid_layers": 2, "wl_mode": "WL_NONE",
+         "max_holding_bars": 55, "sl_mult": 9.0, "be_trigger_atr": 2.5, "tranche_floor": 150.0, "exit_type": 1, "trail_pct": 29.0, "trail_atr_mult": 0.0,
          "bb_exit_len": 20},
+        {"entry_type": 5, "bp_vol_ma_len": 20, "bp_vol_mult": 2.0, "bp_ratio": 3.0, "use_market_macro_system": False,
+         "adx_thresh": 25.0, "max_pyramid_layers": 1, "wl_mode": "WL_NONE",
+         "max_holding_bars": 40, "sl_mult": 4.0, "exit_type": 1, "trail_pct": 20.0, "trail_atr_mult": 0.0, "bb_exit_len": 20},
     ]
 
     for cfg in test_cfgs:
@@ -2212,7 +2327,7 @@ def verify_behavioral_causality(grid: MarketGrid):
 # ==============================================================================
 def sample_hyperparameters(trial: optuna.Trial) -> Dict[str, Any]:
     p = {}
-    p["entry_type"] = trial.suggest_categorical("entry_type", [0, 1, 2, 3, 4])   # V12.1: all five families searched again (owner decision)
+    p["entry_type"] = trial.suggest_categorical("entry_type", [0, 1, 2, 3, 4, 5])   # V13: 3 = pure breakout, 5 = buying-pressure surge
     p["adx_thresh"] = trial.suggest_categorical("adx_thresh", [0.0, 15.0, 20.0, 25.0, 30.0, 35.0, 40.0, 45.0])
 
     if p["entry_type"] == 0:
@@ -2235,10 +2350,17 @@ def sample_hyperparameters(trial: optuna.Trial) -> Dict[str, Any]:
         p["xover_long_len"] = min(200, p["xover_short_len"] + gap)
         p["xover_long_type"] = trial.suggest_categorical("xover_long_type", [0, 1, 3])
     elif p["entry_type"] == 3:
-        p["vol_ma_len"] = trial.suggest_int("vol_ma_len", 10, 50, step=2)
-        p["vol_mult"] = round(trial.suggest_float("vol_mult", 1.5, 4.5, step=0.1), 1)
         p["price_lookback"] = trial.suggest_int("price_lookback", 10, 50, step=2)
         p["body_atr_mult"] = round(trial.suggest_float("body_atr_mult", 0.3, 2.0, step=0.1), 1)
+        if trial.suggest_categorical("breakout_use_volume", [True, False]):
+            p["vol_ma_len"] = trial.suggest_int("vol_ma_len", 10, 50, step=2)
+            p["vol_mult"] = round(trial.suggest_float("vol_mult", 1.5, 4.5, step=0.1), 1)
+        else:
+            p["vol_mult"] = 0.0
+    elif p["entry_type"] == 5:
+        p["bp_vol_ma_len"] = trial.suggest_int("bp_vol_ma_len", 10, 50, step=2)
+        p["bp_vol_mult"] = round(trial.suggest_float("bp_vol_mult", 1.0, 4.0, step=0.25), 2)
+        p["bp_ratio"] = round(trial.suggest_float("bp_ratio", 1.5, 6.0, step=0.5), 1)
     elif p["entry_type"] == 4:
         p["bb_entry_len"] = trial.suggest_int("bb_entry_len", 10, 50, step=2)
         p["bb_entry_std"] = round(trial.suggest_float("bb_entry_std", 1.5, 3.0, step=0.1), 1)
@@ -2255,11 +2377,19 @@ def sample_hyperparameters(trial: optuna.Trial) -> Dict[str, Any]:
     else:
         p["macro_active_exit"] = False
 
-    p["max_concurrent_tranches"] = trial.suggest_int("max_concurrent_tranches", 4, 20, step=1)
-    if p["entry_type"] in (0, 3, 4):
-        p["max_pyramid_layers"] = trial.suggest_categorical("max_pyramid_layers", [1, 2])
+    # V13: no slot cap. Sizing is a weight on equity that ramps while cash sits idle (see SIZE_* constants).
+    p["size_w0"] = float(trial.suggest_categorical("size_w0", SIZE_W0_CHOICES))
+    p["size_w_max"] = float(trial.suggest_categorical("size_w_max", SIZE_W_MAX_CHOICES))
+    p["size_reserve"] = float(trial.suggest_categorical("size_reserve", SIZE_RESERVE_CHOICES))
+    p["size_ramp"] = float(trial.suggest_categorical("size_ramp", SIZE_RAMP_CHOICES))
+    # V13 engine rules the owner fixed (not searched): one watchlist entry per stock, no age cap, whole shares.
+    p.update(V13_FIXED_RULES)
+    p["wl_revalidate"] = trial.suggest_categorical("wl_revalidate", [True, False])
+    if p["entry_type"] in (0, 3, 4, 5):
+        p["max_pyramid_layers"] = trial.suggest_categorical("max_pyramid_layers", [1, 2, 3])
     else:
         p["max_pyramid_layers"] = 1
+    p["avg_down_free_adds"] = trial.suggest_categorical("avg_down_free_adds", [0, 1]) if p["max_pyramid_layers"] > 1 else 0
 
     p["wl_mode"] = trial.suggest_categorical("wl_mode", [
         "WL_NONE", "WL_DEEPEST_DISCOUNT", "WL_STRONGEST_MOMENTUM"
@@ -2332,6 +2462,8 @@ ENGINE_HASH_INPUT: str = (
     _canonical_func_source(calculate_benchmarks) +
     _canonical_func_source(compute_max_affordable_tranche) +
     _canonical_func_source(breakeven_exit_price) +
+    _canonical_func_source(buy_sell_volume_split) +
+    _canonical_func_source(buy_pressure_mask) +
     _canonical_func_source(repair_price_artifacts) +
     _canonical_func_source(_year_returns) +
     _canonical_func_source(compute_buy_cost_audited) +
@@ -2340,8 +2472,8 @@ ENGINE_HASH_INPUT: str = (
          BRACKET_SLIPPAGE_BPS, BRACKET_IMPACT_COEF_BPS, TIER_ADV_LARGE_USD, TIER_ADV_MID_USD, VOL_BREAKOUT_SLIP_MULT, SLIPPAGE_SCALE,
          TRANCHE_FLOOR_CHOICES, MAX_POSITION_EQUITY_PCT,
          MAX_ADV_PARTICIPATION, DD_PENALTY_WEIGHT, MIN_CLOSED_TRADES, EOT_EXCESS_WEIGHT, ADV_WINDOW, ADV_MIN_PERIODS,
-         INITIAL_CAPITAL, MONTHLY_CONTRIBUTION, CASH_ANNUAL_YIELD, WL_MAX_AGE_BARS, BENCH_SYMBOL, BARS_PER_YEAR, TOP_N_COINS, DELIST_HAIRCUT,
-         OBJ_YEAR_EXCESS_CLIP, OBJ_SCORE_SCALE, OBJ_MIN_YEAR_BARS, STOP_EXECUTION, STOP_MARKET_SLIP_MULT, EXCLUDED_SYMBOLS, ALLOWED_PROVIDERS, PEGGED_BAND, PEGGED_SHARE, BASKET_INVESTABLE_ONLY, SPIKE_MIN_MOVE, CA_DROP_Q, CA_JUMP_Q, CA_GAP_EXPLAINS, CA_MARKET_DAY_MAX, MANUAL_CORPORATE_ACTIONS])
+         INITIAL_CAPITAL, MONTHLY_CONTRIBUTION, CASH_ANNUAL_YIELD, ENGINE_DEFAULTS, SIZE_W0_CHOICES, SIZE_W_MAX_CHOICES, SIZE_RESERVE_CHOICES, SIZE_RAMP_CHOICES, SIZE_RUNT_FRACTION, V13_FIXED_RULES, PLATEAU_IN_LOOP, PLATEAU_TOP_QUANTILE, PLATEAU_MIN_COMPLETED, PLATEAU_MAX_NEIGHBORS, PLATEAU_PENALTY_WEIGHT, PLATEAU_PENALTY_CAP, BENCH_SYMBOL, BARS_PER_YEAR, TOP_N_COINS, DELIST_HAIRCUT,
+         OBJ_YEAR_EXCESS_CLIP, OBJ_SCORE_SCALE, OBJ_MIN_YEAR_BARS, EXCLUDED_SYMBOLS, ALLOWED_PROVIDERS, PEGGED_BAND, PEGGED_SHARE, BASKET_INVESTABLE_ONLY, SPIKE_MIN_MOVE, CA_DROP_Q, CA_JUMP_Q, CA_GAP_EXPLAINS, CA_MARKET_DAY_MAX, MANUAL_CORPORATE_ACTIONS])
 )
 PARAM_SPACE_HASH: str = hashlib.sha256(ENGINE_HASH_INPUT.encode()).hexdigest()[:8]
 STUDY_NAME = f"crypto_swing_{ENGINE_VERSION.lower()}_{UNIVERSE_NAME.lower()}_{PARAM_SPACE_HASH}"
@@ -2368,6 +2500,11 @@ def reconstitute_params(params: Dict[str, Any]) -> Dict[str, Any]:
     p.setdefault("trail_atr_mult", 0.0)
     p.setdefault("wl_mode", "WL_NONE")
     p.setdefault("tranche_floor", TRANCHE_FLOOR_USD)
+    # V13: values the search does not record in trial.params (fixed rules, and options that are off by default)
+    p.update(V13_FIXED_RULES)
+    p.setdefault("avg_down_free_adds", 0)
+    if p.get("entry_type") == 3 and not p.get("breakout_use_volume", True):
+        p["vol_mult"] = 0.0                      # pure breakout: volume confirmation switched off
     for legacy in ("use_global_tp", "tp_mult", "tp_size_pct", "tp_move_sl_be"):
         p.pop(legacy, None)
     return p
@@ -2408,38 +2545,64 @@ def compute_twr_analytics(strategy_twr: np.ndarray, btc_daily_ret: np.ndarray) -
     }
 
 
+_PLACEBO_CTX: Dict[str, Any] = {}
+
+
+def _placebo_init(ctx: Dict[str, Any]) -> None:
+    _PLACEBO_CTX.clear()
+    _PLACEBO_CTX.update(ctx)
+    _PLACEBO_CTX["engine"] = BacktestEngine(params=ctx["p"])
+
+
+def _placebo_one(seed_i: int) -> Tuple[int, Optional[float], float]:
+    """One placebo seed (own RNG stream, so serial and parallel runs give identical numbers)."""
+    c = _PLACEBO_CTX
+    grid, start_bar, end_bar = c["grid"], c["start_bar"], c["end_bar"]
+    rng = np.random.default_rng([42, seed_i])
+    random_raw = rng.random((len(grid.symbols), end_bar - start_bar)) < c["prob"]
+    placebo_raw = np.zeros((len(grid.symbols), len(grid.dates)), dtype=bool)
+    placebo_raw[:, start_bar:end_bar] = random_raw & grid.alive_mat[:, start_bar:end_bar]
+    uncond = None
+    if seed_i < c["n_uncond"]:
+        uncond_entry = placebo_raw & c["macro_ok"] & c["liq_ok"] & grid.alive_mat
+        res = c["engine"].run_interval(grid, placebo_raw, uncond_entry, c["exit_mat"], c["macro_ok"], start_bar, end_bar, state_mat=c["state_mat"])
+        uncond = calculate_metrics(res, grid, start_bar, end_bar, c["bench"])["full"]["cagr"]
+    cond_entry = placebo_raw & c["macro_ok"] & c["adx_ok"] & c["liq_ok"] & grid.alive_mat
+    res = c["engine"].run_interval(grid, placebo_raw, cond_entry, c["exit_mat"], c["macro_ok"], start_bar, end_bar, state_mat=c["state_mat"])
+    return seed_i, uncond, calculate_metrics(res, grid, start_bar, end_bar, c["bench"])["full"]["cagr"]
+
+
+@logged_phase("placebo suite")
 def run_matched_placebo_suite(grid: MarketGrid, p: Dict[str, Any], total_bars: int,
                               start_bar: int, end_bar: int, benchmark_cagr: float,
                               total_raw_triggers: int, n_seeds: int = 100, n_seeds_uncond: int = 30) -> Dict[str, Any]:
-    """Runs Unconditioned and Conditioned Placebos and preserves full empirical distributions."""
+    """Unconditioned and conditioned random-entry placebos; keeps the full empirical distributions. Seeds run in parallel."""
     n_syms = len(grid.symbols)
-    raw_trigger_prob = max(0.001, total_raw_triggers / float(total_bars * n_syms))
-    np.random.seed(42)
-    unconditioned_cagrs = []
-    conditioned_cagrs = []
     adx_t = p.get("adx_thresh", 0.0)
-
     _, _, exit_mat, macro_ok, state_mat = compile_signals_fast(grid, p)
-    engine = BacktestEngine(params=p)
-
-    liq_thresh = np.maximum(grid.liq_floor, 1.0)[:, None]
-    for seed_i in range(n_seeds):
-        random_raw = (np.random.rand(n_syms, total_bars) < raw_trigger_prob)
-        placebo_raw = np.zeros((n_syms, len(grid.dates)), dtype=bool)
-        placebo_raw[:, start_bar:end_bar] = random_raw & grid.alive_mat[:, start_bar:end_bar]
-        liq_ok = grid.dvol30_mat >= liq_thresh
-
-        if seed_i < n_seeds_uncond:
-            uncond_entry = placebo_raw & macro_ok & liq_ok & grid.alive_mat
-            res_uncond = engine.run_interval(grid, placebo_raw, uncond_entry, exit_mat, macro_ok, start_bar, end_bar, state_mat=state_mat)
-            m_uncond = calculate_metrics(res_uncond, grid, start_bar, end_bar, benchmark_cagr)
-            unconditioned_cagrs.append(m_uncond["full"]["cagr"])
-
-        adx_ok = (grid.adx14_mat >= adx_t) if adx_t > 0.0 else True
-        cond_entry = placebo_raw & macro_ok & adx_ok & liq_ok & grid.alive_mat
-        res_cond = engine.run_interval(grid, placebo_raw, cond_entry, exit_mat, macro_ok, start_bar, end_bar, state_mat=state_mat)
-        m_cond = calculate_metrics(res_cond, grid, start_bar, end_bar, benchmark_cagr)
-        conditioned_cagrs.append(m_cond["full"]["cagr"])
+    ctx = {
+        "grid": grid, "p": p, "start_bar": start_bar, "end_bar": end_bar, "bench": benchmark_cagr,
+        "prob": max(0.001, total_raw_triggers / float(total_bars * n_syms)), "n_uncond": n_seeds_uncond,
+        "exit_mat": exit_mat, "macro_ok": macro_ok, "state_mat": state_mat,
+        "liq_ok": grid.dvol30_mat >= np.maximum(grid.liq_floor, 1.0)[:, None],
+        "adx_ok": (grid.adx14_mat >= adx_t) if adx_t > 0.0 else True,
+    }
+    workers = max(1, min(PLACEBO_WORKERS, (os.cpu_count() or 2) - 1, n_seeds))
+    rows = None
+    if workers > 1:
+        try:
+            with ProcessPoolExecutor(max_workers=workers, mp_context=mp.get_context("spawn"),
+                                     initializer=_placebo_init, initargs=(ctx,)) as ex:
+                rows = list(ex.map(_placebo_one, range(n_seeds), chunksize=max(1, n_seeds // (workers * 4))))
+        except Exception as e:  # parallel is an optimisation only
+            logging.warning(f"Parallel placebo failed ({type(e).__name__}: {e}); running serially.")
+            rows = None
+    if rows is None:
+        _placebo_init(ctx)
+        rows = [_placebo_one(i) for i in range(n_seeds)]
+    rows.sort(key=lambda r: r[0])
+    unconditioned_cagrs = [r[1] for r in rows if r[1] is not None]
+    conditioned_cagrs = [r[2] for r in rows]
 
     return {
         "unconditioned": (
@@ -2457,6 +2620,7 @@ def run_matched_placebo_suite(grid: MarketGrid, p: Dict[str, Any], total_bars: i
     }
 
 
+@logged_phase("trailing-stop ablation")
 def run_trailing_stop_ablation(grid: MarketGrid, p: Dict[str, Any], is_start: int, is_end: int,
                                oos_start: int, oos_end: int, is_bench_cagr: float,
                                oos_bench_cagr: float) -> str:
@@ -2551,6 +2715,7 @@ def run_causality_audit_cached(grid: MarketGrid) -> None:
         pass
 
 
+@logged_phase("timing robustness")
 def run_timing_robustness(grid: MarketGrid, params: Dict[str, Any], start_bar: int, end_bar: int) -> Dict[str, Any]:
     """Re-runs the config with the monthly deposit landing on different trading days and with shifted start dates."""
     raw, ent, ext, mac, st = compile_signals_fast(grid, params)
@@ -2601,8 +2766,8 @@ def missed_swing_md(grid: MarketGrid, signal_log: List[Tuple[int, int, int, str]
         return "*No signals recorded.*\n"
     df = pd.DataFrame(signal_log, columns=["sid", "c_i", "sbar", "outcome"]).sort_values(["c_i", "sbar"]).reset_index(drop=True)
     df["ep"] = ((df["c_i"] != df["c_i"].shift()) | ((df["sbar"] - df["sbar"].shift()) > 1)).cumsum()
-    order = ["executed", "slot_saturated", "cash_starved", "scrip_risk_cap", "expired_unfilled", "revalidation_dropped",
-             "anti_averaging_down", "pyramid_blocked", "liquidity_blocked", "adx_blocked", "macro_blocked", "open_at_end"]
+    order = ["executed", "cash_starved", "scrip_risk_cap", "expired_unfilled", "revalidation_dropped",
+             "anti_averaging_down", "pyramid_blocked", "wl_duplicate", "unaffordable", "liquidity_blocked", "adx_blocked", "macro_blocked", "open_at_end"]
     prio = {o: i for i, o in enumerate(order)}
     df["prio"] = df["outcome"].map(prio).fillna(len(order))
     eps = df.groupby("ep").agg(c_i=("c_i", "first"), sbar=("sbar", "first"), prio=("prio", "min"), days=("sid", "count")).reset_index()
@@ -2628,9 +2793,9 @@ def missed_swing_md(grid: MarketGrid, signal_log: List[Tuple[int, int, int, str]
     big = eps[eps["fwd"] > 0.10]
     if len(big) > 0:
         md += f"\n* Of **{len(big)}** swing episodes that ran > +10% within {horizon} bars, **{(big['outcome'] == 'executed').mean() * 100:.1f}%** were bought "
-        md += f"(**{(big['outcome'].isin(['slot_saturated', 'cash_starved', 'scrip_risk_cap', 'expired_unfilled'])).mean() * 100:.1f}%** were lost to capital/slot limits, "
+        md += f"(**{(big['outcome'].isin(['cash_starved', 'scrip_risk_cap', 'expired_unfilled'])).mean() * 100:.1f}%** were lost to capital limits, "
         md += f"**{(big['outcome'].isin(['adx_blocked', 'liquidity_blocked', 'macro_blocked'])).mean() * 100:.1f}%** to the entry filters).\n"
-    cap = eps[eps["outcome"].isin(["cash_starved", "slot_saturated", "scrip_risk_cap", "expired_unfilled"])]
+    cap = eps[eps["outcome"].isin(["cash_starved", "scrip_risk_cap", "expired_unfilled"])]
     ex = eps[eps["outcome"] == "executed"]
     if len(cap) > 20 and len(ex) > 20:
         verdict = ("the ranking leaves better swings on the table" if cap["fwd"].mean() > ex["fwd"].mean() else "the ranking is choosing at least as well as the average dropped episode")
@@ -2653,7 +2818,12 @@ def top_trades_md(trades: pd.DataFrame, n: int = 10) -> str:
         md += (f"| {r['coin']} | {pd.Timestamp(r['entry_date']).date()} | {pd.Timestamp(r['exit_date']).date()} | {int(r['bars'])} | "
                f"{r['ret']*100:+.1f}% | {format_price(r['pnl'])} | {(r['pnl']/tot*100 if tot > 0 else 0):.1f}% | {r['reason']} | {'YES - review' if near else 'no'} |\n")
     if tot > 0:
-        md += (f"\n* Top-1 / top-3 / top-5 / top-10 trades = **{trades['pnl'].nlargest(1).sum()/tot:.1%} / {trades['pnl'].nlargest(3).sum()/tot:.1%} / "
+        _c = trades['pnl'] / trades['entry_equity'].clip(lower=1.0)
+        _ct = float(_c.sum())
+        if _ct > 0:
+            md += (f"\n* Same, each trade measured as % of equity at entry (size-neutral): **{_c.nlargest(1).sum()/_ct:.1%} / {_c.nlargest(3).sum()/_ct:.1%} / "
+                   f"{_c.nlargest(5).sum()/_ct:.1%} / {_c.nlargest(10).sum()/_ct:.1%}**.\n")
+        md += (f"\n* Top-1 / top-3 / top-5 / top-10 trades (dollars) = **{trades['pnl'].nlargest(1).sum()/tot:.1%} / {trades['pnl'].nlargest(3).sum()/tot:.1%} / "
                f"{trades['pnl'].nlargest(5).sum()/tot:.1%} / {trades['pnl'].nlargest(10).sum()/tot:.1%}** of total profit.\n")
     return md
 
@@ -2722,31 +2892,6 @@ def slippage_sweep_md(grid: MarketGrid, p: Dict[str, Any], is_start: int, n_bars
     return md
 
 
-def stop_execution_ab_md(grid: MarketGrid, p: Dict[str, Any], is_start: int, n_bars: int, compiled: Tuple[Any, ...]) -> str:
-    """Runs the champion under both stop-execution models. NEXT_OPEN (judge on the close, sell at the next open) is the NSE convention; INTRADAY is a resting
-    stop-market order. In a 24/7 market the difference can be the whole strategy: a breakeven stop that is only recognised at the close exits several % below breakeven."""
-    raw_sig, entry_m, exit_m, macro_m, state_m = compiled
-    base = STOP_EXECUTION
-    bench = calculate_benchmarks(grid, is_start, n_bars, macro_m)
-    md = ("| Stop model | Strategy CAGR | BTC CAGR | Max DD | Trades | Breakeven exits | Avg breakeven-exit return | Net PnL |\n"
-          "| :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- |\n")
-    try:
-        for mode in ("NEXT_OPEN", "INTRADAY"):
-            globals()["STOP_EXECUTION"] = mode
-            r = BacktestEngine(params=p).run_interval(grid, raw_sig, entry_m, exit_m, macro_m, is_start, n_bars, state_mat=state_m)
-            m = calculate_metrics(r, grid, is_start, n_bars, bench, min_trades=0)
-            tdf_ = r["trades"]
-            be = tdf_[tdf_["reason"] == "BREAKEVEN_SL"] if len(tdf_) else tdf_
-            be_avg = f"{float(be['ret'].mean()) * 100:+.2f}%" if len(be) else "n/a"
-            md += (f"| {mode}{' (current setting)' if mode == base else ''} | {m['full']['cagr']:.2f}% | {bench['btc_twr_cagr']:.2f}% | {m['max_dd']:.1f}% | "
-                   f"{m['full']['trades']} | {len(be)} | {be_avg} | {format_price(float(tdf_['pnl'].sum()) if len(tdf_) else 0.0)} |\n")
-    except Exception as exc:
-        md += f"| error | {type(exc).__name__}: {exc} | | | | | | |\n"
-    finally:
-        globals()["STOP_EXECUTION"] = base
-    return md
-
-
 def fee_reality_md() -> str:
     md = "| Ticket | Buy-side charges | Sell-side charges | Round trip | % of ticket |\n| :--- | :--- | :--- | :--- | :--- |\n"
     for tk in (50, 100, 250, 500, 1000, 2500, 10000):
@@ -2783,7 +2928,7 @@ def eot_share_multi_cut(grid: MarketGrid, eng: Any, sigs: Tuple[Any, ...], is_st
                         base_organic: Optional[float] = None, base_basket: Optional[float] = None, base_headline: Optional[float] = None) -> Dict[str, Any]:
     """V12.2/V12.4: how much of the in-sample result depends on unclosed terminal marks, with the IS window ending at the real cut AND at earlier cuts.
     A long trend trade straddling one particular cut date must not decide promotion on its own.
-    rows     = (cut back-shift, rupee share of IS profit that is an unclosed mark)           [V12.2 measure, now information]
+    rows     = (cut back-shift, dollar share of IS profit that is an unclosed mark)           [V12.2 measure, now information]
     org_rows = (cut back-shift, organic CAGR, survivor-basket CAGR, headline CAGR)           [V12.4 gate measure, return terms]"""
     raw_sig, entry_m, exit_m, macro_m, state_m = sigs
     rows: List[Tuple[int, float]] = []
@@ -2871,12 +3016,18 @@ def evaluate_gates(*, oos_slice: Dict[str, Any], oos_bench_cagr: float, oos_bask
     else:
         gates.append((f"Beats BTC in >= {GATE_MIN_YEARS_BEATING:.0%} of calendar years", False, "no comparable years"))
 
+    # Lottery guard in PERCENT terms: each trade counts as its profit divided by portfolio equity when it was opened, so the
+    # late, large positions of a compounding account do not dominate by size alone. The rupee reading is shown for reference.
+    _lbl = f"Lottery guard: top-5 trades <= {GATE_MAX_TOP5_TRADE_SHARE:.0%} of total profit (each trade as % of equity at entry)"
     tot_pnl = float(cont_trades["pnl"].sum()) if len(cont_trades) else 0.0
-    if tot_pnl > 0:
-        top5 = float(cont_trades["pnl"].nlargest(5).sum() / tot_pnl)
-        gates.append((f"Lottery guard: top-5 trades <= {GATE_MAX_TOP5_TRADE_SHARE:.0%} of total profit", top5 <= GATE_MAX_TOP5_TRADE_SHARE, f"{top5:.1%}"))
+    contrib = (cont_trades["pnl"] / cont_trades["entry_equity"].clip(lower=1.0)) if len(cont_trades) else pd.Series(dtype=float)
+    tot_c = float(contrib.sum())
+    if tot_c > 0:
+        top5 = float(contrib.nlargest(5).sum() / tot_c)
+        top5_usd = float(cont_trades["pnl"].nlargest(5).sum() / tot_pnl) if tot_pnl > 0 else float("nan")
+        gates.append((_lbl, top5 <= GATE_MAX_TOP5_TRADE_SHARE, f"{top5:.1%} (in dollars it would read {top5_usd:.1%})"))
     else:
-        gates.append((f"Lottery guard: top-5 trades <= {GATE_MAX_TOP5_TRADE_SHARE:.0%} of total profit", False, "no positive total profit"))
+        gates.append((_lbl, False, "no positive total profit"))
 
     gates.append((f"Max drawdown <= {GATE_MAX_DD_VS_INDEX:.2f}x benchmark's", cont_max_dd <= GATE_MAX_DD_VS_INDEX * max(1.0, cont_bench_dd),
                   f"{cont_max_dd:.1f}% vs benchmark {cont_bench_dd:.1f}%"))
@@ -2909,7 +3060,6 @@ def wasted_by_choice_md(allt: List[Any]) -> str:
     def _bin(col: str, edges: List[float], labels: List[str]) -> None:
         if col in df.columns:
             df[col + "_band"] = pd.cut(pd.to_numeric(df[col], errors="coerce"), bins=edges, labels=labels, include_lowest=True)
-    _bin("max_concurrent_tranches", [0, 6, 9, 14, 100], ["4-6 slots", "7-9 slots", "10-14 slots", "15+ slots"])
     _bin("max_holding_bars", [0, 60, 120, 180, 1000], ["10-60 bars", "61-120 bars", "121-180 bars", "181+ bars"])
     if known:
         md = (f"\n**Failure share by choice** ('Below trade floor' = fewer than {MIN_CLOSED_TRADES} closed trades, truly wasted; 'Poor' = traded enough but scored <= -5, "
@@ -2917,7 +3067,7 @@ def wasted_by_choice_md(allt: List[Any]) -> str:
     else:
         md = ("\n**Score <= -5 by choice** (this study did not record trade counts, so the cause is NOT known: a score <= -5 is either a trade-floor failure or a genuinely "
               "poor configuration):\n\n| Parameter | Choice | Trials | Score <= -5 | Share |\n| :--- | :--- | :--- | :--- | :--- |\n")
-    for col in ("entry_type", "exit_type", "adx_thresh", "max_concurrent_tranches_band", "max_holding_bars_band", "tranche_floor"):
+    for col in ("entry_type", "exit_type", "adx_thresh", "size_w0", "size_reserve", "size_ramp", "max_holding_bars_band", "tranche_floor"):
         if col not in df.columns:
             continue
         sub = df.dropna(subset=[col])
@@ -3010,7 +3160,7 @@ def search_diagnostics_md(seed_trials: Dict[int, List[Any]], seed_studies: Dict[
             md += f"| {k} | {med:.4g} | {up:.0%} | {dn:.0%} | {flag} |\n"
 
         df = pd.DataFrame([{**t.params, "value": t.value} for t in ok])
-        for col in ("entry_type", "exit_type", "wl_mode", "use_market_macro_system", "tranche_floor", "max_pyramid_layers"):
+        for col in ("entry_type", "exit_type", "wl_mode", "use_market_macro_system", "tranche_floor", "max_pyramid_layers", "size_w0", "size_w_max", "size_reserve", "size_ramp", "wl_revalidate", "avg_down_free_adds"):
             if col in df.columns and df[col].notna().sum() > 20:
                 g = df.dropna(subset=[col]).groupby(col)["value"].agg(["count", "median", lambda x: x.quantile(0.9)])
                 md += f"\n**{col}** (score by choice, scored trials only)\n\n| Choice | Trials | Median | p90 |\n| :--- | :--- | :--- | :--- |\n"
@@ -3138,13 +3288,24 @@ def run_optimization():
     is_bench = calculate_benchmarks(grid, is_start, is_end, rough_macro_ok)
     oos_bench = calculate_benchmarks(grid, oos_start, oos_end, rough_macro_ok)
 
-    # ---- ONE consistent objective (no penalties inside the search; robustness is applied afterwards) ----
+    # ---- Objective: in-sample score, with a soft plateau penalty for trials that reach the study's top decile ----
     def objective(trial: optuna.Trial) -> float:
         params = sample_hyperparameters(trial)
         raw_sig, entry_mat, exit_mat, macro_ok, state_mat = compile_signals_fast(grid, params)
         res = BacktestEngine(params=params).run_interval(grid, raw_sig, entry_mat, exit_mat, macro_ok, is_start, is_end, state_mat=state_mat)
-        trial.set_user_attr("n_closed", int(len(res["trades"])))   # V12.4: lets the diagnostics separate floor failures from poor configs
-        return float(calculate_metrics(res, grid, is_start, is_end, is_bench)["score"])
+        trial.set_user_attr("n_closed", int(len(res["trades"])))   # lets the diagnostics separate floor failures from poor configs
+        raw = float(calculate_metrics(res, grid, is_start, is_end, is_bench)["score"])
+        trial.set_user_attr("raw_score", raw)
+        if not PLATEAU_IN_LOOP or raw <= 0.0:
+            return raw
+        done_vals = [t.value for t in trial.study.trials if t.state == optuna.trial.TrialState.COMPLETE and t.value is not None]
+        if len(done_vals) < PLATEAU_MIN_COMPLETED or raw < float(np.quantile(done_vals, PLATEAU_TOP_QUANTILE)):
+            return raw
+        _, plateau, _, _ = evaluate_neighborhood_stability(params, raw, grid, is_start, is_end, is_bench, max_neighbors=PLATEAU_MAX_NEIGHBORS)
+        penalty = min(PLATEAU_PENALTY_WEIGHT * max(0.0, raw - plateau), PLATEAU_PENALTY_CAP * abs(raw))
+        trial.set_user_attr("plateau_score", float(plateau))
+        trial.set_user_attr("plateau_penalty", float(penalty))
+        return raw - penalty
 
     seed_trials: Dict[int, List[Any]] = {}
     seed_studies: Dict[int, Any] = {}
@@ -3160,6 +3321,9 @@ def run_optimization():
         else:
             logging.info(f"[seed {seed}] loaded completed study with {done} trials.")
         seed_studies[seed] = study
+        _pen = [t.user_attrs["plateau_penalty"] for t in study.trials if "plateau_penalty" in t.user_attrs]
+        if _pen:
+            logging.info(f"[seed {seed}] plateau check ran on {len(_pen)} top-decile trials; mean penalty {np.mean(_pen):.2f} score points, max {np.max(_pen):.2f}")
         seed_trials[seed] = [
             SimpleNamespace(number=f"s{seed}-{t.number}", seed=seed, value=float(t.value), params=dict(t.params),
                             dists=dict(t.distributions), tnum=int(t.number), n_closed=t.user_attrs.get("n_closed"))
@@ -3277,6 +3441,7 @@ def run_optimization():
     )
     logging.info(f"Champion selection: {selection_diagnosis_msg}")
     logging.info(f"Optimization Complete. Champion search score: {best_trial.value:.4f}")
+    logging.info("Final validation now runs (placebo suites, ablation, timing battery, report). Each phase logs its own time below.")
 
 
     raw_sig_final, entry_final, exit_final, macro_final, state_final = compile_signals_fast(grid, best_params)
@@ -3578,14 +3743,15 @@ def run_optimization():
 | ├── Macro Gate Blocked | -{f_disp['macro_blocked']} | BTC below Macro Moving Average |
 | ├── Liquidity Floor Blocked | -{f_disp['liquidity_blocked']} | Median 30d traded value below the floor ({format_price(LIQUIDITY_FLOOR_USD)}) or fewer than {ADV_MIN_PERIODS} live bars |
 | ├── ADX Trend Blocked | -{f_disp['adx_blocked']} | ADX < Selected Threshold |
-| ├── Pyramid Limit Blocked | -{f_disp['pyramid_blocked']} | Scrip already at max tranches or averaging down |
+| ├── Pyramid Limit Blocked | -{f_disp['pyramid_blocked']} | Coin already at max layers or averaging down |
 | ├── Revalidation Dropped | -{f_disp['revalidation_dropped']} | Failed macro/ADX/state check at fill time |
-| ├── Slot Saturated Dropped | -{f_disp['slot_saturated_dropped']} | No open portfolio slots available |
 | ├── Cash Starved Dropped | -{f_disp['cash_starved_dropped']} | Cash below tranche floor ({format_price(best_params.get('tranche_floor', TRANCHE_FLOOR_USD))}) |
-| ├── Scrip Risk Cap Dropped | -{f_disp['risk_cap_dropped']} | Exceeded single-stock 25% exposure ceiling |
-| ├── Expired in Watchlist | -{f_disp['expired_unfilled']} | Exceeded {WL_MAX_AGE_BARS} bars or shadow stop |
+| ├── Coin Risk Cap Dropped | -{f_disp['risk_cap_dropped']} | Exceeded single-coin 25% exposure ceiling |
+| ├── Expired in Watchlist | -{f_disp['expired_unfilled']} | Shadow position stopped/exited (or age cap if one is set) |
+| ├── Watchlist Duplicate Dropped | -{f_disp['wl_duplicate_dropped']} | Stock already on the watchlist (one entry per stock) |
+| ├── Unaffordable | -{f_disp['unaffordable_dropped']} | Order could not be sized (fractional units; rare) |
 | **Executed Trades on Ledger** | **{f_disp['executed_fills']}** | Successfully filled and audited |
-| **Checksum Reconciliation** | **{sum([f_disp['macro_blocked'], f_disp['liquidity_blocked'], f_disp['adx_blocked'], f_disp['pyramid_blocked'], f_disp['revalidation_dropped'], f_disp['slot_saturated_dropped'], f_disp['cash_starved_dropped'], f_disp['risk_cap_dropped'], f_disp['expired_unfilled'], f_disp['executed_fills']])}** | Must strictly equal Total Raw Triggers ({f_disp['raw_triggers']}) |
+| **Checksum Reconciliation** | **{sum([f_disp['macro_blocked'], f_disp['liquidity_blocked'], f_disp['adx_blocked'], f_disp['pyramid_blocked'], f_disp['revalidation_dropped'], f_disp['cash_starved_dropped'], f_disp['risk_cap_dropped'], f_disp['expired_unfilled'], f_disp['wl_duplicate_dropped'], f_disp['unaffordable_dropped'], f_disp['executed_fills']])}** | Must strictly equal Total Raw Triggers ({f_disp['raw_triggers']}) |
 """
 
     def _render_excursion(tdf: pd.DataFrame) -> str:
@@ -3668,9 +3834,11 @@ def run_optimization():
     is_reason_md = _render_reasons(is_results["trades"])
     oos_reason_md = _render_reasons(oos_results["trades"])
 
-    concurrency_md = "| Active Concurrent Slots | Total Days (IS) | Time Proportion (%) |\n| :--- | :--- | :--- |\n"
+    concurrency_md = "| Active Positions | Total Days (IS) | Time Proportion (%) |\n| :--- | :--- | :--- |\n"
     tot_bars_is = sum(is_results["concurrency_hist"])
-    for slots, b_cnt in enumerate(is_results["concurrency_hist"]):
+    _ch = is_results["concurrency_hist"]
+    _last = int(np.flatnonzero(_ch)[-1]) if _ch.any() else 0
+    for slots, b_cnt in enumerate(_ch[:_last + 1]):
         concurrency_md += f"| **{slots} Positions Active** | {b_cnt} days | {(b_cnt/max(1, tot_bars_is))*100:.1f}% |\n"
 
     beats_index_is = bool(is_metrics['full']['cagr'] > is_bench['btc_twr_cagr'])
@@ -3704,7 +3872,6 @@ def run_optimization():
     missed_md = missed_swing_md(grid, continuous_results.get("signal_log", []))
     bracket_md = bracket_breakdown_md(grid, cont_trades)
     fee_md = fee_reality_md()
-    stop_ab_md = stop_execution_ab_md(grid, best_params, is_start, n_bars, (raw_sig_final, entry_final, exit_final, macro_final, state_final))
     slip_sweep_md = slippage_sweep_md(grid, best_params, is_start, n_bars, (raw_sig_final, entry_final, exit_final, macro_final, state_final))
 
     report_md = f"""# Crypto Quantitative Strategy Audit Dossier ({ENGINE_VERSION}) — {UNIVERSE_NAME}
@@ -3741,7 +3908,7 @@ def run_optimization():
 | Concentration Metric | In-Sample (IS) | Out-of-Sample (OOS) | Operational Risk Assessment |
 | :--- | :--- | :--- | :--- |
 | **Distinct Tickers Traded** | {is_exp_telemetry['distinct_scrips']} symbols | {oos_exp_telemetry['distinct_scrips']} symbols | Breadth of execution basket |
-| **Contemporaneous Peak Scrip Exposure** | {is_exp_telemetry['max_single_stock_pct']:.1f}% | {oos_exp_telemetry['max_single_stock_pct']:.1f}% | Sized at <=25% at entry; organic price growth floats above |
+| **Contemporaneous Peak Single-Coin Exposure** | {is_exp_telemetry['max_single_stock_pct']:.1f}% | {oos_exp_telemetry['max_single_stock_pct']:.1f}% | Sized at <=25% at entry; organic price growth floats above |
 | **Top 5 Symbol Profit Share** | {is_exp_telemetry['top5_share']:.1f}% | {oos_exp_telemetry['top5_share']:.1f}% | Share of total profitable symbols |
 
 ## 2. Comprehensive Multi-Crisis Stress Audit (Continuous Pre-Invested Book)
@@ -3758,7 +3925,7 @@ def run_optimization():
 > 
 > **Methodological Note (Fold 3 vs Literal OOS):** Fold 3 covers the final 33% of all available days ({f3_label}), spanning the late In-Sample bull market plus the entire Out-of-Sample test window. Literal OOS strictly isolates the final 25% of trading history. An algorithm can produce positive alpha over the pure OOS test window while still trailing the index during the broader bull run embedded in Fold 3.
 >
-> **Score note:** *Search Score* is the plain objective (trimmed excess CAGR vs benchmark, minus a penalty for drawdown beyond the benchmark's). No penalties are applied inside the search; neighborhood, deposit-timing and seed-agreement checks are applied afterwards to the shortlisted candidates and shown in the columns to the right.
+> **Score note:** *Search Score* is the plain objective (trimmed excess CAGR vs benchmark, minus a penalty for drawdown beyond the benchmark's). Trials that reach the top decile of their study also receive a soft in-sample plateau penalty (a sample of neighbouring settings is scored; the raw score is kept as a trial attribute), so a Search Score below the raw objective means the setting looked fragile. Neighbourhood, deposit-timing and seed-agreement checks are applied afterwards to the shortlisted candidates and shown in the columns to the right.
 
 {wf_folds_md}
 *Timing p10 in this table is measured on the in-sample window for every candidate; the promotion gate in section 0 uses the full window (section 12), so the champion's two numbers can differ.*
@@ -3792,7 +3959,7 @@ def run_optimization():
 ## 9. Annual Pure Time-Weighted Return (TWR) Attribution
 {yearly_md}
 
-## 10. Portfolio Slot Concurrency Distribution
+## 10. Concurrent Positions Distribution
 {concurrency_md}
 
 ## 11. Trade-Reason Population Breakdown
@@ -3817,9 +3984,6 @@ def run_optimization():
 
 ## 15b. Slippage Sweep (continuous run; does the edge survive harsher fills?)
 {slip_sweep_md}
-
-## 15c. Stop Execution A/B (close-then-next-open vs resting intraday stop)
-{stop_ab_md}
 
 ## 16. Data Integrity & Sanity
 {sanity_md}

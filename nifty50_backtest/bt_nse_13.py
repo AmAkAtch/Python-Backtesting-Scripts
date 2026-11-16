@@ -122,7 +122,7 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(me
 # USER CONTROL PANEL
 # ==============================================================================
 
-ENGINE_VERSION: str = "V13.0"
+ENGINE_VERSION: str = "V13.2"
 # Universe: Nifty LargeMidcap 250 (= Nifty 100 + Nifty Midcap 150) pooled with Nifty Smallcap 100.
 UNIVERSE_NAME: str = "POOL_LM250_SC100"
 
@@ -202,6 +202,9 @@ ENGINE_DEFAULTS: Dict[str, Any] = {
     **V13_FIXED_RULES,
     "wl_revalidate": True,        # re-check macro/ADX/trend state at fill time (searched)
     "avg_down_free_adds": 0,      # add-ons allowed below the last entry price before the anti-averaging guard bites (searched)
+    "pyramid_rule": 0,            # V13.2 (entry type 0 only in the search): 0 = a further layer may be bought any day (V13.0 behaviour, not searchable), 1 = minimum bars since the last layer, 2 = price must be k x ATR above the last layer's fill
+    "pyramid_gap_bars": 0,        # rule 1: minimum bars between layers (searched)
+    "pyramid_progress_atr": 0.0,  # rule 2: required rise above the last layer's fill, in ATRs of that layer (searched)
     "size_w0": 0.05, "size_w_max": 0.15, "size_reserve": 0.10, "size_ramp": 0.05,   # sizing (searched)
 }
 
@@ -210,6 +213,8 @@ SIZE_W0_CHOICES: List[float] = [0.02, 0.03, 0.05, 0.08]        # starting weight
 SIZE_W_MAX_CHOICES: List[float] = [0.10, 0.15, 0.25]           # ceiling the ramp may reach
 SIZE_RESERVE_CHOICES: List[float] = [0.05, 0.10, 0.20]         # idle-cash share of equity tolerated before ramping up
 SIZE_RAMP_CHOICES: List[float] = [0.02, 0.05, 0.10]            # daily multiplicative change of w
+PYRAMID_GAP_CHOICES: List[int] = [5, 10, 20]                  # V13.2 rule 1: minimum bars between layers (a week or more)
+PYRAMID_PROGRESS_CHOICES: List[float] = [1.0, 1.5, 2.0]        # V13.2 rule 2: required rise above the last layer, in ATRs
 SIZE_RUNT_FRACTION: float = 0.6                                # an entry below this share of the target is not made
 MAX_TRACKED_POSITIONS: int = 300                               # concurrency histogram length only (not a limit)
 
@@ -1064,6 +1069,18 @@ def compile_signals_fast(grid: MarketGrid, p: Dict[str, Any]) -> Tuple[np.ndarra
             b_up, b_mid, _ = FastIndicators.bollinger_bands(c_arr, p["bb_entry_len"], p["bb_entry_std"])
             raw_entry = (~np.isnan(b_up)) & (c_arr > b_up) & (shift_1d(c_arr) <= shift_1d(b_up))
             state_entry = (~np.isnan(b_mid)) & (c_arr > b_mid)
+        elif et == 6:
+            # V13.2 MA reclaim: close above the MA AND (the bar opened at/below the MA = bounce,
+            # OR the previous close was below the previous MA = cross on the close, which also catches gap-ups).
+            ma = FastIndicators.moving_average(c_arr, p["entry_ma_len"], p["entry_ma_type"])
+            ma_ok = ~np.isnan(ma)
+            ma_prev = shift_1d(ma)
+            c_prev = shift_1d(c_arr)
+            above = ma_ok & (c_arr > ma)
+            bounce = o_arr <= ma
+            cross = (~np.isnan(ma_prev)) & (c_prev < ma_prev)
+            raw_entry = above & (bounce | cross)
+            state_entry = above                      # at fill time the stock must still close above the MA
         elif et == 5:
             raw_entry = buy_pressure_mask(h_arr, l_arr, c_arr, v_arr, p["bp_vol_ma_len"], p["bp_vol_mult"], p["bp_ratio"])
             state_entry = np.ones(n_bars, dtype=bool)      # a buying-pressure dip has no trend state to re-check at fill time
@@ -1206,7 +1223,8 @@ def tranche_eod_update(tr: Tranche, t: int, grid: MarketGrid, xt: int, be_trigge
 
 def evaluate_entry(grid: MarketGrid, c_i: int, t: int, today_open: float, entry_atr: float, cash: float,
                    live_tranches: List[Tranche], day_equity: float, day_target: float, floor_inr: float,
-                   free_adds: int, max_pyramid: int, whole_shares: bool) -> Dict[str, Any]:
+                   free_adds: int, max_pyramid: int, whole_shares: bool,
+                   pyr_rule: int = 0, pyr_gap_bars: int = 0, pyr_progress_atr: float = 0.0) -> Dict[str, Any]:
     """Sizing and fill decision for one entry candidate at the open of bar t. Changes no state.
     The backtest passes the real open; the live bot passes its estimate of tomorrow's open."""
     coin_layers = sum(1 for tr in live_tranches if tr.coin_idx == c_i)
@@ -1214,6 +1232,12 @@ def evaluate_entry(grid: MarketGrid, c_i: int, t: int, today_open: float, entry_
         highest_prior_entry = max(tr.entry_price for tr in live_tranches if tr.coin_idx == c_i)
         if today_open <= highest_prior_entry * 1.005:
             return {"ok": False, "reason": "anti_averaging_down", "starved": False}
+    if coin_layers >= 1 and pyr_rule:
+        last_tr = max((tr for tr in live_tranches if tr.coin_idx == c_i), key=lambda tr: tr.entry_bar)
+        if pyr_rule == 1 and (t - last_tr.entry_bar) < pyr_gap_bars:
+            return {"ok": False, "reason": "pyramid_blocked", "starved": False}
+        if pyr_rule == 2 and today_open < last_tr.entry_price + pyr_progress_atr * last_tr.entry_atr:
+            return {"ok": False, "reason": "pyramid_blocked", "starved": False}
     if cash < floor_inr:
         return {"ok": False, "reason": "cash_starved", "starved": True}
     max_pos_cap = day_equity * MAX_POSITION_EQUITY_PCT
@@ -1319,6 +1343,9 @@ class BacktestEngine:
         wl_revalidate = bool(cfg["wl_revalidate"])
         free_adds = int(cfg["avg_down_free_adds"])
         whole_shares = bool(cfg["whole_shares"])
+        pyr_rule = int(cfg["pyramid_rule"])
+        pyr_gap = int(cfg["pyramid_gap_bars"])
+        pyr_prog = float(cfg["pyramid_progress_atr"])
 
         def _slip(c_i: int, part_rate: float) -> float:
             return slip_fraction(grid, c_i, part_rate)
@@ -1561,7 +1588,8 @@ class BacktestEngine:
                             continue
 
                     dec = evaluate_entry(grid, c_i, t, grid.open_mat[c_i, t], item["entry_atr"], cash, live_tranches,
-                                         day_equity, day_target, floor_inr, free_adds, max_pyramid, whole_shares)
+                                         day_equity, day_target, floor_inr, free_adds, max_pyramid, whole_shares,
+                                         pyr_rule, pyr_gap, pyr_prog)
                     if dec["ok"]:
                         binding_stats[dec["binding"]] += 1
                         cash -= dec["total_cost"]
@@ -2024,6 +2052,14 @@ def dynamic_parameter_neighbors(base_p: Dict[str, Any]) -> List[Dict[str, Any]]:
                     cand_c = copy.deepcopy(base_p)
                     cand_c[k_c] = choices[j_c]
                     neighbors.append(cand_c)
+    for k_c, choices in (("pyramid_gap_bars", PYRAMID_GAP_CHOICES), ("pyramid_progress_atr", PYRAMID_PROGRESS_CHOICES)):
+        if base_p.get("pyramid_rule", 0) and float(base_p.get(k_c, 0)) in choices:
+            i_c = choices.index(type(choices[0])(base_p[k_c]))
+            for j_c in (i_c - 1, i_c + 1):
+                if 0 <= j_c < len(choices):
+                    cand_c = copy.deepcopy(base_p)
+                    cand_c[k_c] = choices[j_c]
+                    neighbors.append(cand_c)
     for k_b in ("wl_revalidate",):
         if k_b in base_p:
             cand_b = copy.deepcopy(base_p)
@@ -2101,7 +2137,7 @@ def slice_market_grid(grid: MarketGrid, cutoff_bar: int) -> MarketGrid:
 
 
 def verify_behavioral_causality(grid: MarketGrid):
-    logging.info("Executing Complete 6-Archetype Prefix-Invariance Causality Audit (Comparing Row Data)...")
+    logging.info("Executing Complete 9-Archetype Prefix-Invariance Causality Audit (Comparing Row Data)...")
     n_bars = len(grid.dates)
     if n_bars < 500:
         return
@@ -2140,6 +2176,15 @@ def verify_behavioral_causality(grid: MarketGrid):
         {"entry_type": 5, "bp_vol_ma_len": 20, "bp_vol_mult": 2.0, "bp_ratio": 3.0, "use_market_macro_system": False,
          "adx_thresh": 25.0, "max_pyramid_layers": 1, "wl_mode": "WL_NONE",
          "max_holding_bars": 40, "sl_mult": 4.0, "exit_type": 1, "trail_pct": 20.0, "trail_atr_mult": 0.0, "bb_exit_len": 20},
+        {"entry_type": 6, "entry_ma_len": 50, "entry_ma_type": 1, "use_market_macro_system": False,
+         "adx_thresh": 25.0, "max_pyramid_layers": 2, "wl_mode": "WL_STRONGEST_MOMENTUM",
+         "max_holding_bars": 40, "sl_mult": 4.0, "exit_type": 1, "trail_pct": 20.0, "trail_atr_mult": 0.0, "bb_exit_len": 20},
+        {"entry_type": 0, "entry_ma_len": 50, "entry_ma_type": 1, "use_market_macro_system": False,
+         "adx_thresh": 25.0, "max_pyramid_layers": 3, "avg_down_free_adds": 1, "pyramid_rule": 1, "pyramid_gap_bars": 5,
+         "wl_mode": "WL_STRONGEST_MOMENTUM", "max_holding_bars": 60, "sl_mult": 4.0, "exit_type": 1, "trail_pct": 20.0, "trail_atr_mult": 0.0, "bb_exit_len": 20},
+        {"entry_type": 0, "entry_ma_len": 50, "entry_ma_type": 1, "use_market_macro_system": False,
+         "adx_thresh": 25.0, "max_pyramid_layers": 3, "avg_down_free_adds": 1, "pyramid_rule": 2, "pyramid_progress_atr": 1.0,
+         "wl_mode": "WL_NONE", "max_holding_bars": 60, "sl_mult": 4.0, "exit_type": 1, "trail_pct": 20.0, "trail_atr_mult": 0.0, "bb_exit_len": 20},
     ]
 
     for cfg in test_cfgs:
@@ -2173,7 +2218,7 @@ def verify_behavioral_causality(grid: MarketGrid):
                 abs(f_row["pnl"] - t_row["pnl"]) > 0.01):
                 raise RuntimeError(f"Row-level Causality Drift on trade {f_row['coin']} on {f_row['entry_date']}")
 
-    logging.info("Complete 5-Archetype Prefix-Invariance Audit Passed (Exact Row-Level PnL Verified).")
+    logging.info("Complete 9-Archetype Prefix-Invariance Audit Passed (Exact Row-Level PnL Verified).")
 
 
 # ==============================================================================
@@ -2181,10 +2226,10 @@ def verify_behavioral_causality(grid: MarketGrid):
 # ==============================================================================
 def sample_hyperparameters(trial: optuna.Trial) -> Dict[str, Any]:
     p = {}
-    p["entry_type"] = trial.suggest_categorical("entry_type", [0, 1, 2, 3, 4, 5])   # V13: 3 = pure breakout, 5 = buying-pressure surge
+    p["entry_type"] = trial.suggest_categorical("entry_type", [0, 1, 2, 3, 4, 5, 6])   # V13: 3 = pure breakout, 5 = buying-pressure surge; V13.2: 6 = MA reclaim
     p["adx_thresh"] = trial.suggest_categorical("adx_thresh", [0.0, 15.0, 20.0, 25.0, 30.0, 35.0, 40.0, 45.0])
 
-    if p["entry_type"] == 0:
+    if p["entry_type"] in (0, 6):
         p["entry_ma_len"] = trial.suggest_int("entry_ma_len", 10, 200, step=5)
         p["entry_ma_type"] = trial.suggest_categorical("entry_ma_type", [0, 1, 3])
     elif p["entry_type"] == 1:
@@ -2239,11 +2284,18 @@ def sample_hyperparameters(trial: optuna.Trial) -> Dict[str, Any]:
     # V13 engine rules the owner fixed (not searched): one watchlist entry per stock, no age cap, whole shares.
     p.update(V13_FIXED_RULES)
     p["wl_revalidate"] = trial.suggest_categorical("wl_revalidate", [True, False])
-    if p["entry_type"] in (0, 3, 4, 5):
+    if p["entry_type"] in (0, 3, 4, 5, 6):
         p["max_pyramid_layers"] = trial.suggest_categorical("max_pyramid_layers", [1, 2, 3])
     else:
         p["max_pyramid_layers"] = 1
     p["avg_down_free_adds"] = trial.suggest_categorical("avg_down_free_adds", [0, 1]) if p["max_pyramid_layers"] > 1 else 0
+    if p["entry_type"] == 0 and p["max_pyramid_layers"] > 1:
+        # V13.2: type 0 is a state signal, so it re-fires every day. The "any day" option is deliberately NOT searchable.
+        p["pyramid_rule"] = trial.suggest_categorical("pyramid_rule", [1, 2])
+        if p["pyramid_rule"] == 1:
+            p["pyramid_gap_bars"] = trial.suggest_categorical("pyramid_gap_bars", PYRAMID_GAP_CHOICES)
+        else:
+            p["pyramid_progress_atr"] = trial.suggest_categorical("pyramid_progress_atr", PYRAMID_PROGRESS_CHOICES)
 
     p["wl_mode"] = trial.suggest_categorical("wl_mode", [
         "WL_NONE", "WL_DEEPEST_DISCOUNT", "WL_STRONGEST_MOMENTUM"
@@ -2357,6 +2409,9 @@ def reconstitute_params(params: Dict[str, Any]) -> Dict[str, Any]:
     # V13: values the search does not record in trial.params (fixed rules, and options that are off by default)
     p.update(V13_FIXED_RULES)
     p.setdefault("avg_down_free_adds", 0)
+    p.setdefault("pyramid_rule", 0)
+    p.setdefault("pyramid_gap_bars", 0)
+    p.setdefault("pyramid_progress_atr", 0.0)
     if p.get("entry_type") == 3 and not p.get("breakout_use_volume", True):
         p["vol_mult"] = 0.0                      # pure breakout: volume confirmation switched off
     for legacy in ("use_global_tp", "tp_mult", "tp_size_pct", "tp_move_sl_be"):

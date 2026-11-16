@@ -1,0 +1,46 @@
+{
+ "schema": 2,
+ "config_hash": "V13.0-CRYPTO:5acdaa22",
+ "last_bar_date": "2026-11-03",
+ "cash": 0.0,
+ "fx_account": 100.9,
+ "size_w": 0.08,
+ "positions": [
+  {
+   "id": "P1",
+   "coin": "ONDO",
+   "entry_date": "2026-09-25",
+   "entry_price": 0.4266204162537165,
+   "units": 4348.790000000001,
+   "cost_usd": 1855.28,
+   "source": "manual",
+   "fx_lock": 100.9,
+   "entry_price_inr": 43.046
+  }
+ ],
+ "watchlist": [],
+ "plan": {
+  "made_after_bar": "2026-11-03",
+  "orders": [
+   {
+    "id": "2026-11-03:SELL:ONDO:P1",
+    "side": "SELL",
+    "coin": "ONDO",
+    "pos_id": "P1",
+    "units": 4348.790000000001,
+    "est_price": 0.3903,
+    "reason": "BREAKEVEN_SL",
+    "overdue_since": "2026-10-23",
+    "fx": 100.9
+   }
+  ],
+  "starved": false
+ },
+ "closed_trades": [],
+ "applied_manual_ids": [
+  "ONDO|2026-09-25|43.1|None|43.046"
+ ],
+ "applied_cash_ids": [],
+ "applied_remove_ids": [],
+ "next_id": 2
+}
