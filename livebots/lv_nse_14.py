@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
 """
-NSE LIVE BOT V14.0 -- runs AFTER the market close and tells you what to do at TOMORROW'S OPEN.
-
-Design rules & Parity Updates (V14.0):
-  * One rulebook. Entry sizing, exits, stops and trailing logic are the SAME functions the backtester uses
-    (make_tranche, tranche_open_exit_reason, tranche_eod_update, evaluate_entry, compile_signals_composable).
-  * Composable signal and multi-exit support matching `bt_nse_14.py`.
-  * The state file stores only FACTS: what was bought, when, at what price, how many, and your cash.
-  * Decide on the close of bar t, trade at the open of bar t+1.
+NSE LIVE PAPER-TRADING & EXECUTION BOT V14.0
+============================================
+Runs AFTER the market close and tells you what to do at TOMORROW'S OPEN.
+  * 100% Rulebook Parity with `bt_nse_14_2.py` (V14.0):
+    - 2D Vectorized Indicator Bank + Composable Signals (Solo or 1-2 Confirmation Filters, 0-2 OR Exits, PCT/ATR Trail).
+    - Exact Upstox Statutory Fee Accounting, Split-Ratio Corporate Action Guard, and Whole-Share Sizing.
+  * State stores ONLY facts (holdings, entry date/price/units/cost, cash, watchlist, last plan).
+  * Every position and watchlist item is re-evaluated from price history on EVERY run under the current winner config.
 """
 from __future__ import annotations
 
@@ -39,24 +39,45 @@ import yfinance as yf
 # ==============================================================================
 # 1. SETTINGS (edit this block)
 # ==============================================================================
-DRY_RUN: bool = True                       # True = compute + show + email, save NOTHING. Set False once verified.
+DRY_RUN: bool = False                       # True = compute + show + email, save NOTHING. Set False once verified.
 SEND_EMAIL_NOTIFICATION: bool = True
-ALLOW_NOT_PROMOTED_CONFIG: bool = True     # Use current candidate even if unpromoted
-LIVE_CONFIG_OVERRIDE: Optional[str] = None # Path to winner json; None = winner.json or winner_candidate.json
+ALLOW_NOT_PROMOTED_CONFIG: bool = True     # True = allow running winner_candidate.json if winner.json is absent
+LIVE_CONFIG_OVERRIDE: Optional[str] = None # Path to a specific winner json; None = winner.json, else winner_candidate.json
 MARKET_CLOSE_IST_HOUR: float = 16.0        # Exclude today's incomplete bar if run before this hour IST
 
-STARTING_CASH_INR: float = 0.0             # Free cash in broker account on first run. 0 = no BUY orders planned.
+STARTING_CASH_INR: float = 10000.0             # Free cash in broker account on first run. 0 = no BUY orders planned.
 COLAB_WORK_DIR: str = "/content/drive/MyDrive/nse_live_v14"
-WORK_DIR_OVERRIDE: Optional[str] = None    # Local testing override
+WORK_DIR_OVERRIDE: Optional[str] = None    # Local override (e.g. nifty50_backtest folder to share data_cache)
 
-# Holdings you own (from Upstox trade register). Added once each.
-MANUAL_HOLDINGS_ADD: List[Dict[str, Any]] = []
+# Holdings you own (from Upstox trade register). Added once each (by symbol|date|units|price).
+MANUAL_HOLDINGS_ADD: List[Dict[str, Any]] = [
+    {"coin": "ADANIGREEN", "units": 6, "entry_price": 1377.80, "entry_date": "2026-07-28"},
+    {"coin": "BPCL", "units": 20, "entry_price": 293.90, "entry_date": "2026-07-12"},
+    {"coin": "CGPOWER", "units": 14, "entry_price": 740.55, "entry_date": "2026-03-13"},
+    {"coin": "CHOLAFIN", "units": 4, "entry_price": 1765.60, "entry_date": "2026-09-16"},
+    {"coin": "GAIL", "units": 45, "entry_price": 175.78, "entry_date": "2026-06-18"},
+    {"coin": "HDBFS", "units": 12, "entry_price": 684.85, "entry_date": "2026-07-29"},
+    {"coin": "IOC", "units": 23, "entry_price": 131.38, "entry_date": "2026-05-18"},
+    {"coin": "ITCHOTELS", "units": 48, "entry_price": 164.93, "entry_date": "2026-08-17"},
+    {"coin": "JSWENERGY", "units": 15, "entry_price": 515.05, "entry_date": "2026-05-15"},
+    {"coin": "MOTILALOFS", "units": 9, "entry_price": 869.30, "entry_date": "2026-07-27"},
+    {"coin": "NATCOPHARM", "units": 8, "entry_price": 927.55, "entry_date": "2026-03-23"},
+    {"coin": "NATIONALUM", "units": 14, "entry_price": 374.00, "entry_date": "2026-09-03"},
+    {"coin": "NHPC", "units": 67, "entry_price": 78.50, "entry_date": "2026-05-12"},
+    {"coin": "NTPCGREEN", "units": 73, "entry_price": 110.15, "entry_date": "2026-05-15"},
+    {"coin": "PHOENIXLTD", "units": 4, "entry_price": 1908.70, "entry_date": "2026-08-11"},
+    {"coin": "TATAPOWER", "units": 20, "entry_price": 395.00, "entry_date": "2026-04-08"},
+]
+# Positions sold manually: {"coin": "X", "entry_date": "YYYY-MM-DD", "exit_date": "YYYY-MM-DD", "exit_price": 123.4}
 MANUAL_HOLDINGS_REMOVE: List[Dict[str, Any]] = []
+# Cash deposited (+) or withdrawn (-), applied once by id: {"id": "2026-11-03-sip", "amount": 5000.0}
 CASH_ADJUSTMENTS: List[Dict[str, Any]] = []
+# Order ids from the plan that you did NOT execute:
 ORDER_SKIPS: List[str] = []
+# First run only: rebuild standing watchlist over the last N bars. 0 = off.
 WATCHLIST_WARM_START_BARS: int = 60
 
-# Credentials
+# Credentials: environment / .env / Colab secrets
 try:
     from dotenv import load_dotenv
     load_dotenv(override=True)
@@ -76,7 +97,7 @@ LIVE_ENGINE_VERSION = "V14.0"
 IST = dt.timezone(dt.timedelta(hours=5, minutes=30))
 
 # ==============================================================================
-# 2. WORK FOLDER SETUP
+# 2. WORK FOLDER
 # ==============================================================================
 def _resolve_work_dir() -> Path:
     if WORK_DIR_OVERRIDE:
@@ -96,13 +117,14 @@ os.chdir(WORK_DIR)
 STATE_DIR: Path = WORK_DIR / "live_v14_state"
 
 # ==============================================================================
-# 3. ENGINE CORE & VECTORIZED INDICATORS (Parity with bt_nse_14.py)
+# 3. ENGINE CORE (V14.0 PARITY)
 # ==============================================================================
 UNIVERSE_NAME: str = "POOL_LM250_SC100"
 
 POOL_COMPONENTS: Dict[str, List[Tuple[str, str]]] = {
     "POOL_LM250_SC100": [("LARGE", "NIFTY100"), ("MID", "MIDCAP150"), ("SMALL", "SMALLCAP100")],
 }
+
 SINGLE_UNIVERSE_BRACKET: Dict[str, str] = {
     "NIFTY50": "LARGE", "NIFTY100": "LARGE", "MIDCAP150": "MID",
     "SMALLCAP100": "SMALL", "SMALLCAP250": "SMALL",
@@ -143,11 +165,12 @@ MACRO_INDEX_TICKER: str = "^NSEI"
 FORCE_MACRO_REGIME_FILTER: Optional[bool] = None
 START_YEAR: int = 2021
 MIN_HISTORY_DAYS: int = 300
-PARALLEL_DOWNLOAD_WORKERS: int = 1
+PARALLEL_DOWNLOAD_WORKERS: int = 4
 CACHE_MAX_AGE_HOURS: float = 72.0
 
 V13_FIXED_RULES: Dict[str, Any] = {
     "wl_dedupe": True,
+    "wl_max_age_bars": 0,
     "whole_shares": True,
 }
 
@@ -177,7 +200,6 @@ BRACKET_IMPACT_COEF_BPS: Dict[str, float] = {"LARGE": 120.0, "MID": 200.0, "SMAL
 TRANCHE_FLOOR_INR: float = 5_000.0
 MAX_POSITION_EQUITY_PCT: float = 0.25
 MAX_ADV_PARTICIPATION: float = 0.015
-DELIST_RECOVERY_FRACTION: float = 0.50
 
 SPIKE_MIN_MOVE: float = 0.40
 SPIKE_REVERT_WITHIN: int = 5
@@ -276,7 +298,543 @@ def np_ewm_mean(arr: np.ndarray, span: int) -> np.ndarray:
     return out
 
 
+@dataclass
+class FeeBreakdown:
+    brokerage: float = 0.0
+    stt: float = 0.0
+    exchange_charges: float = 0.0
+    stamp_duty: float = 0.0
+    sebi_charges: float = 0.0
+    gst: float = 0.0
+    dp_charges: float = 0.0
+    slippage_cost: float = 0.0
+
+
+def compute_buy_cost_audited(gross_inr: float, slip_cost: float) -> Tuple[float, FeeBreakdown]:
+    if gross_inr <= 0:
+        return 0.0, FeeBreakdown()
+    brokerage = FLAT_BROKERAGE_INR if BROKERAGE_MODE == "FLAT" else 0.0
+    stt = gross_inr * STT_RATE
+    exch = gross_inr * EXCHANGE_TXN_RATE
+    stamp = gross_inr * STAMP_DUTY_RATE
+    sebi = gross_inr * SEBI_CHARGE_RATE
+    gst = (brokerage + exch + sebi) * GST_RATE
+    breakdown = FeeBreakdown(
+        brokerage=brokerage, stt=stt, exchange_charges=exch,
+        stamp_duty=stamp, sebi_charges=sebi, gst=gst,
+        dp_charges=0.0, slippage_cost=slip_cost
+    )
+    return gross_inr + brokerage + stt + exch + stamp + sebi + gst, breakdown
+
+
+def compute_sell_proceeds_audited(gross_inr: float, slip_cost: float, apply_dp: bool = True) -> Tuple[float, FeeBreakdown]:
+    if gross_inr <= 0:
+        return 0.0, FeeBreakdown()
+    brokerage = FLAT_BROKERAGE_INR if BROKERAGE_MODE == "FLAT" else 0.0
+    stt = gross_inr * STT_RATE
+    exch = gross_inr * EXCHANGE_TXN_RATE
+    sebi = gross_inr * SEBI_CHARGE_RATE
+    gst = (brokerage + exch + sebi) * GST_RATE
+    dp = (DP_CHARGE_INR + DP_CHARGE_GST) if apply_dp else 0.0
+    breakdown = FeeBreakdown(
+        brokerage=brokerage, stt=stt, exchange_charges=exch,
+        stamp_duty=0.0, sebi_charges=sebi, gst=gst,
+        dp_charges=dp, slippage_cost=slip_cost
+    )
+    proceeds = max(0.0, gross_inr - brokerage - stt - exch - sebi - gst - dp)
+    return proceeds, breakdown
+
+
+def compute_max_affordable_tranche(cash: float, adv_30d: float, base_bps: float, impact_bps: float) -> float:
+    clean_adv = adv_30d if np.isfinite(adv_30d) else 1_000_000.0
+    adv = max(clean_adv, 1_000_000.0)
+    flat_buy_charge = (FLAT_BROKERAGE_INR * (1.0 + GST_RATE)) if BROKERAGE_MODE == "FLAT" else 0.0
+    usable_cash = max(0.0, cash - flat_buy_charge)
+    tranche_guess = usable_cash / (1.0 + EFFECTIVE_BUY_FEE_RATE + base_bps / 10000.0)
+    for _ in range(3):
+        part_rate = min(1.0, max(0.0, tranche_guess / adv))
+        slip_mult = (base_bps + impact_bps * np.sqrt(part_rate)) / 10000.0
+        tranche_guess = usable_cash / (1.0 + EFFECTIVE_BUY_FEE_RATE + slip_mult)
+    return float(np.nan_to_num(tranche_guess * (1.0 - 1e-6), nan=0.0))
+
+
+def breakeven_exit_price(total_cost: float, units: float, slip_mult: float) -> float:
+    denom = units * max(1e-6, (1.0 - slip_mult - EFFECTIVE_SELL_FEE_RATE))
+    return (total_cost + FLAT_SELL_FIXED_INR) / max(1e-9, denom)
+
+
+def _buy_fill_audited(tranche_inr: float, ref_open_price: float, slip_mult: float,
+                      whole_shares: bool = False) -> Tuple[float, float, float, FeeBreakdown]:
+    fill_px = ref_open_price * (1.0 + slip_mult)
+    units = tranche_inr / ref_open_price if ref_open_price > 0 else 0.0
+    if whole_shares:
+        units = float(np.floor(units))
+        if units < 1.0 and ref_open_price > 0 and ref_open_price <= 2.0 * tranche_inr:
+            units = 1.0
+    gross_at_slip = units * fill_px
+    slip_cost = units * (fill_px - ref_open_price)
+    total_cash_cost, fees = compute_buy_cost_audited(gross_at_slip, slip_cost)
+    return fill_px, units, total_cash_cost, fees
+
+
+def _buy_fill_units_audited(units: float, ref_open_price: float, slip_mult: float) -> Tuple[float, float, FeeBreakdown]:
+    fill_px = ref_open_price * (1.0 + slip_mult)
+    gross_at_slip = units * fill_px
+    slip_cost = units * (fill_px - ref_open_price)
+    total_cash_cost, fees = compute_buy_cost_audited(gross_at_slip, slip_cost)
+    return fill_px, total_cash_cost, fees
+
+
+def _sell_fill_audited(units: float, ref_price: float, slip_mult: float, apply_dp: bool = True) -> Tuple[float, float, FeeBreakdown]:
+    fill_px = ref_price * (1.0 - slip_mult)
+    gross = units * fill_px
+    slip_cost = units * (ref_price - fill_px)
+    net_proceeds, fees = compute_sell_proceeds_audited(gross, slip_cost, apply_dp=apply_dp)
+    return fill_px, net_proceeds, fees
+
+
+def load_universe_constituents(universe_name: str) -> List[str]:
+    path = Path(UNIVERSE_CONSTITUENT_FILES[universe_name])
+    if path.exists():
+        df = pd.read_csv(path)
+        sym_col = next((c for c in ("Symbol", "SYMBOL", "symbol") if c in df.columns), None)
+        if sym_col:
+            return sorted({str(s).strip().upper() for s in df[sym_col].tolist() if str(s).strip()})
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    urls = UNIVERSE_CONSTITUENT_URLS.get(universe_name, [])
+    headers = {"User-Agent": "Mozilla/5.0", "Accept": "*/*"}
+    df = None
+    for url in urls:
+        try:
+            req = urllib.request.Request(url, headers=headers)
+            with urllib.request.urlopen(req, timeout=15) as resp:
+                content = resp.read()
+                path.write_bytes(content)
+                df = pd.read_csv(io.BytesIO(content))
+                break
+        except Exception as e:
+            logging.warning(f"Mirror failed for {url}: {e}")
+
+    if df is None or df.empty:
+        raise RuntimeError(f"Could not load constituent list for {universe_name}.")
+    sym_col = next((c for c in ("Symbol", "SYMBOL", "symbol") if c in df.columns), None)
+    if not sym_col:
+        raise RuntimeError(f"No Symbol column found in constituent list for {universe_name}.")
+    return sorted({str(s).strip().upper() for s in df[sym_col].tolist() if str(s).strip()})
+
+
+def load_universe_with_brackets(universe_name: str) -> Tuple[List[str], Dict[str, str]]:
+    comps = POOL_COMPONENTS.get(universe_name)
+    if comps is None:
+        comps = [(SINGLE_UNIVERSE_BRACKET.get(universe_name, "LARGE"), universe_name)]
+    order = {"LARGE": 0, "MID": 1, "SMALL": 2}
+    bracket_map: Dict[str, str] = {}
+    for bracket, comp in comps:
+        for sym in load_universe_constituents(comp):
+            if sym not in bracket_map or order[bracket] < order[bracket_map[sym]]:
+                bracket_map[sym] = bracket
+    return sorted(bracket_map), bracket_map
+
+
+def _yf_ticker(symbol: str) -> str:
+    return symbol if symbol.startswith("^") else f"{symbol}.NS"
+
+
+def fetch_from_yfinance(symbol: str, start_year: int) -> Optional[pd.DataFrame]:
+    global DROPPED_TODAY_BARS
+    ticker = _yf_ticker(symbol)
+    start = f"{start_year}-01-01"
+    raw = None
+    for attempt in range(3):
+        try:
+            raw = yf.download(ticker, start=start, progress=False, auto_adjust=True, threads=False)
+            if raw is not None and not raw.empty:
+                break
+        except Exception as e:
+            if attempt == 2:
+                logging.warning(f"yfinance download failed for {ticker} after 3 attempts: {e}")
+            else:
+                time.sleep(1.0 * (attempt + 1))
+    if raw is None or raw.empty:
+        return None
+
+    if isinstance(raw.columns, pd.MultiIndex):
+        if "Close" in raw.columns.get_level_values(0):
+            raw.columns = raw.columns.get_level_values(0)
+        elif "Close" in raw.columns.get_level_values(1):
+            raw.columns = raw.columns.get_level_values(1)
+        else:
+            raw.columns = [c[0] if isinstance(c, tuple) else c for c in raw.columns]
+
+    raw = raw.reset_index()
+    raw.columns = [c[0] if isinstance(c, tuple) else str(c) for c in raw.columns]
+    raw.columns = [c.lower().strip() for c in raw.columns]
+    raw = raw.loc[:, ~raw.columns.duplicated()].copy()
+
+    required = {"date", "open", "high", "low", "close", "volume"}
+    if not required.issubset(raw.columns):
+        return None
+
+    raw["date"] = pd.to_datetime(raw["date"]).dt.tz_localize(None).dt.normalize()
+    raw = raw.drop_duplicates(subset=["date"]).sort_values("date").reset_index(drop=True)
+
+    now_ist = dt.datetime.now(IST)
+    today_ist = pd.Timestamp(now_ist.date())
+    if (now_ist.hour + now_ist.minute / 60.0) >= MARKET_CLOSE_IST_HOUR:
+        raw = raw[raw["date"] <= today_ist]
+    else:
+        if (raw["date"] >= today_ist).any():
+            DROPPED_TODAY_BARS += 1
+        raw = raw[raw["date"] < today_ist]
+
+    for col in ["open", "high", "low", "close", "volume"]:
+        raw[col] = pd.to_numeric(raw[col], errors="coerce")
+    raw = raw.dropna(subset=["open", "high", "low", "close"])
+    raw = raw[
+        (raw["open"] > 0) &
+        (raw["close"] > 0) &
+        (raw["high"] >= raw["low"]) &
+        (raw["high"] / np.maximum(1e-8, raw["low"]) < 50.0)
+    ]
+    if len(raw) < MIN_HISTORY_DAYS:
+        return None
+    raw["high"] = np.maximum(raw["high"], np.maximum(raw["open"], raw["close"]))
+    raw["low"] = np.minimum(raw["low"], np.minimum(raw["open"], raw["close"]))
+    raw["quote_volume"] = raw["close"] * raw["volume"]
+    return raw.set_index("date")
+
+
+def fetch_single_stock(symbol: str, start_year: int, refresh: bool) -> Tuple[str, Optional[pd.DataFrame], str]:
+    safe_name = symbol.replace("^", "IDX_")
+    cache_file = DATA_DIR / f"{safe_name}_1d_from{start_year}.parquet"
+    meta_file = DATA_DIR / f"{safe_name}_1d_from{start_year}.meta.json"
+
+    if not refresh and cache_file.exists() and meta_file.exists():
+        age_hours = (time.time() - os.path.getmtime(cache_file)) / 3600.0
+        if age_hours < CACHE_MAX_AGE_HOURS:
+            try:
+                with open(meta_file, "r", encoding="utf-8") as mf:
+                    meta = json.load(mf)
+                if meta.get("start_year") == start_year:
+                    df = pd.read_parquet(cache_file)
+                    if len(df) >= MIN_HISTORY_DAYS:
+                        return symbol, df, "cache"
+            except Exception:
+                pass
+
+    df = fetch_from_yfinance(symbol, start_year)
+    if df is not None and len(df) >= MIN_HISTORY_DAYS:
+        try:
+            df.to_parquet(cache_file)
+            with open(meta_file, "w", encoding="utf-8") as mf:
+                json.dump({"provider": "yfinance", "timestamp": time.time(), "bars": len(df), "start_year": start_year}, mf)
+        except Exception:
+            pass
+        return symbol, df, "yfinance"
+
+    if cache_file.exists():
+        try:
+            df_cached = pd.read_parquet(cache_file)
+            if len(df_cached) >= MIN_HISTORY_DAYS:
+                logging.warning(f"yfinance failed for {symbol}; falling back to cached parquet.")
+                return symbol, df_cached, "stale_cache"
+        except Exception:
+            pass
+
+    return symbol, None, "none"
+
+
+@dataclass
+class MarketGrid:
+    symbols: List[str]
+    dates: pd.DatetimeIndex
+    open_mat: np.ndarray
+    high_mat: np.ndarray
+    low_mat: np.ndarray
+    close_mat: np.ndarray
+    volume_mat: np.ndarray
+    atr14_mat: np.ndarray
+    dvol30_mat: np.ndarray
+    adx14_mat: np.ndarray
+    delist_mat: np.ndarray
+    alive_mat: np.ndarray
+    macro_close: np.ndarray
+    macro_open: np.ndarray
+    brackets: List[str]
+    liq_floor: np.ndarray
+    slip_bps: np.ndarray
+    impact_bps: np.ndarray
+    stale_symbols: List[str] = field(default_factory=list)
+
+
+class FastIndicators:
+    @staticmethod
+    def moving_average(arr: np.ndarray, length: int, kind: int) -> np.ndarray:
+        length = max(2, int(length))
+        if kind == 0:
+            return np_rolling_mean(arr, length)
+        elif kind == 1:
+            return np_ewm_mean(arr, length)
+        elif kind == 3:
+            valid_mask = ~np.isnan(arr)
+            out = np.full_like(arr, np.nan, dtype=np.float64)
+            if not np.any(valid_mask):
+                return out
+            first_valid = int(np.argmax(valid_mask))
+            n_valid = len(arr) - first_valid
+            if n_valid < length:
+                return out
+            w = np.arange(1, length + 1, dtype=float)
+            w_norm = w / w.sum()
+            conv = np.convolve(arr[first_valid:], w_norm[::-1], mode="full")[:n_valid]
+            conv[:length - 1] = np.nan
+            out[first_valid:] = conv
+            return out
+        raise ValueError(f"Unsupported moving-average kind {kind} (allowed: 0=SMA, 1=EMA, 3=WMA)")
+
+    @staticmethod
+    def atr_1d(h: np.ndarray, l: np.ndarray, c: np.ndarray, length: int = 14) -> np.ndarray:
+        started = np.cumsum(~np.isnan(c)) > 0
+        cp = shift_1d(c, fill_value=np.nan)
+        tr1 = h - l
+        tr2 = np.abs(h - cp)
+        tr3 = np.abs(l - cp)
+        tr = np.where(started, np.fmax(tr1, np.fmax(tr2, tr3)), np.nan)
+        alpha = 1.0 / max(2, length)
+        span = int(round((2.0 / alpha) - 1.0))
+        return np_ewm_mean(tr, span)
+
+    @staticmethod
+    def adx_1d(h: np.ndarray, l: np.ndarray, c: np.ndarray, length: int = 14) -> np.ndarray:
+        length = max(2, int(length))
+        span = int(round((2.0 * length) - 1.0))
+        up = h - shift_1d(h, fill_value=np.nan)
+        down = shift_1d(l, fill_value=np.nan) - l
+        valid = (~np.isnan(up)) & (~np.isnan(down))
+        p_dm = np.where(valid, np.where((up > down) & (up > 0.0), up, 0.0), np.nan)
+        m_dm = np.where(valid, np.where((down > up) & (down > 0.0), down, 0.0), np.nan)
+        atr_arr = FastIndicators.atr_1d(h, l, c, length)
+        p_di = 100.0 * np_ewm_mean(p_dm, span) / (atr_arr + 1e-9)
+        m_di = 100.0 * np_ewm_mean(m_dm, span) / (atr_arr + 1e-9)
+        dx = 100.0 * np.abs(p_di - m_di) / (p_di + m_di + 1e-9)
+        return np_ewm_mean(dx, span)
+
+
+_SPLIT_RATIOS = (0.10, 0.20, 0.25, 0.3333, 0.50, 0.6667, 0.75, 2.0, 3.0, 4.0, 5.0, 10.0)
+
+
+def _is_plausible_split_ratio(qe: float, vol_jump: bool) -> bool:
+    for r in _SPLIT_RATIOS:
+        if abs(qe - r) / r <= 0.08:
+            return True
+    return bool(vol_jump and (qe <= 0.55 or qe >= 1.90))
+
+
+def repair_price_artifacts(df: pd.DataFrame, sym: str, mkt_ret: Optional[pd.Series],
+                           allow_corporate: bool = True) -> Tuple[pd.DataFrame, List[Dict[str, Any]]]:
+    recs: List[Dict[str, Any]] = []
+    if df is None or len(df) < 10:
+        return df, recs
+    d = df.copy()
+    o = d["open"].values.astype(np.float64).copy()
+    h = d["high"].values.astype(np.float64).copy()
+    l = d["low"].values.astype(np.float64).copy()
+    c = d["close"].values.astype(np.float64).copy()
+    v = d["volume"].values.astype(np.float64).copy() if "volume" in d.columns else np.zeros(len(d))
+    n = len(c)
+    idx = d.index
+
+    def _date(i: int) -> str:
+        return str(pd.Timestamp(idx[i]).date())
+
+    with np.errstate(divide="ignore", invalid="ignore"):
+        q = np.r_[1.0, c[1:] / np.where(c[:-1] > 0, c[:-1], np.nan)]
+    cand = np.flatnonzero(np.abs(np.nan_to_num(q, nan=1.0) - 1.0) >= SPIKE_MIN_MOVE)
+    skip_until = -1
+    for i in cand:
+        if i <= skip_until or i < 1 or i >= n - 1 or not np.isfinite(c[i - 1]) or c[i - 1] <= 0:
+            continue
+        for j in range(i, min(n - 1, i + SPIKE_REVERT_WITHIN)):
+            if np.isfinite(c[j + 1]) and abs(c[j + 1] / c[i - 1] - 1.0) <= SPIKE_REVERT_TOL:
+                f = c[i - 1] / c[i]
+                sl = slice(i, j + 1)
+                o[sl] *= f; h[sl] *= f; l[sl] *= f; c[sl] *= f
+                recs.append({"symbol": sym, "date": _date(i), "type": "SPIKE_REVERT_FIXED", "ratio": float(q[i]),
+                             "detail": f"{j - i + 1} bad bar(s) rescaled x{f:.3f}"})
+                skip_until = j + 1
+                break
+
+    if allow_corporate:
+        forced_dates = set(MANUAL_CORPORATE_ACTIONS.get(sym, []))
+        veto_dates = set(KEEP_AS_REAL_MOVES.get(sym, []))
+        with np.errstate(divide="ignore", invalid="ignore"):
+            q_now = np.r_[1.0, c[1:] / np.where(c[:-1] > 0, c[:-1], np.nan)]
+        cand_e = set(np.flatnonzero(np.abs(np.nan_to_num(q_now, nan=1.0) - 1.0) >= LARGE_MOVE_LOG).tolist())
+        cand_e |= {i for i in range(1, n) if _date(i) in forced_dates} if forced_dates else set()
+        for e in sorted(cand_e):
+            if e < 1 or not (np.isfinite(c[e]) and np.isfinite(c[e - 1]) and c[e - 1] > 0 and c[e] > 0):
+                continue
+            qe = c[e] / c[e - 1]
+            mag = abs(qe - 1.0)
+            forced = _date(e) in forced_dates
+            if _date(e) in veto_dates:
+                recs.append({"symbol": sym, "date": _date(e), "type": "LARGE_MOVE_KEPT", "ratio": float(qe),
+                             "detail": "kept by KEEP_AS_REAL_MOVES override"})
+                continue
+            if mag < LARGE_MOVE_LOG and not forced:
+                continue
+            gap = o[e] / c[e - 1] if (np.isfinite(o[e]) and o[e] > 0) else qe
+            same_dir = (gap - 1.0) * (qe - 1.0) > 0.0
+            explained = bool(same_dir and abs(gap - 1.0) >= CA_GAP_EXPLAINS * mag)
+            prev_med_v = float(np.nanmedian(v[max(0, e - 10):e])) if e >= 2 else 0.0
+            vol_jump = bool(prev_med_v > 0 and v[e] >= 1.5 * prev_med_v)
+            split_like = _is_plausible_split_ratio(qe, vol_jump)
+            m_day = 0.0
+            if mkt_ret is not None:
+                try:
+                    m_day = abs(float(mkt_ret.get(pd.Timestamp(idx[e]).normalize(), 0.0)))
+                    m_day = m_day if np.isfinite(m_day) else 0.0
+                except Exception:
+                    m_day = 0.0
+            if forced or ((qe <= CA_DROP_Q or qe >= CA_JUMP_Q) and explained and split_like and m_day < CA_MARKET_DAY_MAX):
+                _pc, _nc, _no = float(c[e - 1]), float(c[e]), float(o[e])
+                o[:e] *= qe; h[:e] *= qe; l[:e] *= qe; c[:e] *= qe; v[:e] /= qe
+                recs.append({"symbol": sym, "date": _date(e), "type": "CORP_ACTION_REBASED", "ratio": float(qe),
+                             "detail": f"pre-event prices x{qe:.4f}, volume /{qe:.4f}; prev close {_pc:.2f}, open {_no:.2f}, close {_nc:.2f}" + (" (manual)" if forced else "")})
+            else:
+                recs.append({"symbol": sym, "date": _date(e), "type": "LARGE_MOVE_KEPT", "ratio": float(qe),
+                             "detail": f"{mag * 100:.0f}% move kept (index move {m_day * 100:.1f}%, gap-explained: {bool(explained)}, split-ratio-like: {bool(split_like)})"})
+
+    if any(r["type"] != "LARGE_MOVE_KEPT" for r in recs):
+        d["open"], d["high"], d["low"], d["close"] = o, h, l, c
+        if "volume" in d.columns:
+            d["volume"] = v
+        if "quote_volume" in d.columns:
+            d["quote_volume"] = c * v
+    return d, recs
+
+
+def build_market_universe(universe_name: str, start_year: int, refresh: bool,
+                          extra_symbols: Optional[Dict[str, str]] = None) -> MarketGrid:
+    symbols, bracket_map = load_universe_with_brackets(universe_name)
+    for _sym, _br in (extra_symbols or {}).items():
+        if _sym not in bracket_map:
+            bracket_map[_sym] = _br
+            symbols = sorted(set(symbols) | {_sym})
+
+    _, macro_df, _ = fetch_single_stock(MACRO_INDEX_TICKER, start_year, refresh)
+    if macro_df is None:
+        raise RuntimeError(f"Failed to load macro index data for {MACRO_INDEX_TICKER}.")
+
+    raw_universe: Dict[str, pd.DataFrame] = {}
+    with ThreadPoolExecutor(max_workers=PARALLEL_DOWNLOAD_WORKERS) as executor:
+        future_map = {executor.submit(fetch_single_stock, sym, start_year, refresh): sym for sym in symbols}
+        for future in as_completed(future_map):
+            sym, df, _ = future.result()
+            if df is not None and len(df) >= MIN_HISTORY_DAYS:
+                raw_universe[sym] = df
+
+    DATA_REPAIR_LOG.clear()
+    macro_df, r_m = repair_price_artifacts(macro_df, MACRO_INDEX_TICKER, None, allow_corporate=False)
+    mkt_ret = macro_df["close"].pct_change()
+    mkt_ret.index = pd.DatetimeIndex(mkt_ret.index).normalize()
+    all_recs: List[Dict[str, Any]] = list(r_m)
+    for sym_r in list(raw_universe.keys()):
+        raw_universe[sym_r], recs_r = repair_price_artifacts(raw_universe[sym_r], sym_r, mkt_ret)
+        all_recs.extend(recs_r)
+    DATA_REPAIR_LOG.extend(all_recs)
+    try:
+        pd.DataFrame(all_recs).to_csv(REPAIRS_CSV_FILE, index=False)
+    except Exception:
+        pass
+    n_fix = sum(1 for r in all_recs if r["type"] == "SPIKE_REVERT_FIXED")
+    n_ca = sum(1 for r in all_recs if r["type"] == "CORP_ACTION_REBASED")
+    n_kept = sum(1 for r in all_recs if r["type"] == "LARGE_MOVE_KEPT")
+    logging.info(
+        f"Data integrity: {n_fix} spike-and-revert bad prints fixed, {n_ca} unadjusted corporate actions rebased, "
+        f"{n_kept} large moves kept for manual review (see {REPAIRS_CSV_FILE.name})."
+    )
+
+    master_dates = pd.DatetimeIndex(sorted(macro_df.index.unique())).normalize()
+    macro_df = macro_df.reindex(master_dates).ffill().dropna(subset=["close"])
+
+    valid_symbols = sorted(raw_universe.keys())
+    n_syms, n_bars = len(valid_symbols), len(master_dates)
+
+    open_mat = np.full((n_syms, n_bars), np.nan, dtype=np.float64)
+    high_mat = np.full((n_syms, n_bars), np.nan, dtype=np.float64)
+    low_mat = np.full((n_syms, n_bars), np.nan, dtype=np.float64)
+    close_mat = np.full((n_syms, n_bars), np.nan, dtype=np.float64)
+    vol_mat = np.zeros((n_syms, n_bars), dtype=np.float64)
+    atr14_mat = np.zeros((n_syms, n_bars), dtype=np.float64)
+    adx14_mat = np.zeros((n_syms, n_bars), dtype=np.float64)
+    dvol30_mat = np.zeros((n_syms, n_bars), dtype=np.float64)
+    delist_mat = np.zeros((n_syms, n_bars), dtype=bool)
+    alive_mat = np.zeros((n_syms, n_bars), dtype=bool)
+
+    brackets = [bracket_map.get(s, "LARGE") for s in valid_symbols]
+    liq_floor = np.array([BRACKET_LIQUIDITY_FLOOR_INR[b] for b in brackets], dtype=np.float64)
+    slip_bps = np.array([BRACKET_SLIPPAGE_BPS[b] for b in brackets], dtype=np.float64)
+    impact_bps = np.array([BRACKET_IMPACT_COEF_BPS[b] for b in brackets], dtype=np.float64)
+
+    stale_symbols: List[str] = []
+    last_master_date = master_dates[-1]
+
+    for i, sym in enumerate(valid_symbols):
+        df = raw_universe[sym]
+        if df.index.max() < last_master_date:
+            stale_symbols.append(sym)
+        reindexed = df.reindex(master_dates)
+        raw_close = reindexed["close"].copy()
+
+        is_missing = raw_close.isna()
+        trailing_missing_count = int((is_missing[::-1].cumprod()[::-1]).astype(int).sum())
+        has_ever_traded = (~is_missing).cumsum() > 0
+        is_delisted_perm = (is_missing[::-1].cumprod()[::-1].astype(bool) & has_ever_traded & (trailing_missing_count >= 20)).values
+
+        reindexed["close"] = reindexed["close"].ffill()
+        reindexed["open"] = reindexed["open"].ffill()
+        reindexed["high"] = np.maximum(reindexed["high"].ffill(), np.maximum(reindexed["open"], reindexed["close"]))
+        reindexed["low"] = np.minimum(reindexed["low"].ffill(), np.minimum(reindexed["open"], reindexed["close"]))
+        reindexed["volume"] = reindexed["volume"].fillna(0.0)
+
+        h_arr = reindexed["high"].values
+        l_arr = reindexed["low"].values
+        c_arr = reindexed["close"].values
+
+        atr14 = FastIndicators.atr_1d(h_arr, l_arr, c_arr, 14)
+        adx14 = FastIndicators.adx_1d(h_arr, l_arr, c_arr, 14)
+
+        qv = reindexed["quote_volume"].values if "quote_volume" in reindexed else (c_arr * reindexed["volume"].values)
+        dvol30 = np_rolling_median(qv, ADV_WINDOW, ADV_MIN_PERIODS)
+        dvol30 = np.nan_to_num(dvol30, nan=0.0)
+
+        open_mat[i, :] = reindexed["open"].values
+        high_mat[i, :] = h_arr
+        low_mat[i, :] = l_arr
+        close_mat[i, :] = c_arr
+        vol_mat[i, :] = reindexed["volume"].values
+        atr14_mat[i, :] = np.nan_to_num(atr14, nan=0.0)
+        adx14_mat[i, :] = np.nan_to_num(adx14, nan=0.0)
+        dvol30_mat[i, :] = dvol30
+        delist_mat[i, :] = is_delisted_perm
+        alive_mat[i, :] = (~is_missing).values
+
+    return MarketGrid(
+        symbols=valid_symbols, dates=master_dates,
+        open_mat=open_mat, high_mat=high_mat, low_mat=low_mat, close_mat=close_mat, volume_mat=vol_mat,
+        atr14_mat=atr14_mat, dvol30_mat=dvol30_mat, adx14_mat=adx14_mat,
+        delist_mat=delist_mat, alive_mat=alive_mat,
+        macro_close=macro_df["close"].values, macro_open=macro_df["open"].values,
+        brackets=brackets, liq_floor=liq_floor,
+        slip_bps=slip_bps, impact_bps=impact_bps,
+        stale_symbols=stale_symbols,
+    )
+
+
 class VectorIndicatorBank:
+    """2D vectorized indicator bank matching `bt_nse_14_2.py`."""
     def __init__(self, grid: MarketGrid):
         self.grid = grid
         self._cache: Dict[Tuple[Any, ...], np.ndarray] = {}
@@ -432,59 +990,6 @@ class VectorIndicatorBank:
         vma = np.full_like(v, np.nan)
         vma[:, w - 1:] = (csum[:, w:] - csum[:, :-w]) / float(w)
         return (~np.isnan(vma)) & (v > 0) & (v > vol_mult * vma) & (buy >= ratio * sell)
-
-
-class FastIndicators:
-    @staticmethod
-    def moving_average(arr: np.ndarray, length: int, kind: int) -> np.ndarray:
-        length = max(2, int(length))
-        if kind == 0:
-            return np_rolling_mean(arr, length)
-        elif kind == 1:
-            return np_ewm_mean(arr, length)
-        elif kind == 3:
-            valid_mask = ~np.isnan(arr)
-            out = np.full_like(arr, np.nan, dtype=np.float64)
-            if not np.any(valid_mask):
-                return out
-            first_valid = int(np.argmax(valid_mask))
-            n_valid = len(arr) - first_valid
-            if n_valid < length:
-                return out
-            w = np.arange(1, length + 1, dtype=float)
-            w_norm = w / w.sum()
-            conv = np.convolve(arr[first_valid:], w_norm[::-1], mode="full")[:n_valid]
-            conv[:length - 1] = np.nan
-            out[first_valid:] = conv
-            return out
-        raise ValueError(f"Unsupported moving-average kind {kind} (allowed: 0=SMA, 1=EMA, 3=WMA)")
-
-    @staticmethod
-    def atr_1d(h: np.ndarray, l: np.ndarray, c: np.ndarray, length: int = 14) -> np.ndarray:
-        started = np.cumsum(~np.isnan(c)) > 0
-        cp = shift_1d(c, fill_value=np.nan)
-        tr1 = h - l
-        tr2 = np.abs(h - cp)
-        tr3 = np.abs(l - cp)
-        tr = np.where(started, np.fmax(tr1, np.fmax(tr2, tr3)), np.nan)
-        alpha = 1.0 / max(2, length)
-        span = int(round((2.0 / alpha) - 1.0))
-        return np_ewm_mean(tr, span)
-
-    @staticmethod
-    def adx_1d(h: np.ndarray, l: np.ndarray, c: np.ndarray, length: int = 14) -> np.ndarray:
-        length = max(2, int(length))
-        span = int(round((2.0 * length) - 1.0))
-        up = h - shift_1d(h, fill_value=np.nan)
-        down = shift_1d(l, fill_value=np.nan) - l
-        valid = (~np.isnan(up)) & (~np.isnan(down))
-        p_dm = np.where(valid, np.where((up > down) & (up > 0.0), up, 0.0), np.nan)
-        m_dm = np.where(valid, np.where((down > up) & (down > 0.0), down, 0.0), np.nan)
-        atr_arr = FastIndicators.atr_1d(h, l, c, length)
-        p_di = 100.0 * np_ewm_mean(p_dm, span) / (atr_arr + 1e-9)
-        m_di = 100.0 * np_ewm_mean(m_dm, span) / (atr_arr + 1e-9)
-        dx = 100.0 * np.abs(p_di - m_di) / (p_di + m_di + 1e-9)
-        return np_ewm_mean(dx, span)
 
 
 def _eval_entry_state_filter(bank: VectorIndicatorBank, grid: MarketGrid, fname: str, prefix: str, p: Dict[str, Any]) -> np.ndarray:
@@ -670,6 +1175,10 @@ class Tranche:
     pending_reason: str = ""
 
 
+def slip_fraction(grid: MarketGrid, c_i: int, part_rate: float) -> float:
+    return (grid.slip_bps[c_i] + grid.impact_bps[c_i] * np.sqrt(part_rate)) / 10000.0
+
+
 def _resolve_trail_mode(p: Dict[str, Any]) -> Tuple[str, float, float]:
     if "trail_mode" in p:
         tm = str(p["trail_mode"])
@@ -735,7 +1244,7 @@ def tranche_eod_update(tr: Tranche, t: int, grid: MarketGrid, trail_mode: str, b
         if pct_floor > tr.current_sl:
             tr.current_sl = pct_floor
             tr.stop_reason = "TRAIL_PCT_STOP"
-    elif trail_mode == "ATR" and trail_mult > 0.0 and t >= 1:
+    elif trail_mode == "ATR" and trail_mult > 0.0:
         atr_now = grid.atr14_mat[c_i, t] if grid.atr14_mat[c_i, t] > 0 else tr.entry_atr
         atr_floor = tr.highest_high - (trail_mult * atr_now)
         if atr_floor > tr.current_sl:
@@ -743,14 +1252,85 @@ def tranche_eod_update(tr: Tranche, t: int, grid: MarketGrid, trail_mode: str, b
             tr.stop_reason = "TRAIL_ATR_STOP"
 
 
+def evaluate_entry(grid: MarketGrid, c_i: int, t: int, today_open: float, entry_atr: float, cash: float,
+                   live_tranches: List[Tranche], day_equity: float, day_target: float, floor_inr: float,
+                   free_adds: int, max_pyramid: int, whole_shares: bool,
+                   pyr_rule: int = 0, pyr_gap_bars: int = 0, pyr_progress_atr: float = 0.0) -> Dict[str, Any]:
+    coin_layers = sum(1 for tr in live_tranches if tr.coin_idx == c_i)
+    if coin_layers >= max_pyramid:
+        return {"ok": False, "reason": "pyramid_blocked", "starved": False}
+    if coin_layers > free_adds:
+        highest_prior_entry = max(tr.entry_price for tr in live_tranches if tr.coin_idx == c_i)
+        if today_open <= highest_prior_entry * 1.005:
+            return {"ok": False, "reason": "anti_averaging_down", "starved": False}
+    if coin_layers >= 1 and pyr_rule:
+        last_tr = max((tr for tr in live_tranches if tr.coin_idx == c_i), key=lambda tr: tr.entry_bar)
+        if pyr_rule == 1 and (t - last_tr.entry_bar) < pyr_gap_bars:
+            return {"ok": False, "reason": "pyramid_blocked", "starved": False}
+        if pyr_rule == 2 and today_open < last_tr.entry_price + pyr_progress_atr * last_tr.entry_atr:
+            return {"ok": False, "reason": "pyramid_blocked", "starved": False}
+    if cash < floor_inr:
+        return {"ok": False, "reason": "cash_starved", "starved": True}
+
+    max_pos_cap = day_equity * MAX_POSITION_EQUITY_PCT
+    dynamic_slot_target = min(max_pos_cap, day_target)
+    current_scrip_exposure = sum(tr.units * today_open for tr in live_tranches if tr.coin_idx == c_i)
+    remaining_scrip_capacity = max(0.0, max_pos_cap - current_scrip_exposure)
+    if remaining_scrip_capacity < floor_inr:
+        return {"ok": False, "reason": "scrip_risk_cap", "starved": False}
+
+    adv_30d = max(grid.dvol30_mat[c_i, t - 1], 1_000_000.0)
+    liquidity_cap_inr = adv_30d * MAX_ADV_PARTICIPATION
+    target_inr = min(dynamic_slot_target, liquidity_cap_inr, remaining_scrip_capacity)
+    max_affordable = compute_max_affordable_tranche(cash, adv_30d, float(grid.slip_bps[c_i]), float(grid.impact_bps[c_i]))
+    tranche_inr = min(max_affordable, max(floor_inr, target_inr))
+    runt = tranche_inr < SIZE_RUNT_FRACTION * max(floor_inr, target_inr)
+    slip_mult = slip_fraction(grid, c_i, min(1.0, max(0.0, tranche_inr / adv_30d)))
+    fill_px, units, total_cost, fee_buy = _buy_fill_audited(tranche_inr, today_open, slip_mult, whole_shares)
+
+    if whole_shares and units == 1.0 and total_cost > min(cash, remaining_scrip_capacity):
+        return {"ok": False, "reason": "unaffordable", "starved": False}
+
+    if cash >= total_cost and tranche_inr >= floor_inr and units > 0 and not runt:
+        if max_affordable < target_inr:
+            binding = "cash_constrained"
+        elif target_inr == liquidity_cap_inr:
+            binding = "liquidity_cap"
+        elif target_inr < floor_inr:
+            binding = "tranche_floor"
+        else:
+            binding = "equity_slot"
+        return {"ok": True, "binding": binding, "tranche_inr": tranche_inr, "fill_px": fill_px, "units": units,
+                "total_cost": total_cost, "fee_buy": fee_buy, "slip_mult": slip_mult}
+    if units <= 0:
+        return {"ok": False, "reason": "unaffordable", "starved": False}
+    return {"ok": False, "reason": "cash_starved", "starved": True}
+
+
 def reconstitute_params(params: Dict[str, Any]) -> Dict[str, Any]:
     p = copy.deepcopy(params)
+    if p.get("entry_filter_1", "NONE") == "NONE":
+        p["entry_filter_1"] = "NONE"
+        p["entry_filter_2"] = "NONE"
+    elif p.get("entry_filter_2") == p.get("entry_filter_1"):
+        p["entry_filter_2"] = "NONE"
+
+    if p.get("exit_primary", "NONE") == "NONE":
+        p["exit_primary"] = "NONE"
+        p["exit_secondary"] = "NONE"
+    elif p.get("exit_secondary") == p.get("exit_primary"):
+        p["exit_secondary"] = "NONE"
+
     for k in list(p.keys()):
         if isinstance(p[k], float):
             p[k] = round(p[k], 2)
 
     if p.get("entry_type") == 2 and "xover_gap" in p:
         p["xover_long_len"] = min(200, p["xover_short_len"] + p["xover_gap"])
+    if "ex1_xover_s_len" in p and "ex1_xover_gap" in p:
+        p["ex1_xover_l_len"] = min(150, p["ex1_xover_s_len"] + p["ex1_xover_gap"])
+    if "ex2_xover_s_len" in p and "ex2_xover_gap" in p:
+        p["ex2_xover_l_len"] = min(150, p["ex2_xover_s_len"] + p["ex2_xover_gap"])
 
     p.setdefault("entry_filter_1", "NONE")
     p.setdefault("entry_filter_2", "NONE")
@@ -773,16 +1353,19 @@ def reconstitute_params(params: Dict[str, Any]) -> Dict[str, Any]:
     p.setdefault("pyramid_progress_atr", 0.0)
     if p.get("entry_type") == 3 and not p.get("breakout_use_volume", True):
         p["vol_mult"] = 0.0
+    for legacy in ("use_global_tp", "tp_mult", "tp_size_pct", "tp_move_sl_be"):
+        p.pop(legacy, None)
     return p
-
 
 # ==============================================================================
 # 4. CONFIG
 # ==============================================================================
 @dataclass
 class Rules:
+    """Everything the engine rules read from the winner config, resolved once."""
     p: Dict[str, Any]
     xt: int
+    trail_mode: str
     trail_mult: float
     trail_pct_mult: float
     be_trigger_mult: float
@@ -804,22 +1387,47 @@ class Rules:
     pyr_rule: int
     pyr_gap: int
     pyr_prog: float
+    has_signal_exit: bool
+    exit_label: str
 
     @classmethod
     def from_params(cls, params: Dict[str, Any]) -> "Rules":
         p = reconstitute_params(dict(params))
         c = {**ENGINE_DEFAULTS, **p}
+        t_mode, t_pct_mult, t_atr_mult = _resolve_trail_mode(p)
+        xt = int(p.get("exit_type", 0))
+        if "exit_primary" in p or "exit_secondary" in p:
+            x1, x2 = str(p.get("exit_primary", "NONE")), str(p.get("exit_secondary", "NONE"))
+            active_exits = [x for x in (x1, x2) if x != "NONE"]
+            has_sig_exit = len(active_exits) > 0
+            exit_lbl = "SIGNAL_EXIT_" + "+".join(active_exits) if active_exits else "SIGNAL_EXIT"
+        else:
+            has_sig_exit = xt in (3, 4, 5, 6, 7)
+            exit_lbl = f"SIGNAL_EXIT_TYPE_{xt}"
+
         return cls(
-            p=p, xt=int(p.get("exit_type", 0)), trail_mult=float(p.get("trail_atr_mult", 0.0)),
-            trail_pct_mult=1.0 - float(p.get("trail_pct", 10.0)) / 100.0, be_trigger_mult=float(p.get("be_trigger_atr", 0.0)),
-            macro_active_exit=bool(p.get("macro_active_exit", False)), max_holding_bars=int(p.get("max_holding_bars", 20)),
-            sl_mult=float(p.get("sl_mult", 3.0)), floor_inr=float(p.get("tranche_floor", TRANCHE_FLOOR_INR)),
-            max_pyramid=int(p.get("max_pyramid_layers", 1)), free_adds=int(c["avg_down_free_adds"]),
-            whole_shares=bool(c["whole_shares"]), wl_mode=str(p.get("wl_mode", "WL_NONE")), wl_dedupe=bool(c["wl_dedupe"]),
-            wl_revalidate=bool(c["wl_revalidate"]), adx_t=float(p.get("adx_thresh", 0.0)),
-            size_w0=float(c["size_w0"]), size_w_max=float(c["size_w_max"]), size_reserve=float(c["size_reserve"]),
-            size_ramp=float(c["size_ramp"]), pyr_rule=int(c["pyramid_rule"]), pyr_gap=int(c["pyramid_gap_bars"]),
-            pyr_prog=float(c["pyramid_progress_atr"])
+            p=p, xt=xt, trail_mode=t_mode, trail_mult=t_atr_mult, trail_pct_mult=t_pct_mult,
+            be_trigger_mult=float(p.get("be_trigger_atr", 0.0)),
+            macro_active_exit=bool(p.get("macro_active_exit", False)),
+            max_holding_bars=int(p.get("max_holding_bars", 20)),
+            sl_mult=float(p.get("sl_mult", 3.0)),
+            floor_inr=float(p.get("tranche_floor", TRANCHE_FLOOR_INR)),
+            max_pyramid=int(p.get("max_pyramid_layers", 1)),
+            free_adds=int(c["avg_down_free_adds"]),
+            whole_shares=bool(c["whole_shares"]),
+            wl_mode=str(p.get("wl_mode", "WL_NONE")),
+            wl_dedupe=bool(c["wl_dedupe"]),
+            wl_revalidate=bool(c["wl_revalidate"]),
+            adx_t=float(p.get("adx_thresh", 0.0)),
+            size_w0=float(c["size_w0"]),
+            size_w_max=float(c["size_w_max"]),
+            size_reserve=float(c["size_reserve"]),
+            size_ramp=float(c["size_ramp"]),
+            pyr_rule=int(c["pyramid_rule"]),
+            pyr_gap=int(c["pyramid_gap_bars"]),
+            pyr_prog=float(c["pyramid_progress_atr"]),
+            has_signal_exit=has_sig_exit,
+            exit_label=exit_lbl,
         )
 
 
@@ -831,38 +1439,49 @@ def load_config() -> Tuple[Rules, Dict[str, Any]]:
     elif (WORK_DIR / "winner_candidate.json").exists():
         path = WORK_DIR / "winner_candidate.json"
     else:
-        sys.exit(f"No winner config found. Copy winner.json or winner_candidate.json into {WORK_DIR}")
+        sys.exit(f"No winner config found. Copy winner.json or winner_candidate.json from the backtester's output folder into {WORK_DIR}")
     with open(path, "r", encoding="utf-8") as f:
         doc = json.load(f)
     status = str(doc.get("status", "UNKNOWN"))
-    if doc.get("version") != LIVE_ENGINE_VERSION:
-        sys.exit(f"Config {path.name} was produced by {doc.get('version')}, this live bot is {LIVE_ENGINE_VERSION}.")
+    doc_ver = str(doc.get("version", ""))
+    if not (doc_ver == LIVE_ENGINE_VERSION or doc_ver.startswith("V14") or doc_ver.startswith("V13")):
+        sys.exit(f"Config {path.name} was produced by {doc_ver}, this live bot is {LIVE_ENGINE_VERSION}. Re-run the backtester.")
     if "NOT PROMOTED" in status.upper() and not ALLOW_NOT_PROMOTED_CONFIG:
         sys.exit(f"Config {path.name} is {status} and ALLOW_NOT_PROMOTED_CONFIG is False.")
     content = hashlib.sha256(json.dumps(doc["best_params"], sort_keys=True, default=str).encode()).hexdigest()[:8]
-    meta = {"path": str(path), "status": status, "param_hash": content, "file_hash": doc.get("param_hash"),
-            "updated_at": doc.get("updated_at"), "version": doc.get("version")}
+    meta = {
+        "path": str(path), "status": status, "param_hash": content,
+        "file_hash": doc.get("param_hash"), "updated_at": doc.get("updated_at"), "version": doc_ver
+    }
     return Rules.from_params(doc["best_params"]), meta
 
 
 # ==============================================================================
-# 5. STATE & HELPERS
+# 5. STATE (facts only) AND SMALL HELPERS
 # ==============================================================================
+def inr(x: float) -> str:
+    return f"₹{x:,.2f}" if np.isfinite(x) else "-"
+
+
 def new_state(last_bar_date: str, rules: Rules, cfg_hash: str) -> Dict[str, Any]:
-    return {"schema": 2, "config_hash": cfg_hash, "last_bar_date": last_bar_date, "cash": float(STARTING_CASH_INR),
-            "size_w": rules.size_w0, "positions": [], "watchlist": [], "plan": None, "closed_trades": [],
-            "applied_manual_ids": [], "applied_cash_ids": [], "applied_remove_ids": [], "next_id": 1}
+    return {
+        "schema": 2, "config_hash": cfg_hash, "last_bar_date": last_bar_date,
+        "cash": float(STARTING_CASH_INR), "size_w": rules.size_w0,
+        "positions": [], "watchlist": [], "plan": None, "closed_trades": [],
+        "applied_manual_ids": [], "applied_cash_ids": [], "applied_remove_ids": [], "next_id": 1
+    }
 
 
 def load_state() -> Optional[Dict[str, Any]]:
-    f = STATE_DIR / "live_state_v14.json"
-    if not f.exists():
-        return None
-    with open(f, "r", encoding="utf-8") as fp:
-        st = json.load(fp)
-    if st.get("schema") != 2:
-        sys.exit("Unknown state schema; refusing to continue.")
-    return st
+    for fname in ("live_state_v14.json", "live_state_v13.json"):
+        f = STATE_DIR / fname
+        if f.exists():
+            with open(f, "r", encoding="utf-8") as fp:
+                st = json.load(fp)
+            if st.get("schema") != 2:
+                sys.exit("Unknown state schema; refusing to continue.")
+            return st
+    return None
 
 
 def save_state(st: Dict[str, Any]) -> None:
@@ -890,18 +1509,21 @@ def entry_atr_of(grid: MarketGrid, pos: Dict[str, Any], c_i: int, e_bar: int) ->
 
 def _proxy_tranche(grid: MarketGrid, rules: Rules, pos: Dict[str, Any], c_i: int) -> Tranche:
     e = min(bar_index(grid, pos["entry_date"]), len(grid.dates) - 1)
-    return make_tranche(grid, c_i, e, float(pos["entry_price"]), float(pos["units"]), float(pos["cost_inr"]),
-                      0.0, entry_atr_of(grid, pos, c_i, e), rules.sl_mult)
+    return make_tranche(
+        grid, c_i, e, float(pos["entry_price"]), float(pos["units"]), float(pos["cost_inr"]),
+        0.0, entry_atr_of(grid, pos, c_i, e), rules.sl_mult
+    )
 
 
 # ==============================================================================
-# 6. REPLAY
+# 6. REPLAY: rebuild every position's rule state from price history under CURRENT config
 # ==============================================================================
 def macro_bear(rules: Rules, macro_ok: np.ndarray, t: int) -> bool:
     return bool(rules.macro_active_exit and t >= 3 and (not macro_ok[t - 1]) and (not macro_ok[t - 2]) and (not macro_ok[t - 3]))
 
 
 def replay_position(grid: MarketGrid, rules: Rules, sig, pos: Dict[str, Any], n: int) -> Dict[str, Any]:
+    """Replays bars e_bar .. n-1 exactly as the V14 backtest engine does, then checks bar n (tomorrow's open)."""
     _, _, exit_mat, macro_ok, _, _ = sig
     idx = sym_index(grid)
     out: Dict[str, Any] = {"pos": pos, "tranche": None, "verdict": "", "overdue_since": None, "note": ""}
@@ -919,37 +1541,45 @@ def replay_position(grid: MarketGrid, rules: Rules, sig, pos: Dict[str, Any], n:
     bar_high = float(grid.high_mat[c_i, e_bar])
     data_open = float(grid.open_mat[c_i, e_bar])
     if data_open > 0 and bar_low > 0 and (entry_px < bar_low * 0.95 or entry_px > bar_high * 1.05):
+        out["note"] = f"Entry {entry_px:.2f} outside day range [{bar_low:.2f}..{bar_high:.2f}]: rebased to open {data_open:.2f}"
         entry_px = data_open
 
     units = float(pos["units"])
-    tr = make_tranche(grid, c_i, e_bar, entry_px, units, float(pos["cost_inr"]), 0.0,
-                      entry_atr_of(grid, pos, c_i, e_bar), rules.sl_mult)
-    tranche_eod_update(tr, e_bar, grid, rules.xt, rules.be_trigger_mult, rules.trail_pct_mult, rules.trail_mult)
+    adv = max(float(grid.dvol30_mat[c_i, max(e_bar - 1, 0)]), 1_000_000.0)
+    slip = slip_fraction(grid, c_i, min(1.0, float(pos["cost_inr"]) / adv))
+    tr = make_tranche(
+        grid, c_i, e_bar, entry_px, units, float(pos["cost_inr"]), slip,
+        entry_atr_of(grid, pos, c_i, e_bar), rules.sl_mult
+    )
+    # Run EOD stop/trailing ratchet on entry bar e_bar itself (matches V14 Bug #11 fix)
+    tranche_eod_update(tr, e_bar, grid, rules.trail_mode, rules.be_trigger_mult, rules.trail_pct_mult, rules.trail_mult)
     out["tranche"] = tr
-
-    has_signal_exit = bool(np.any(exit_mat))
-    if "exit_primary" in rules.p or "exit_secondary" in rules.p:
-        x1, x2 = rules.p.get("exit_primary", "NONE"), rules.p.get("exit_secondary", "NONE")
-        active_exits = [x for x in (x1, x2) if x != "NONE"]
-        exit_label = "SIGNAL_EXIT_" + "+".join(active_exits) if active_exits else "SIGNAL_EXIT"
-    else:
-        exit_label = f"SIGNAL_EXIT_TYPE_{rules.xt}"
 
     for t in range(e_bar + 1, n):
         if not grid.alive_mat[c_i, t]:
             continue
-        reason = tranche_open_exit_reason(tr, t, grid, exit_mat, macro_bear(rules, macro_ok, t), has_signal_exit, rules.max_holding_bars, exit_label)
-        if reason:
-            out["verdict"], out["overdue_since"] = reason, str(grid.dates[t].date())
-            return out
-        tranche_eod_update(tr, t, grid, rules.xt, rules.be_trigger_mult, rules.trail_pct_mult, rules.trail_mult)
+        reason = tranche_open_exit_reason(
+            tr, t, grid, exit_mat, macro_bear(rules, macro_ok, t),
+            rules.has_signal_exit, rules.max_holding_bars, rules.exit_label
+        )
+        if reason and out["overdue_since"] is None:
+            out["overdue_since"] = str(grid.dates[t].date())
+        # If the price recovered back above the stop on a later day while still held, clear pending_stop
+        tr.pending_stop = False
+        tr.pending_reason = ""
+        tranche_eod_update(tr, t, grid, rules.trail_mode, rules.be_trigger_mult, rules.trail_pct_mult, rules.trail_mult)
 
-    out["verdict"] = tranche_open_exit_reason(tr, n, grid, exit_mat, macro_bear(rules, macro_ok, n), has_signal_exit, rules.max_holding_bars, exit_label)
+    out["verdict"] = tranche_open_exit_reason(
+        tr, n, grid, exit_mat, macro_bear(rules, macro_ok, n),
+        rules.has_signal_exit, rules.max_holding_bars, rules.exit_label
+    )
+    if not out["verdict"]:
+        out["overdue_since"] = None
     return out
 
 
 # ==============================================================================
-# 7. PLAN EXECUTION
+# 7. APPLY LAST PLAN AT THE OPEN OF BAR t, THEN WATCHLIST AND SIZE UPDATES
 # ==============================================================================
 def apply_plan(st: Dict[str, Any], grid: MarketGrid, rules: Rules, t: int) -> List[str]:
     notes: List[str] = []
@@ -988,7 +1618,7 @@ def apply_plan(st: Dict[str, Any], grid: MarketGrid, rules: Rules, t: int) -> Li
             continue
         c_i = idx[o["coin"]]
         if not grid.alive_mat[c_i, t]:
-            notes.append(f"BUY {o['coin']} not filled: no trading in the stock at the open")
+            notes.append(f"BUY {o['coin']} not filled: no trading in the stock at the open (halted or delisted)")
             continue
         planned_units = float(o["units"])
         raw_px = float(grid.open_mat[c_i, t])
@@ -1006,6 +1636,7 @@ def apply_plan(st: Dict[str, Any], grid: MarketGrid, rules: Rules, t: int) -> Li
         notes.append(f"BOUGHT {o['coin']} x{planned_units:g} at open {fill_px:.2f} (cost {inr(total_cost)})")
 
     st["cash"] = cash
+
     for it in st["watchlist"]:
         if it["signal_date"] == str(grid.dates[t].date()) and it["coin"] in idx:
             o_t = float(grid.open_mat[idx[it["coin"]], t])
@@ -1014,30 +1645,36 @@ def apply_plan(st: Dict[str, Any], grid: MarketGrid, rules: Rules, t: int) -> Li
 
 
 def watchlist_lifecycle(st: Dict[str, Any], grid: MarketGrid, rules: Rules, sig, t: int) -> None:
+    """End-of-bar-t life of items waiting on the watchlist (matches V14 Bug #12 fix)."""
     if rules.wl_mode == "WL_NONE":
         st["watchlist"] = []
         return
     idx = sym_index(grid)
     exit_mat = sig[2]
     keep = []
-    has_signal_exit = bool(np.any(exit_mat))
     for it in st["watchlist"]:
         if it["coin"] not in idx:
             continue
         c_i = idx[it["coin"]]
-        stopped = grid.close_mat[c_i, t] <= it["shadow_stop"]
-        exited = has_signal_exit and bool(exit_mat[c_i, t])
-        if stopped or exited:
+        sig_bar = bar_index(grid, it["signal_date"]) if it.get("signal_date") else t
+        stopped = float(grid.close_mat[c_i, t]) <= float(it["shadow_stop"])
+        exited = rules.has_signal_exit and bool(exit_mat[c_i, t])
+        timed_out = (t - sig_bar) >= rules.max_holding_bars
+        if stopped or exited or timed_out:
             continue
         if grid.high_mat[c_i, t] > it["highest_high"]:
             it["highest_high"] = float(grid.high_mat[c_i, t])
-        if rules.trail_mult > 0.0:
-            it["shadow_stop"] = max(it["shadow_stop"], it["highest_high"] - rules.trail_mult * float(grid.atr14_mat[c_i, t]))
+        if rules.trail_mode == "PCT" and rules.trail_pct_mult > 0.0:
+            it["shadow_stop"] = max(it["shadow_stop"], it["highest_high"] * rules.trail_pct_mult)
+        elif rules.trail_mode == "ATR" and rules.trail_mult > 0.0:
+            atr_now = float(grid.atr14_mat[c_i, t]) if grid.atr14_mat[c_i, t] > 0 else float(it["entry_atr"])
+            it["shadow_stop"] = max(it["shadow_stop"], it["highest_high"] - rules.trail_mult * atr_now)
         keep.append(it)
     st["watchlist"] = keep
 
 
 def warm_start_watchlist(st: Dict[str, Any], grid: MarketGrid, rules: Rules, sig, n: int) -> int:
+    """Approximate the standing watchlist over the last WATCHLIST_WARM_START_BARS bars."""
     if rules.wl_mode == "WL_NONE" or WATCHLIST_WARM_START_BARS <= 0:
         return 0
     _, entry_mat, _, _, _, _ = sig
@@ -1055,7 +1692,8 @@ def warm_start_watchlist(st: Dict[str, Any], grid: MarketGrid, rules: Rules, sig
             a_y = float(grid.atr14_mat[c_i, t - 1])
             o_t = float(grid.open_mat[c_i, t])
             tmp["watchlist"].append({
-                "coin": coin, "signal_date": None, "trigger_price": float(grid.close_mat[c_i, t - 1]),
+                "coin": coin, "signal_date": str(grid.dates[t].date()),
+                "trigger_price": float(grid.close_mat[c_i, t - 1]),
                 "shadow_stop": o_t - rules.sl_mult * a_y, "highest_high": o_t,
                 "breakout_quality": float((grid.close_mat[c_i, t - 1] - grid.open_mat[c_i, t - 1]) / max(1e-6, a_y)),
                 "entry_atr": a_y
@@ -1078,7 +1716,7 @@ def update_size_w(st: Dict[str, Any], grid: MarketGrid, rules: Rules, t: int, st
 
 
 # ==============================================================================
-# 8. MAKE PLAN
+# 8. PLAN FOR THE OPEN OF BAR n (n = number of completed bars)
 # ==============================================================================
 def make_plan(st: Dict[str, Any], grid: MarketGrid, rules: Rules, sig, n: int, est_open: Callable[[int], float],
               alive_at_open: Optional[Callable[[int], bool]] = None) -> Dict[str, Any]:
@@ -1090,14 +1728,7 @@ def make_plan(st: Dict[str, Any], grid: MarketGrid, rules: Rules, sig, n: int, e
     views: List[Dict[str, Any]] = []
     live_tr: List[Tranche] = []
 
-    has_signal_exit = bool(np.any(exit_mat))
-    if "exit_primary" in rules.p or "exit_secondary" in rules.p:
-        x1, x2 = rules.p.get("exit_primary", "NONE"), rules.p.get("exit_secondary", "NONE")
-        active_exits = [x for x in (x1, x2) if x != "NONE"]
-        exit_label = "SIGNAL_EXIT_" + "+".join(active_exits) if active_exits else "SIGNAL_EXIT"
-    else:
-        exit_label = f"SIGNAL_EXIT_TYPE_{rules.xt}"
-
+    # 1. Sells
     for pos in st["positions"]:
         r = replay_position(grid, rules, sig, pos, n)
         tr = r["tranche"]
@@ -1117,6 +1748,7 @@ def make_plan(st: Dict[str, Any], grid: MarketGrid, rules: Rules, sig, n: int, e
             live_tr.append(tr)
         views.append(r)
 
+    # 2. Candidates decided on close of bar n-1
     active_counts: Dict[int, int] = {}
     for tr in live_tr:
         active_counts[tr.coin_idx] = active_counts.get(tr.coin_idx, 0) + 1
@@ -1134,7 +1766,7 @@ def make_plan(st: Dict[str, Any], grid: MarketGrid, rules: Rules, sig, n: int, e
         if grid.dvol30_mat[c_i, n - 1] < max(float(grid.liq_floor[c_i]), 1.0):
             gate_counts["liquidity"] += 1
             continue
-        if not entry_mat[n - 1, c_i] if entry_mat.ndim == 2 and entry_mat.shape[0] != len(grid.symbols) else not entry_mat[c_i, n - 1]:
+        if not entry_mat[c_i, n - 1]:
             gate_counts["adx"] += 1
             continue
         if active_counts.get(c_i, 0) >= rules.max_pyramid:
@@ -1159,6 +1791,7 @@ def make_plan(st: Dict[str, Any], grid: MarketGrid, rules: Rules, sig, n: int, e
         it["_new"] = True
     wl.extend(new_items)
 
+    # 3. Sizing and fills at estimated open
     starved = False
     unfilled: List[Dict[str, Any]] = []
     skipped_info: List[Dict[str, Any]] = []
@@ -1176,9 +1809,11 @@ def make_plan(st: Dict[str, Any], grid: MarketGrid, rules: Rules, sig, n: int, e
             if rules.wl_revalidate and not it.get("_new"):
                 if not macro_ok[n - 1] or (rules.adx_t > 0.0 and grid.adx14_mat[c_i, n - 1] < rules.adx_t) or not active_state[c_i, n - 1]:
                     continue
-            dec = evaluate_entry(grid, c_i, n, est_open(c_i), float(it["entry_atr"]), cash, live_tr, day_equity, day_target,
-                                 rules.floor_inr, rules.free_adds, rules.max_pyramid, rules.whole_shares,
-                                 rules.pyr_rule, rules.pyr_gap, rules.pyr_prog)
+            dec = evaluate_entry(
+                grid, c_i, n, est_open(c_i), float(it["entry_atr"]), cash, live_tr, day_equity, day_target,
+                rules.floor_inr, rules.free_adds, rules.max_pyramid, rules.whole_shares,
+                rules.pyr_rule, rules.pyr_gap, rules.pyr_prog
+            )
             if dec["ok"]:
                 cash -= dec["total_cost"]
                 orders.append({
@@ -1187,8 +1822,10 @@ def make_plan(st: Dict[str, Any], grid: MarketGrid, rules: Rules, sig, n: int, e
                     "reason": "WATCHLIST" if not it.get("_new") else "SIGNAL",
                     "stop_at_fill": dec["fill_px"] - rules.sl_mult * it["entry_atr"]
                 })
-                live_tr.append(make_tranche(grid, c_i, n - 1, dec["fill_px"], dec["units"], dec["total_cost"],
-                                            dec["slip_mult"], float(it["entry_atr"]), rules.sl_mult))
+                live_tr.append(make_tranche(
+                    grid, c_i, n - 1, dec["fill_px"], dec["units"], dec["total_cost"],
+                    dec["slip_mult"], float(it["entry_atr"]), rules.sl_mult
+                ))
             else:
                 starved = starved or dec["starved"]
                 unfilled.append(it)
@@ -1210,7 +1847,7 @@ def make_plan(st: Dict[str, Any], grid: MarketGrid, rules: Rules, sig, n: int, e
 
 
 # ==============================================================================
-# 9. RUN BAR & MANUAL INPUTS
+# 9. ONE FULL DAY & DELIST CHECK
 # ==============================================================================
 def check_delisted_positions(st: Dict[str, Any], grid: MarketGrid, t: int) -> List[str]:
     warns: List[str] = []
@@ -1219,7 +1856,7 @@ def check_delisted_positions(st: Dict[str, Any], grid: MarketGrid, t: int) -> Li
         c_i = idx.get(pos["coin"])
         if c_i is not None and grid.delist_mat[c_i, t]:
             warns.append(
-                f"{pos['coin']} ({pos['id']}) has 20+ missing bars (possible delisting). "
+                f"{pos['coin']} ({pos['id']}) has 20+ missing bars (possible delisting, suspension, or ticker change). "
                 f"Position kept in ledger; if sold manually, add to MANUAL_HOLDINGS_REMOVE."
             )
     return warns
@@ -1243,6 +1880,18 @@ def run_bar(st: Dict[str, Any], grid: MarketGrid, rules: Rules, sig, t: int, fir
     return notes
 
 
+def finalize_plan(st: Dict[str, Any], plan: Dict[str, Any]) -> None:
+    st["plan"] = {
+        "made_after_bar": plan["made_after_bar"],
+        "orders": plan["orders"],
+        "starved": plan["starved"],
+        "watchlist_after": plan["watchlist_after"],
+    }
+
+
+# ==============================================================================
+# 10. LEDGER INPUTS
+# ==============================================================================
 def apply_manual_inputs(st: Dict[str, Any], grid: MarketGrid) -> List[str]:
     notes: List[str] = []
     idx = sym_index(grid)
@@ -1292,13 +1941,97 @@ def apply_manual_inputs(st: Dict[str, Any], grid: MarketGrid) -> List[str]:
 
 
 # ==============================================================================
-# 10. REPORTING & EMAIL
+# 11. REPORTING (EXECUTIVE DASHBOARD WITH COMPOSABLE V14 EXIT WATCH)
 # ==============================================================================
+def _format_exit_watch(tr: Optional[Tranche], c_i: Optional[int], last_px: float, held_bars: int,
+                       rules: Rules, exit_mat: np.ndarray, macro_ok: np.ndarray, n: int) -> Tuple[str, str]:
+    """Builds HTML and plain-text Exit Watch summaries showing ONLY the exit rules active in the current V14 config."""
+    if tr is None or c_i is None or not np.isfinite(last_px) or last_px <= 0:
+        return '<span style="color:#ef4444;font-weight:600;">No price data</span>', "No data"
+
+    html_lines: List[str] = []
+    txt_parts: List[str] = []
+
+    # 1. Stop level
+    sl_px = tr.current_sl
+    dist_pct = ((last_px - sl_px) / last_px) * 100.0
+    sl_label_map = {
+        "STOP_LOSS": "Initial",
+        "BREAKEVEN_SL": "Breakeven",
+        "TRAIL_PCT_STOP": "Trail %",
+        "TRAIL_ATR_STOP": "Trail ATR",
+    }
+    sl_type = sl_label_map.get(tr.stop_reason, tr.stop_reason)
+    if dist_pct <= 0:
+        sl_col = "#ef4444"
+        dist_str = f"BREACHED ({dist_pct:+.1f}%)"
+    elif dist_pct < 4.0:
+        sl_col = "#f59e0b"
+        dist_str = f"-{dist_pct:.1f}% below close"
+    else:
+        sl_col = "#10b981"
+        dist_str = f"-{dist_pct:.1f}% below close"
+    html_lines.append(
+        f'<div><span style="color:#94a3b8;">Stop ({sl_type}):</span> '
+        f'<strong style="color:#f8fafc;">{inr(sl_px)}</strong> '
+        f'<span style="color:{sl_col};font-weight:600;">({dist_str})</span></div>'
+    )
+    txt_parts.append(f"Stop({sl_type}): {inr(sl_px)} ({dist_str})")
+
+    # 2. Composable / Legacy Signal Exit (shown only if active)
+    if rules.has_signal_exit:
+        sig_on = bool(exit_mat[c_i, n - 1])
+        gate_ok = held_bars >= 3 or (tr.highest_high - tr.entry_price) >= (1.0 * tr.entry_atr)
+        short_lbl = rules.exit_label.replace("SIGNAL_EXIT_", "")
+        if sig_on and gate_ok:
+            sig_html = '<span style="color:#ef4444;font-weight:700;">ACTIVE (Exit Triggered)</span>'
+            sig_txt = "ACTIVE"
+        elif sig_on:
+            sig_html = '<span style="color:#f59e0b;font-weight:600;">ARMED (Wait Bar 3 / +1 ATR)</span>'
+            sig_txt = "ARMED"
+        else:
+            sig_html = '<span style="color:#10b981;">INTACT</span>'
+            sig_txt = "INTACT"
+        html_lines.append(f'<div><span style="color:#94a3b8;">Sig ({short_lbl}):</span> {sig_html}</div>')
+        txt_parts.append(f"Sig({short_lbl}): {sig_txt}")
+
+    # 3. Time limit
+    time_col = "#ef4444" if held_bars >= rules.max_holding_bars else ("#f59e0b" if held_bars >= rules.max_holding_bars - 2 else "#cbd5e1")
+    html_lines.append(
+        f'<div><span style="color:#94a3b8;">Time:</span> '
+        f'<span style="color:{time_col};font-weight:600;">{held_bars} / {rules.max_holding_bars}d</span></div>'
+    )
+    txt_parts.append(f"Time: {held_bars}/{rules.max_holding_bars}d")
+
+    # 4. Macro regime exit (shown only if enabled)
+    if rules.macro_active_exit:
+        bear_streak = 0
+        for k in range(1, 4):
+            if n - k >= 0 and not macro_ok[n - k]:
+                bear_streak += 1
+            else:
+                break
+        if bear_streak >= 3:
+            m_html = '<span style="color:#ef4444;font-weight:700;">BEAR EXIT (3/3d below MA)</span>'
+            m_txt = "BEAR EXIT"
+        elif bear_streak > 0:
+            m_html = f'<span style="color:#f59e0b;font-weight:600;">WARN ({bear_streak}/3d below MA)</span>'
+            m_txt = f"WARN({bear_streak}/3d)"
+        else:
+            m_html = '<span style="color:#10b981;">BULL / OK</span>'
+            m_txt = "OK"
+        html_lines.append(f'<div><span style="color:#94a3b8;">Macro:</span> {m_html}</div>')
+        txt_parts.append(f"Macro: {m_txt}")
+
+    return "".join(html_lines), " | ".join(txt_parts)
+
+
 def build_report(st: Dict[str, Any], meta: Dict[str, Any], grid: MarketGrid, rules: Rules,
                  sig, plan: Dict[str, Any], notes: List[str], warnings: List[str]) -> Tuple[str, str, str]:
     n = len(grid.dates)
     last_date = str(grid.dates[n - 1].date())
     idx = sym_index(grid)
+    _, _, exit_mat, macro_ok, _, _ = sig
     sells = [o for o in plan["orders"] if o["side"] == "SELL"]
     buys = [o for o in plan["orders"] if o["side"] == "BUY"]
     prefix = "[DRY RUN] " if DRY_RUN else ""
@@ -1327,7 +2060,6 @@ def build_report(st: Dict[str, Any], meta: Dict[str, Any], grid: MarketGrid, rul
 
         held_bars = max(0, n - bar_index(grid, p["entry_date"])) if c_i is not None else 0
         verdict = r["verdict"] if r["verdict"] else ("HOLD" if has_data else "NO DATA")
-        _, _, exit_mat, macro_ok, _, _ = sig
         ew_html, ew_txt = _format_exit_watch(tr, c_i, last_px, held_bars, rules, exit_mat, macro_ok, n)
 
         rows_holdings.append({
@@ -1604,7 +2336,7 @@ def build_report(st: Dict[str, Any], meta: Dict[str, Any], grid: MarketGrid, rul
     html += """
         <tr>
           <td style="padding-top:24px;padding-bottom:24px;text-align:center;font-size:11px;color:#64748b;">
-            NSE Live Bot Automation Engine • Generated at market close for next day execution.
+            NSE Live Bot Automation Engine V14.0 • Generated at market close for next day execution.
           </td>
         </tr>
       </table>
@@ -1633,7 +2365,7 @@ def send_email(subject: str, text: str, html: str) -> None:
 
 
 # ==============================================================================
-# 11. MAIN
+# 12. MAIN
 # ==============================================================================
 def main() -> None:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
@@ -1665,6 +2397,11 @@ def main() -> None:
             f"Run started at {now:%H:%M} IST (before {MARKET_CLOSE_IST_HOUR:.0f}:00 IST market close). "
             f"Today's incomplete bar was excluded ({DROPPED_TODAY_BARS} tickers had intraday prints); plan is based on {grid.dates[-1].date()}."
         )
+    if len(grid.stale_symbols) > max(5, int(0.10 * len(grid.symbols))):
+        warnings.append(
+            f"Partial Yahoo Finance update detected: {len(grid.stale_symbols)}/{len(grid.symbols)} stocks lack bars for "
+            f"{grid.dates[-1].date()} (forward-filled from prior close). Consider re-running later this evening."
+        )
     if (now.date() - grid.dates[-1].date()).days > 5:
         warnings.append(f"Price data ends {grid.dates[-1].date()}: more than 5 days old.")
 
@@ -1689,7 +2426,7 @@ def main() -> None:
     if first_run:
         n_wl = warm_start_watchlist(st, grid, rules, sig, n)
         if rules.wl_mode != "WL_NONE":
-            notes.append(f"Watchlist rebuilt from the last {WATCHLIST_WARM_START_BARS} bars: {n_wl} items.")
+            notes.append(f"Watchlist rebuilt from the last {WATCHLIST_WARM_START_BARS} bars: {n_wl} items (approximation of the backtest's standing queue).")
 
     est_open = lambda c_i: float(grid.close_mat[c_i, n - 1])
     plan = make_plan(st, grid, rules, sig, n, est_open)

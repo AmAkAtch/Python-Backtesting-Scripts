@@ -1,0 +1,213 @@
+{
+ "schema": 2,
+ "config_hash": "V14.0:33531b81",
+ "last_bar_date": "2026-11-16",
+ "cash": 0.0,
+ "size_w": 0.08,
+ "positions": [
+  {
+   "id": "P1",
+   "coin": "ADANIGREEN",
+   "entry_date": "2026-07-28",
+   "entry_price": 1377.8,
+   "units": 6.0,
+   "cost_inr": 8300.25,
+   "source": "manual"
+  },
+  {
+   "id": "P2",
+   "coin": "BPCL",
+   "entry_date": "2026-07-12",
+   "entry_price": 293.9,
+   "units": 20.0,
+   "cost_inr": 5908.61,
+   "source": "manual"
+  },
+  {
+   "id": "P3",
+   "coin": "CGPOWER",
+   "entry_date": "2026-03-13",
+   "entry_price": 740.55,
+   "units": 14.0,
+   "cost_inr": 10403.66,
+   "source": "manual"
+  },
+  {
+   "id": "P4",
+   "coin": "CHOLAFIN",
+   "entry_date": "2026-09-16",
+   "entry_price": 1765.6,
+   "units": 4.0,
+   "cost_inr": 7094.42,
+   "source": "manual"
+  },
+  {
+   "id": "P5",
+   "coin": "GAIL",
+   "entry_date": "2026-06-18",
+   "entry_price": 175.78,
+   "units": 45.0,
+   "cost_inr": 7943.13,
+   "source": "manual"
+  },
+  {
+   "id": "P6",
+   "coin": "HDBFS",
+   "entry_date": "2026-07-29",
+   "entry_price": 684.85,
+   "units": 12.0,
+   "cost_inr": 8251.6,
+   "source": "manual"
+  },
+  {
+   "id": "P7",
+   "coin": "IOC",
+   "entry_date": "2026-05-18",
+   "entry_price": 131.38,
+   "units": 23.0,
+   "cost_inr": 3048.94,
+   "source": "manual"
+  },
+  {
+   "id": "P8",
+   "coin": "ITCHOTELS",
+   "entry_date": "2026-08-17",
+   "entry_price": 164.93,
+   "units": 48.0,
+   "cost_inr": 7949.68,
+   "source": "manual"
+  },
+  {
+   "id": "P9",
+   "coin": "JSWENERGY",
+   "entry_date": "2026-05-15",
+   "entry_price": 515.05,
+   "units": 15.0,
+   "cost_inr": 7758.56,
+   "source": "manual"
+  },
+  {
+   "id": "P10",
+   "coin": "MOTILALOFS",
+   "entry_date": "2026-07-27",
+   "entry_price": 869.3,
+   "units": 9.0,
+   "cost_inr": 7856.62,
+   "source": "manual"
+  },
+  {
+   "id": "P11",
+   "coin": "NATCOPHARM",
+   "entry_date": "2026-03-23",
+   "entry_price": 927.55,
+   "units": 8.0,
+   "cost_inr": 7452.84,
+   "source": "manual"
+  },
+  {
+   "id": "P12",
+   "coin": "NATIONALUM",
+   "entry_date": "2026-09-03",
+   "entry_price": 374.0,
+   "units": 14.0,
+   "cost_inr": 5265.84,
+   "source": "manual"
+  },
+  {
+   "id": "P13",
+   "coin": "NHPC",
+   "entry_date": "2026-05-12",
+   "entry_price": 78.5,
+   "units": 67.0,
+   "cost_inr": 5289.37,
+   "source": "manual"
+  },
+  {
+   "id": "P14",
+   "coin": "NTPCGREEN",
+   "entry_date": "2026-05-15",
+   "entry_price": 110.15,
+   "units": 73.0,
+   "cost_inr": 8074.13,
+   "source": "manual"
+  },
+  {
+   "id": "P15",
+   "coin": "PHOENIXLTD",
+   "entry_date": "2026-08-11",
+   "entry_price": 1908.7,
+   "units": 4.0,
+   "cost_inr": 7667.5,
+   "source": "manual"
+  },
+  {
+   "id": "P16",
+   "coin": "TATAPOWER",
+   "entry_date": "2026-04-08",
+   "entry_price": 395.0,
+   "units": 20.0,
+   "cost_inr": 7933.02,
+   "source": "manual"
+  }
+ ],
+ "watchlist": [],
+ "plan": {
+  "made_after_bar": "2026-11-16",
+  "orders": [
+   {
+    "id": "2026-11-16:SELL:JSWENERGY:P9",
+    "side": "SELL",
+    "coin": "JSWENERGY",
+    "pos_id": "P9",
+    "units": 15.0,
+    "est_price": 514.5499877929688,
+    "reason": "BREAKEVEN_SL",
+    "overdue_since": "2026-09-01"
+   },
+   {
+    "id": "2026-11-16:SELL:NATCOPHARM:P11",
+    "side": "SELL",
+    "coin": "NATCOPHARM",
+    "pos_id": "P11",
+    "units": 8.0,
+    "est_price": 828.6500244140625,
+    "reason": "BREAKEVEN_SL",
+    "overdue_since": "2026-06-02"
+   },
+   {
+    "id": "2026-11-16:SELL:TATAPOWER:P16",
+    "side": "SELL",
+    "coin": "TATAPOWER",
+    "pos_id": "P16",
+    "units": 20.0,
+    "est_price": 345.5,
+    "reason": "BREAKEVEN_SL",
+    "overdue_since": "2026-06-10"
+   }
+  ],
+  "starved": false,
+  "watchlist_after": []
+ },
+ "closed_trades": [],
+ "applied_manual_ids": [
+  "ADANIGREEN|2026-07-28|6|1377.8",
+  "BPCL|2026-07-12|20|293.9",
+  "CGPOWER|2026-03-13|14|740.55",
+  "CHOLAFIN|2026-09-16|4|1765.6",
+  "GAIL|2026-06-18|45|175.78",
+  "HDBFS|2026-07-29|12|684.85",
+  "IOC|2026-05-18|23|131.38",
+  "ITCHOTELS|2026-08-17|48|164.93",
+  "JSWENERGY|2026-05-15|15|515.05",
+  "MOTILALOFS|2026-07-27|9|869.3",
+  "NATCOPHARM|2026-03-23|8|927.55",
+  "NATIONALUM|2026-09-03|14|374.0",
+  "NHPC|2026-05-12|67|78.5",
+  "NTPCGREEN|2026-05-15|73|110.15",
+  "PHOENIXLTD|2026-08-11|4|1908.7",
+  "TATAPOWER|2026-04-08|20|395.0"
+ ],
+ "applied_cash_ids": [],
+ "applied_remove_ids": [],
+ "next_id": 17
+}
