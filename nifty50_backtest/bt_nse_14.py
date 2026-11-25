@@ -46,7 +46,7 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(me
 # 1. USER CONTROL PANEL
 # ==============================================================================
 
-ENGINE_VERSION: str = "V14.0"
+ENGINE_VERSION: str = "V14.1"
 UNIVERSE_NAME: str = "POOL_LM250_SC100"
 
 POOL_COMPONENTS: Dict[str, List[Tuple[str, str]]] = {
@@ -800,12 +800,12 @@ class VectorIndicatorBank:
 _SPLIT_RATIOS = (0.10, 0.20, 0.25, 0.3333, 0.50, 0.6667, 0.75, 2.0, 3.0, 4.0, 5.0, 10.0)
 
 
-def _is_plausible_split_ratio(qe: float, vol_jump: bool) -> bool:
-    """Bug #6 fix: Distinguish real corporate splits/bonuses from genuine single-stock crash gaps."""
+def _is_plausible_split_ratio(qe: float, vol_jump: bool = False) -> bool:
+    """V14.1 fix: Match clean corporate split/bonus ratios only (no volume-spike crash wildcard)."""
     for r in _SPLIT_RATIOS:
         if abs(qe - r) / r <= 0.08:
             return True
-    return bool(vol_jump and (qe <= 0.55 or qe >= 1.90))
+    return False
 
 
 def repair_price_artifacts(df: pd.DataFrame, sym: str, mkt_ret: Optional[pd.Series],
@@ -1074,11 +1074,11 @@ def _eval_exit_signal(bank: VectorIndicatorBank, grid: MarketGrid, xname: str, p
     elif xname == "RSI_CROSS_DOWN":
         rf = bank.rsi_smoothed(p[f"{prefix}_rsi_f_len"], p[f"{prefix}_rsi_f_smt"])
         rs = bank.rsi_smoothed(p[f"{prefix}_rsi_s_len"], p[f"{prefix}_rsi_s_smt"])
-        return (~np.isnan(rf)) & (~np.isnan(rs)) & (rf < rs) & (shift_2d(rf) >= shift_2d(rs))
+        return (~np.isnan(rf)) & (~np.isnan(rs)) & (rf < rs)
     elif xname == "MA_XOVER_DOWN":
         s_ma = bank.ma(p[f"{prefix}_xover_s_len"], p[f"{prefix}_xover_s_type"])
         l_ma = bank.ma(p[f"{prefix}_xover_l_len"], p[f"{prefix}_xover_l_type"])
-        return (~np.isnan(s_ma)) & (~np.isnan(l_ma)) & (s_ma < l_ma) & (shift_2d(s_ma) >= shift_2d(l_ma))
+        return (~np.isnan(s_ma)) & (~np.isnan(l_ma)) & (s_ma < l_ma)
     elif xname == "CLIMAX_VOLUME_RED":
         w = max(2, int(p[f"{prefix}_vol_ma_len"]))
         v_shift = shift_2d(v, fill_value=0.0)
@@ -2265,16 +2265,15 @@ def dynamic_parameter_neighbors(base_p: Dict[str, Any]) -> List[Dict[str, Any]]:
     steps = {
         "entry_ma_len": 5, "rsi_f_len": 2, "rsi_f_smt": 2, "rsi_s_len": 2, "rsi_s_smt": 2,
         "rsi_trend_ma_len": 10, "xover_short_len": 5, "xover_gap": 5, "vol_ma_len": 2,
-        "vol_mult": 0.2, "price_lookback": 2, "body_atr_mult": 0.1, "bb_entry_len": 2,
-        "bb_entry_std": 0.1, "macro_ma_len": 10, "sl_mult": 0.3,
-        "trail_atr_mult": 0.5, "max_holding_bars": 5, "trail_pct": 2.0,
+        "vol_mult": 0.1, "price_lookback": 2, "body_atr_mult": 0.1, "bb_entry_len": 2,
+        "bb_entry_std": 0.1, "macro_ma_len": 10, "sl_mult": 0.2,
+        "trail_atr_mult": 0.5, "max_holding_bars": 5, "trail_pct": 1.0,
         "bp_vol_ma_len": 2, "bp_vol_mult": 0.25, "bp_ratio": 0.5,
         "adx_thresh": 5.0, "be_trigger_atr": 1.0,
-        # Composable V14 filter & exit numeric parameters
-        "ef1_ma_len": 10, "ef1_rsi_f_len": 2, "ef1_rsi_s_len": 4, "ef1_vol_mult": 0.2, "ef1_bp_ratio": 0.5, "ef1_bb_len": 4,
-        "ef2_ma_len": 10, "ef2_rsi_f_len": 2, "ef2_rsi_s_len": 4, "ef2_vol_mult": 0.2, "ef2_bp_ratio": 0.5, "ef2_bb_len": 4,
-        "ex1_ma_len": 5, "ex1_rsi_f_len": 2, "ex1_rsi_s_len": 4, "ex1_xover_s_len": 5, "ex1_xover_gap": 5, "ex1_vol_mult": 0.2, "ex1_bb_len": 4,
-        "ex2_ma_len": 5, "ex2_rsi_f_len": 2, "ex2_rsi_s_len": 4, "ex2_xover_s_len": 5, "ex2_xover_gap": 5, "ex2_vol_mult": 0.2, "ex2_bb_len": 4,
+        "ef1_ma_len": 10, "ef1_rsi_f_len": 2, "ef1_rsi_s_len": 4, "ef1_vol_mult": 0.1, "ef1_bp_ratio": 0.5, "ef1_bb_len": 4,
+        "ef2_ma_len": 10, "ef2_rsi_f_len": 2, "ef2_rsi_s_len": 4, "ef2_vol_mult": 0.1, "ef2_bp_ratio": 0.5, "ef2_bb_len": 4,
+        "ex1_ma_len": 5, "ex1_rsi_f_len": 2, "ex1_rsi_s_len": 4, "ex1_xover_s_len": 5, "ex1_xover_gap": 5, "ex1_vol_mult": 0.1, "ex1_bb_len": 4,
+        "ex2_ma_len": 5, "ex2_rsi_f_len": 2, "ex2_rsi_s_len": 4, "ex2_xover_s_len": 5, "ex2_xover_gap": 5, "ex2_vol_mult": 0.1, "ex2_bb_len": 4,
     }
 
     raw_neighbors: List[Dict[str, Any]] = []
@@ -2330,6 +2329,19 @@ def dynamic_parameter_neighbors(base_p: Dict[str, Any]) -> List[Dict[str, Any]]:
                     cand_c = copy.deepcopy(base_p)
                     cand_c[k_c] = choices[j_c]
                     raw_neighbors.append(cand_c)
+    for k_c, choices in (("pyramid_gap_bars", PYRAMID_GAP_CHOICES), ("pyramid_progress_atr", PYRAMID_PROGRESS_CHOICES)):
+        if base_p.get("pyramid_rule", 0) and base_p.get(k_c, 0) in choices:
+            i_c = choices.index(base_p[k_c])
+            for j_c in (i_c - 1, i_c + 1):
+                if 0 <= j_c < len(choices):
+                    cand_c = copy.deepcopy(base_p)
+                    cand_c[k_c] = choices[j_c]
+                    raw_neighbors.append(cand_c)
+
+    if int(base_p.get("max_pyramid_layers", 1)) > 1 and "avg_down_free_adds" in base_p:
+        cand_ad = copy.deepcopy(base_p)
+        cand_ad["avg_down_free_adds"] = 1 - int(base_p["avg_down_free_adds"])
+        raw_neighbors.append(cand_ad)
 
     for k_b in ("wl_revalidate", "macro_active_exit"):
         if k_b in base_p:
@@ -2463,6 +2475,19 @@ def verify_behavioral_causality(grid: MarketGrid) -> None:
          "max_holding_bars": 40, "sl_mult": 4.0, "trail_mode": "PCT", "trail_pct": 20.0,
          "exit_primary": "MA_BREAK", "ex1_ma_len": 30, "ex1_ma_type": 1, "exit_secondary": "RSI_CROSS_DOWN",
          "ex2_rsi_f_len": 14, "ex2_rsi_f_smt": 4, "ex2_rsi_s_len": 30, "ex2_rsi_s_smt": 8},
+         {"entry_type": 0, "entry_ma_len": 50, "entry_ma_type": 1, "entry_filter_1": "NONE", "entry_filter_2": "NONE",
+         "use_market_macro_system": False, "adx_thresh": 25.0, "max_pyramid_layers": 3, "avg_down_free_adds": 1,
+         "pyramid_rule": 1, "pyramid_gap_bars": 5, "wl_mode": "WL_STRONGEST_MOMENTUM", "max_holding_bars": 60,
+         "sl_mult": 4.0, "trail_mode": "PCT", "trail_pct": 20.0, "exit_primary": "NONE", "exit_secondary": "NONE"},
+        {"entry_type": 0, "entry_ma_len": 50, "entry_ma_type": 1, "entry_filter_1": "NONE", "entry_filter_2": "NONE",
+         "use_market_macro_system": False, "adx_thresh": 25.0, "max_pyramid_layers": 3, "avg_down_free_adds": 1,
+         "pyramid_rule": 2, "pyramid_progress_atr": 1.0, "wl_mode": "WL_NONE", "max_holding_bars": 60,
+         "sl_mult": 4.0, "trail_mode": "ATR", "trail_atr_mult": 3.0, "exit_primary": "NONE", "exit_secondary": "NONE"},
+        {"entry_type": 3, "vol_ma_len": 20, "vol_mult": 0.0, "breakout_use_volume": False, "price_lookback": 20,
+         "body_atr_mult": 0.6, "entry_filter_1": "TREND_MA", "ef1_ma_len": 100, "ef1_ma_type": 0, "entry_filter_2": "NONE",
+         "use_market_macro_system": False, "adx_thresh": 20.0, "max_pyramid_layers": 2, "avg_down_free_adds": 0,
+         "pyramid_rule": 1, "pyramid_gap_bars": 10, "wl_mode": "WL_NONE", "max_holding_bars": 90,
+         "sl_mult": 5.0, "trail_mode": "NONE", "exit_primary": "NONE", "exit_secondary": "NONE"},
     ]
 
     for idx_c, cfg in enumerate(test_cfgs):
@@ -2610,7 +2635,7 @@ def sample_hyperparameters_v14(trial: optuna.Trial) -> Dict[str, Any]:
     p["wl_revalidate"] = trial.suggest_categorical("wl_revalidate", [True, False])
     p["max_pyramid_layers"] = trial.suggest_categorical("max_pyramid_layers", [1, 2, 3]) if p["entry_type"] in (0, 3, 4, 5, 6) else 1
     p["avg_down_free_adds"] = trial.suggest_categorical("avg_down_free_adds", [0, 1]) if p["max_pyramid_layers"] > 1 else 0
-    if p["entry_type"] == 0 and p["max_pyramid_layers"] > 1:
+    if p["max_pyramid_layers"] > 1:
         p["pyramid_rule"] = trial.suggest_categorical("pyramid_rule", [1, 2])
         if p["pyramid_rule"] == 1:
             p["pyramid_gap_bars"] = trial.suggest_categorical("pyramid_gap_bars", PYRAMID_GAP_CHOICES)
@@ -2673,28 +2698,57 @@ def _canonical_func_source(fn) -> str:
         return inspect.getsource(fn)
 
 
-ENGINE_HASH_INPUT: str = (
-    _canonical_func_source(sample_hyperparameters_v14) +
-    _canonical_func_source(calculate_metrics) +
-    _canonical_func_source(_calc_sub_metrics) +
-    _canonical_func_source(compile_signals_composable) +
-    _canonical_func_source(BacktestEngine) +
-    _canonical_func_source(VectorIndicatorBank) +
-    _canonical_func_source(SwingRunCatalog) +
-    _canonical_func_source(calculate_benchmarks) +
-    _canonical_func_source(repair_price_artifacts) +
-    str([FORCE_MACRO_REGIME_FILTER, FORCE_TRAIL_STOP, START_YEAR, INITIAL_CAPITAL, MONTHLY_CONTRIBUTION,
-         BRACKET_LIQUIDITY_FLOOR_INR, BRACKET_SLIPPAGE_BPS, BRACKET_IMPACT_COEF_BPS, TRANCHE_FLOOR_CHOICES,
-         MAX_POSITION_EQUITY_PCT, MAX_ADV_PARTICIPATION, DD_PENALTY_WEIGHT, MIN_CLOSED_TRADES, EOT_EXCESS_WEIGHT,
-         OBJ_YEAR_EXCESS_CLIP, RUN_MIN_GAIN_PCT, RUN_REVERSAL_DD, RUN_TARGET_SHARE, RUN_TARGET_MAGNITUDE, RUN_CAPTURE_WEIGHT])
-)
-PARAM_SPACE_HASH: str = hashlib.sha256(ENGINE_HASH_INPUT.encode()).hexdigest()[:8]
-STUDY_NAME = f"nse_swing_{ENGINE_VERSION.lower()}_{UNIVERSE_NAME.lower()}_{PARAM_SPACE_HASH}"
-
-
 def reconstitute_params(params: Dict[str, Any]) -> Dict[str, Any]:
+    """V14.1: Migrates legacy V13 exit_type/trail_atr_mult configs cleanly before setting V14 defaults."""
     p = copy.deepcopy(params)
-    # Normalize duplicate filter/exit names saved in Optuna trial.params
+
+    # 1. Migrate legacy V13 exit_type & trail settings if composable keys are absent
+    if "exit_type" in p and "exit_primary" not in p:
+        legacy_xt = int(p["exit_type"])
+        legacy_map = {
+            3: "MA_BREAK",
+            4: "RSI_CROSS_DOWN",
+            5: "MA_XOVER_DOWN",
+            6: "CLIMAX_VOLUME_RED",
+            7: "BB_MID_BREAK",
+        }
+        if legacy_xt in legacy_map:
+            p["exit_primary"] = legacy_map[legacy_xt]
+            p["use_exit_primary"] = True
+            if legacy_xt == 3:
+                p["ex1_ma_len"] = p.get("exit_ma_len", 50)
+                p["ex1_ma_type"] = p.get("exit_ma_type", 0)
+            elif legacy_xt == 4:
+                p["ex1_rsi_f_len"] = p.get("exit_rsi_f_len", 14)
+                p["ex1_rsi_f_smt"] = p.get("exit_rsi_f_smt", 6)
+                p["ex1_rsi_s_len"] = p.get("exit_rsi_s_len", 40)
+                p["ex1_rsi_s_smt"] = p.get("exit_rsi_s_smt", 10)
+            elif legacy_xt == 5:
+                p["ex1_xover_s_len"] = p.get("exit_xover_short_len", 20)
+                p["ex1_xover_s_type"] = p.get("exit_xover_short_type", 0)
+                p["ex1_xover_gap"] = p.get("exit_xover_gap", 30)
+                p["ex1_xover_l_len"] = min(150, p["ex1_xover_s_len"] + p["ex1_xover_gap"])
+                p["ex1_xover_l_type"] = p.get("exit_xover_long_type", 0)
+            elif legacy_xt == 6:
+                p["ex1_vol_ma_len"] = p.get("exit_vol_ma_len", 20)
+                p["ex1_vol_mult"] = p.get("exit_vol_mult", 1.5)
+            elif legacy_xt == 7:
+                p["ex1_bb_len"] = p.get("bb_exit_len", 20)
+        else:
+            p["exit_primary"] = "NONE"
+            p["use_exit_primary"] = False
+        p["exit_secondary"] = "NONE"
+        p["use_exit_secondary"] = False
+
+    if "trail_mode" not in p:
+        if int(p.get("exit_type", 0)) == 1 and float(p.get("trail_pct", 0.0)) > 0.0:
+            p["trail_mode"] = "PCT"
+        elif float(p.get("trail_atr_mult", 0.0)) > 0.0:
+            p["trail_mode"] = "ATR"
+        else:
+            p["trail_mode"] = "NONE"
+
+    # 2. Normalize duplicate filter/exit names saved in Optuna trial.params
     if p.get("entry_filter_1", "NONE") == "NONE":
         p["entry_filter_1"] = "NONE"
         p["entry_filter_2"] = "NONE"
@@ -2706,7 +2760,7 @@ def reconstitute_params(params: Dict[str, Any]) -> Dict[str, Any]:
         p["exit_secondary"] = "NONE"
     elif p.get("exit_secondary") == p.get("exit_primary"):
         p["exit_secondary"] = "NONE"
-        
+
     for k in list(p.keys()):
         if isinstance(p[k], float):
             p[k] = round(p[k], 2)
@@ -2740,6 +2794,45 @@ def reconstitute_params(params: Dict[str, Any]) -> Dict[str, Any]:
     if p.get("entry_type") == 3 and not p.get("breakout_use_volume", True):
         p["vol_mult"] = 0.0
     return p
+
+
+ENGINE_HASH_INPUT: str = (
+    _canonical_func_source(sample_hyperparameters_v14) +
+    _canonical_func_source(reconstitute_params) +
+    _canonical_func_source(calculate_metrics) +
+    _canonical_func_source(_calc_sub_metrics) +
+    _canonical_func_source(compile_signals_composable) +
+    _canonical_func_source(_eval_entry_state_filter) +
+    _canonical_func_source(_eval_exit_signal) +
+    _canonical_func_source(BacktestEngine) +
+    _canonical_func_source(evaluate_entry) +
+    _canonical_func_source(tranche_open_exit_reason) +
+    _canonical_func_source(tranche_eod_update) +
+    _canonical_func_source(make_tranche) +
+    _canonical_func_source(VectorIndicatorBank) +
+    _canonical_func_source(FastIndicators) +
+    _canonical_func_source(SwingRunCatalog) +
+    _canonical_func_source(calculate_benchmarks) +
+    _canonical_func_source(compute_buy_cost_audited) +
+    _canonical_func_source(compute_sell_proceeds_audited) +
+    _canonical_func_source(compute_max_affordable_tranche) +
+    _canonical_func_source(breakeven_exit_price) +
+    _canonical_func_source(repair_price_artifacts) +
+    str([
+        ENGINE_VERSION, FORCE_MACRO_REGIME_FILTER, FORCE_TRAIL_STOP, START_YEAR, INITIAL_CAPITAL,
+        MONTHLY_CONTRIBUTION, CASH_ANNUAL_YIELD, ENGINE_DEFAULTS, V13_FIXED_RULES,
+        SIZE_W0_CHOICES, SIZE_W_MAX_CHOICES, SIZE_RESERVE_CHOICES, SIZE_RAMP_CHOICES, SIZE_RUNT_FRACTION,
+        PYRAMID_GAP_CHOICES, PYRAMID_PROGRESS_CHOICES, BRACKET_LIQUIDITY_FLOOR_INR,
+        BRACKET_SLIPPAGE_BPS, BRACKET_IMPACT_COEF_BPS, TRANCHE_FLOOR_CHOICES,
+        MAX_POSITION_EQUITY_PCT, MAX_ADV_PARTICIPATION, DELIST_RECOVERY_FRACTION,
+        BROKERAGE_MODE, FLAT_BROKERAGE_INR, STT_RATE, EXCHANGE_TXN_RATE, STAMP_DUTY_RATE,
+        SEBI_CHARGE_RATE, GST_RATE, DP_CHARGE_INR, DD_PENALTY_WEIGHT, MIN_CLOSED_TRADES,
+        EOT_EXCESS_WEIGHT, OBJ_YEAR_EXCESS_CLIP, OBJ_MIN_YEAR_BARS,
+        RUN_MIN_GAIN_PCT, RUN_REVERSAL_DD, RUN_TARGET_SHARE, RUN_TARGET_MAGNITUDE, RUN_CAPTURE_WEIGHT,
+    ])
+)
+PARAM_SPACE_HASH: str = hashlib.sha256(ENGINE_HASH_INPUT.encode()).hexdigest()[:8]
+STUDY_NAME = f"nse_swing_{ENGINE_VERSION.lower()}_{UNIVERSE_NAME.lower()}_{PARAM_SPACE_HASH}"
 
 
 # ==============================================================================
@@ -3359,6 +3452,50 @@ def search_diagnostics_md(seed_trials: Dict[int, List[Any]], seed_studies: Dict[
                 md += f"\n**{col}** (score by choice, scored trials only)\n\n| Choice | Trials | Median | p90 |\n| :--- | :--- | :--- | :--- |\n"
                 for ch_, r_ in g.iterrows():
                     md += f"| {ch_} | {int(r_['count'])} | {r_['median']:+.2f} | {r_.iloc[2]:+.2f} |\n"
+
+        dists: Dict[str, Any] = {}
+        for t in allt:
+            for k, d_ in t.dists.items():
+                dists.setdefault(k, d_)
+        top = sorted(ok, key=lambda x: x.value, reverse=True)[:max(30, int(0.05 * len(ok)))]
+        rows = []
+        for k, d_ in dists.items():
+            vs = [t.params[k] for t in top if k in t.params]
+            if len(vs) < 10 or k.endswith("_type") or k in ("wl_mode", "entry_filter_1", "entry_filter_2", "exit_primary", "exit_secondary", "trail_mode"):
+                continue
+            if hasattr(d_, "choices"):
+                ch = list(d_.choices)
+                if len(ch) < 3 or not all(isinstance(c_, (int, float)) and not isinstance(c_, bool) for c_ in ch):
+                    continue
+                pos_ = np.array([ch.index(v) / (len(ch) - 1) for v in vs if v in ch])
+            else:
+                lo, hi = float(d_.low), float(d_.high)
+                if hi <= lo:
+                    continue
+                pos_ = np.array([(float(v) - lo) / (hi - lo) for v in vs])
+            if len(pos_) >= 10:
+                up, dn = float(np.mean(pos_ >= 0.9)), float(np.mean(pos_ <= 0.1))
+                flag = "PILING AT UPPER LIMIT" if up >= 0.4 else ("PILING AT LOWER LIMIT" if dn >= 0.4 else "ok")
+                rows.append((k, float(np.median([float(v) for v in vs])), up, dn, flag))
+        if rows:
+            md += f"\n**Range check** (best {len(top)} trials):\n\n| Parameter | Median of best | In top 10% | In bottom 10% | Verdict |\n| :--- | :--- | :--- | :--- | :--- |\n"
+            for k, med, up, dn, flag in sorted(rows, key=lambda r: -max(r[2], r[3])):
+                md += f"| {k} | {med:.4g} | {up:.0%} | {dn:.0%} | {flag} |\n"
+
+    try:
+        import optuna.importance as oimp
+        acc: Dict[str, List[float]] = {}
+        for sd, st in seed_studies.items():
+            imp = oimp.get_param_importances(st, target=lambda t_: max(float(t_.value), -5.0))
+            for k, v in imp.items():
+                acc.setdefault(k, []).append(float(v))
+        if acc:
+            top_imp = sorted(((k, float(np.mean(v))) for k, v in acc.items()), key=lambda kv: -kv[1])[:12]
+            md += "\n**Parameter importance** (fANOVA, averaged over seeds):\n\n| Parameter | Importance |\n| :--- | :--- |\n"
+            for k, v in top_imp:
+                md += f"| {k} | {v:.1%} |\n"
+    except Exception as exc:
+        md += f"\n*Parameter importance unavailable ({type(exc).__name__}).*\n"
     return md
 
 
@@ -3664,6 +3801,13 @@ def run_optimization() -> None:
 
     # Stage 2: Neighborhood & deposit-timing battery
     stage2 = scored_candidates[:STAGE2_N]
+
+    stage2_nums = {r["trial"].number for r in stage2}
+    for r in scored_candidates[STAGE2_N:]:
+        if r["trial"].number == f"s{CHAMPION_SEED}-0" and r["trial"].number not in stage2_nums:
+            stage2.append(r)
+            break
+        
     for rec in stage2:
         logging.info(f"Stage-2 battery for {rec['trial'].number} (score {rec['score']:.2f}) ...")
         is_stable, plateau, pass_rate, _ = evaluate_neighborhood_stability(
@@ -4125,6 +4269,89 @@ def run_optimization() -> None:
 ```json
 {json.dumps(best_params, indent=4)}
 """
+    def _render_excursion(tdf: pd.DataFrame) -> str:
+        if len(tdf) == 0:
+            return "*No closed trades.*\n"
+        wins, losses = tdf[tdf["pnl"] > 0], tdf[tdf["pnl"] <= 0]
+        w_eff = f"{(wins['ret'].mean() * 100) / max(0.01, wins['mfe_pct'].mean()) * 100:.1f}%" if len(wins) > 0 and wins["mfe_pct"].mean() > 0 else "N/A"
+        return (
+            "| Sub-Population | Avg MFE (%) | Avg MAE (%) | Peak Bar | Win Efficiency |\n| :--- | :--- | :--- | :--- | :--- |\n"
+            f"| **Winners** | +{wins['mfe_pct'].mean():.2f}% | {wins['mae_pct'].mean():.2f}% | Bar {wins['bars_to_peak'].mean():.1f} | {w_eff} |\n"
+            f"| **Losers** | +{losses['mfe_pct'].mean():.2f}% | {losses['mae_pct'].mean():.2f}% | Bar {losses['bars_to_peak'].mean():.1f} | N/A |\n"
+            f"| **All Trades** | +{tdf['mfe_pct'].mean():.2f}% | {tdf['mae_pct'].mean():.2f}% | Bar {tdf['bars_to_peak'].mean():.1f} | Realized: {tdf['ret'].mean()*100:.2f}% |\n"
+        )
+
+    def _render_frictions(tdf: pd.DataFrame) -> str:
+        if len(tdf) == 0:
+            return "*No trades.*\n"
+        n_t = max(1, len(tdf))
+        tot_brk = sum(tr["frictions"].brokerage for _, tr in tdf.iterrows())
+        tot_stt = sum(tr["frictions"].stt for _, tr in tdf.iterrows())
+        tot_ex = sum(tr["frictions"].exchange_charges + tr["frictions"].sebi_charges + tr["frictions"].stamp_duty for _, tr in tdf.iterrows())
+        tot_gst = sum(tr["frictions"].gst for _, tr in tdf.iterrows())
+        tot_dp = sum(tr["frictions"].dp_charges for _, tr in tdf.iterrows())
+        tot_slp = sum(tr["frictions"].slippage_cost for _, tr in tdf.iterrows())
+        tot_all = tot_brk + tot_stt + tot_ex + tot_gst + tot_dp + tot_slp
+        return (
+            "| Fee Category | In-Sample Paid | Drag / Trade |\n| :--- | :--- | :--- |\n"
+            f"| Brokerage (Upstox) | {format_price(tot_brk)} | {format_price(tot_brk/n_t)} |\n"
+            f"| STT | {format_price(tot_stt)} | {format_price(tot_stt/n_t)} |\n"
+            f"| Exchange + Stamp + SEBI | {format_price(tot_ex)} | {format_price(tot_ex/n_t)} |\n"
+            f"| GST (18%) | {format_price(tot_gst)} | {format_price(tot_gst/n_t)} |\n"
+            f"| DP Charges | {format_price(tot_dp)} | {format_price(tot_dp/n_t)} |\n"
+            f"| Slippage & Impact | {format_price(tot_slp)} | {format_price(tot_slp/n_t)} |\n"
+            f"| **Total Operational Drag** | **{format_price(tot_all)}** | **{format_price(tot_all/n_t)}** |\n"
+        )
+
+    def _render_reasons(tdf: pd.DataFrame) -> str:
+        if len(tdf) == 0:
+            return "*No trades.*\n"
+        rs = tdf.groupby("reason").agg(trades=("pnl", "count"), net_pnl=("pnl", "sum"), win_rate=("pnl", lambda x: (x > 0).mean() * 100.0)).reset_index()
+        out = "| Exit Reason | Trades | Share | Net PnL | Win Rate |\n| :--- | :--- | :--- | :--- | :--- |\n"
+        for _, r in rs.iterrows():
+            out += f"| {r['reason']} | {int(r['trades'])} | {r['trades']/len(tdf)*100:.1f}% | {format_price(r['net_pnl'])} | {r['win_rate']:.1f}% |\n"
+        return out
+
+    _ch = is_results["concurrency_hist"]
+    _last_ch = int(np.flatnonzero(_ch)[-1]) if _ch.any() else 0
+    concurrency_md = "| Active Positions | Sessions (IS) | Share |\n| :--- | :--- | :--- |\n" + "".join(
+        f"| {s} | {cnt} | {cnt/max(1, sum(_ch))*100:.1f}% |\n" for s, cnt in enumerate(_ch[:_last_ch + 1])
+    )
+    timing_md = "| Start Shift | Deposit Day | CAGR | Bench | Excess | Score | Trades |\n| :--- | :--- | :--- | :--- | :--- | :--- | :--- |\n" + "".join(
+        f"| +{r['shift']}d | Day {r['offset']+1} | {r['cagr']:.2f}% | {r['bench']:.2f}% | {r['excess']:+.2f} | {r['score']:+.2f} | {r['trades']} |\n"
+        for r in final_timing["rows"]
+    ) + f"\n* p10 score **{final_timing['p10_score']:+.2f}**, median **{final_timing['median_score']:+.2f}**.\n"
+
+    extra_sections_md = f"""
+## 15. Distinct Ticker & Exposure Telemetry
+| Metric | In-Sample | Out-of-Sample |
+| :--- | :--- | :--- |
+| Distinct Symbols Traded | {is_exp_telemetry['distinct_scrips']} | {oos_exp_telemetry['distinct_scrips']} |
+| Peak Single-Stock Exposure | {is_exp_telemetry['max_single_stock_pct']:.1f}% | {oos_exp_telemetry['max_single_stock_pct']:.1f}% |
+| Top-5 Symbol Equity-Impact Share | {is_exp_telemetry['top5_share']:.1f}% | {oos_exp_telemetry['top5_share']:.1f}% |
+| Unconditioned / Conditioned Placebo Median | {is_placebo_suite['unconditioned'][0]:.2f}% / {is_placebo_suite['conditioned'][0]:.2f}% | {oos_placebo_suite['unconditioned'][0]:.2f}% / {oos_placebo_suite['conditioned'][0]:.2f}% |
+
+## 16. Trade Excursion Analysis (MFE / MAE)
+### In-Sample
+{_render_excursion(is_results['trades'])}
+### Out-of-Sample
+{_render_excursion(oos_results['trades'])}
+
+## 17. Realized Statutory Frictions (In-Sample)
+{_render_frictions(is_results['trades'])}
+
+## 18. Position Concurrency & Exit-Reason Breakdown
+### Active Position Distribution (IS)
+{concurrency_md}
+### In-Sample Exit Reasons
+{_render_reasons(is_results['trades'])}
+### Out-of-Sample Exit Reasons
+{_render_reasons(oos_results['trades'])}
+
+## 19. Deposit-Timing & Start-Date Robustness Battery
+{timing_md}
+"""
+    report_md = report_md.replace("## 20. >=25% Swing Run Capture Audit", extra_sections_md + "\n## 20. >=25% Swing Run Capture Audit")
     with open(REPORT_FILE, "w", encoding="utf-8") as f:
         f.write(report_md)
         logging.info(f"{ENGINE_VERSION} audit dossier written to {REPORT_FILE}")

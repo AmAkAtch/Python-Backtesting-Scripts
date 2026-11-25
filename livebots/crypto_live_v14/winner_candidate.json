@@ -1,0 +1,288 @@
+{
+    "version": "V14.0-CRYPTO",
+    "param_hash": "ca13a2c7",
+    "study_name": "crypto_swing_v14.0_crypto_top_crypto_liquid_ca13a2c7",
+    "universe": "TOP_CRYPTO_LIQUID",
+    "status": "NOT PROMOTED",
+    "gates": [
+        {
+            "name": "Continuous-slice OOS beats BTC",
+            "pass": true,
+            "detail": "OOS 17.71% vs benchmark -22.41%"
+        },
+        {
+            "name": "Continuous-slice OOS beats the equal-weight survivor basket of the same universe (survivorship-neutral)",
+            "pass": true,
+            "detail": "OOS 17.71% vs basket -17.72%"
+        },
+        {
+            "name": "Fresh-start OOS (cold restart on the OOS window, starting capital) beats BTC",
+            "pass": true,
+            "detail": "fresh OOS 36.49% vs benchmark -22.41% (survivor basket -17.72%); 21 trades"
+        },
+        {
+            "name": "IS placebo rank >= 95th",
+            "pass": true,
+            "detail": "100.0th percentile"
+        },
+        {
+            "name": "OOS placebo rank >= 80th",
+            "pass": true,
+            "detail": "100.0th percentile"
+        },
+        {
+            "name": "Organic IS CAGR (open gains at 30% credit) still beats the survivor basket (median over 4 cut dates)",
+            "pass": true,
+            "detail": "organic median 105.5% vs basket 89.6% (headline 113.3%); by cut (organic vs basket): actual 121.7% vs 94.6%, -60 bars 106.1% vs 111.1%, -120 bars 98.6% vs 84.1%, -180 bars 104.9% vs 84.6%; dollar share of profit still open (information): median 0.0%, worst 41.1%"
+        },
+        {
+            "name": "Leave-top-5-out IS CAGR still beats benchmark",
+            "pass": false,
+            "detail": "21.57% vs 58.96%"
+        },
+        {
+            "name": "No single year > 40% of total log-return",
+            "pass": false,
+            "detail": "best year 2021 = 56.6%"
+        },
+        {
+            "name": "Beats BTC in >= 70% of calendar years (year-on-year goal)",
+            "pass": true,
+            "detail": "6 of 8 years"
+        },
+        {
+            "name": "Lottery guard: top-5 trades <= 50% of total profit (each trade as % of equity at entry)",
+            "pass": true,
+            "detail": "47.5% (in dollars it would read 69.9%)"
+        },
+        {
+            "name": "Max drawdown <= 1.25x benchmark's",
+            "pass": true,
+            "detail": "36.6% vs benchmark 76.6%"
+        },
+        {
+            "name": "Neighborhood stable (all active params +/- 1 step, MA types, floor)",
+            "pass": true,
+            "detail": "90% of neighbors beat the benchmark net of DD penalty (rule: >= 80%, median not far below the candidate, p10 > 0)"
+        },
+        {
+            "name": "Deposit-timing / start-date robust (p10 score > 0)",
+            "pass": true,
+            "detail": "p10 score +3.97 over 15 timing variants"
+        },
+        {
+            "name": "Seeds agreeing on the strategy family >= 2",
+            "pass": false,
+            "detail": "1 of 3 seeds"
+        }
+    ],
+    "is_score": 1.086205224868441,
+    "is_metrics": {
+        "score": 1.569078095901541,
+        "full": {
+            "trades": 97,
+            "net_pnl": 1339068.0441963905,
+            "cagr": 121.67135084170187,
+            "total_return": 7033.24973730861,
+            "win_rate": 51.546391752577314,
+            "pure_win_rate": 51.546391752577314,
+            "be_rate": 0.0,
+            "loss_rate": 48.45360824742268,
+            "profit_factor": 4.954567253697393
+        },
+        "eot_trades": 0,
+        "eot_pnl": 0.0,
+        "eot_profit_share": 0.0,
+        "cagr_organic": 121.67135084170187,
+        "trimmed_cagr": 118.65379801324784,
+        "excess_cagr": 59.69193873889406,
+        "bench_max_dd": 76.62925431645935,
+        "max_dd": 36.57610374667948,
+        "closed_trade_dd_pct": 21.470601817828406,
+        "utilization": 23.07443270090976,
+        "obj_core": 1.569078095901541,
+        "dd_penalty": 0.0,
+        "year_excess_raw": [
+            11.557673123486975,
+            -120.23194737056775,
+            29.381997899896096,
+            75.27528500293094,
+            -14.093639665764604,
+            9.621115600286423
+        ],
+        "excess_vs_basket_cagr": 24.047992702164947
+    },
+    "oos_metrics": {
+        "score": 13.450558614621663,
+        "full": {
+            "trades": 21,
+            "net_pnl": 6931.149697478216,
+            "cagr": 36.49099474037172,
+            "total_return": 74.39985799337394,
+            "win_rate": 42.857142857142854,
+            "pure_win_rate": 42.857142857142854,
+            "be_rate": 0.0,
+            "loss_rate": 57.14285714285714,
+            "profit_factor": 3.6392348913085963
+        },
+        "eot_trades": 0,
+        "eot_pnl": 0.0,
+        "eot_profit_share": 0.0,
+        "cagr_organic": 36.49099474037172,
+        "trimmed_cagr": 29.979041908111864,
+        "excess_cagr": 52.390333658841485,
+        "bench_max_dd": 52.971765913510616,
+        "max_dd": 21.102982083934567,
+        "closed_trade_dd_pct": 15.10111954486987,
+        "utilization": 17.34662788385339,
+        "obj_core": 13.450558614621663,
+        "dd_penalty": 0.0,
+        "year_excess_raw": [
+            64.72272102846837,
+            25.757714355920232
+        ],
+        "excess_vs_basket_cagr": 47.69522880211005
+    },
+    "oos_continuous_slice": {
+        "cagr": 17.709916870137498,
+        "max_dd": 18.50809361498441,
+        "trades": 27,
+        "net_pnl": 478933.7894042009,
+        "bars": 654
+    },
+    "is_swing_capture": {
+        "total_runs": 326,
+        "total_25pct_runs": 326,
+        "setup_run_capture": 0.003067484662576687,
+        "setup_mag_capture": 0.023454300350399096,
+        "portfolio_run_capture": 0.10810810810810811,
+        "capture_score": 0.1894413215212556
+    },
+    "oos_swing_capture": {
+        "total_runs": 88,
+        "total_25pct_runs": 88,
+        "setup_run_capture": 0.0,
+        "setup_mag_capture": 0.016053375571456245,
+        "portfolio_run_capture": 0.0,
+        "capture_score": 0.11466696836754461
+    },
+    "is_post_tax": {
+        "pnl": 801422.9894398277,
+        "cagr": 101.78126706217441
+    },
+    "oos_post_tax": {
+        "pnl": 3316.2504357244025,
+        "cagr": 18.569107255670424
+    },
+    "is_twr_analytics": {
+        "twr_corr": 0.2663470335327059,
+        "twr_beta": 0.24600880450586057,
+        "up_capture": 35.63009533718774,
+        "down_capture": 16.54798103798443
+    },
+    "oos_twr_analytics": {
+        "twr_corr": 0.20559717362075292,
+        "twr_beta": 0.1589076426479768,
+        "up_capture": 31.564429802011862,
+        "down_capture": 17.53345276139459
+    },
+    "leave5_cagr": 21.570418464699337,
+    "top_5_scrips": [
+        "NEAR",
+        "AVAX",
+        "DOGE",
+        "SOL",
+        "XRP"
+    ],
+    "is_placebo_suite": {
+        "unconditioned": [
+            17.6656668138506,
+            -2.5035111478816843,
+            36.43668643777941
+        ],
+        "conditioned": [
+            11.003891952767543,
+            -4.153671624969329,
+            34.24514562776676
+        ]
+    },
+    "oos_placebo_suite": {
+        "unconditioned": [
+            -4.142370436325393,
+            -14.86849570546211,
+            19.538780384238212
+        ],
+        "conditioned": [
+            -0.6638101188079781,
+            -8.864285856988348,
+            17.719878633113815
+        ]
+    },
+    "is_exposure_telemetry": {
+        "distinct_scrips": 21,
+        "max_single_stock_pct": 67.43825513548968,
+        "top5_share": 83.05362651595587
+    },
+    "oos_exposure_telemetry": {
+        "distinct_scrips": 13,
+        "max_single_stock_pct": 55.32836193016234,
+        "top5_share": 97.82839187053732
+    },
+    "seed_agreement": 1,
+    "continuous_year_returns": {
+        "2019": 0.4099322303407593,
+        "2020": 20.79456755235949,
+        "2021": 1219.6534593966185,
+        "2022": -24.017455468450123,
+        "2023": 122.00631746171209,
+        "2024": 164.19481186389396,
+        "2025": 25.795152611955572,
+        "2026": 6.399464552425882
+    },
+    "best_params": {
+        "entry_type": 3,
+        "adx_thresh": 25.0,
+        "price_lookback": 22,
+        "body_atr_mult": 1.0,
+        "breakout_use_volume": true,
+        "vol_ma_len": 50,
+        "vol_mult": 3.5,
+        "use_entry_filter_1": false,
+        "use_market_macro_system": true,
+        "macro_ma_len": 80,
+        "macro_ma_type": 3,
+        "macro_active_exit": true,
+        "size_w0": 0.08,
+        "size_w_max": 0.25,
+        "size_reserve": 0.05,
+        "size_ramp": 0.1,
+        "wl_revalidate": true,
+        "max_pyramid_layers": 3,
+        "avg_down_free_adds": 0,
+        "pyramid_rule": 2,
+        "pyramid_progress_atr": 1.5,
+        "wl_mode": "WL_STRONGEST_MOMENTUM",
+        "tranche_floor": 100.0,
+        "be_trigger_atr": 0.0,
+        "max_holding_bars": 80,
+        "sl_mult": 5.4,
+        "trail_mode": "ATR",
+        "trail_atr_mult": 8.0,
+        "use_exit_primary": true,
+        "exit_primary": "RSI_CROSS_DOWN",
+        "ex1_rsi_f_len": 18,
+        "ex1_rsi_f_smt": 12,
+        "ex1_rsi_s_len": 50,
+        "ex1_rsi_s_smt": 8,
+        "use_exit_secondary": false,
+        "entry_filter_1": "NONE",
+        "entry_filter_2": "NONE",
+        "exit_secondary": "NONE",
+        "trail_pct": 0.0,
+        "wl_dedupe": true,
+        "wl_max_age_bars": 0,
+        "whole_shares": false,
+        "pyramid_gap_bars": 0
+    },
+    "updated_at": "2026-11-24T23:45:16.667397"
+}

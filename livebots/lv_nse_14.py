@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-NSE LIVE PAPER-TRADING & EXECUTION BOT V14.0
+NSE LIVE PAPER-TRADING & EXECUTION BOT V14.1
 ============================================
 Runs AFTER the market close and tells you what to do at TOMORROW'S OPEN.
   * 100% Rulebook Parity with `bt_nse_14_2.py` (V14.0):
@@ -45,28 +45,30 @@ ALLOW_NOT_PROMOTED_CONFIG: bool = True     # True = allow running winner_candida
 LIVE_CONFIG_OVERRIDE: Optional[str] = None # Path to a specific winner json; None = winner.json, else winner_candidate.json
 MARKET_CLOSE_IST_HOUR: float = 16.0        # Exclude today's incomplete bar if run before this hour IST
 
-STARTING_CASH_INR: float = 10000.0             # Free cash in broker account on first run. 0 = no BUY orders planned.
+STARTING_CASH_INR: float = 0.0             # Free cash in broker account on first run. 0 = no BUY orders planned.
 COLAB_WORK_DIR: str = "/content/drive/MyDrive/nse_live_v14"
 WORK_DIR_OVERRIDE: Optional[str] = None    # Local override (e.g. nifty50_backtest folder to share data_cache)
 
 # Holdings you own (from Upstox trade register). Added once each (by symbol|date|units|price).
 MANUAL_HOLDINGS_ADD: List[Dict[str, Any]] = [
-    {"coin": "ADANIGREEN", "units": 6, "entry_price": 1377.80, "entry_date": "2026-07-28"},
-    {"coin": "BPCL", "units": 20, "entry_price": 293.90, "entry_date": "2026-07-12"},
-    {"coin": "CGPOWER", "units": 14, "entry_price": 740.55, "entry_date": "2026-03-13"},
-    {"coin": "CHOLAFIN", "units": 4, "entry_price": 1765.60, "entry_date": "2026-09-16"},
-    {"coin": "GAIL", "units": 45, "entry_price": 175.78, "entry_date": "2026-06-18"},
-    {"coin": "HDBFS", "units": 12, "entry_price": 684.85, "entry_date": "2026-07-29"},
-    {"coin": "IOC", "units": 23, "entry_price": 131.38, "entry_date": "2026-05-18"},
-    {"coin": "ITCHOTELS", "units": 48, "entry_price": 164.93, "entry_date": "2026-08-17"},
-    {"coin": "JSWENERGY", "units": 15, "entry_price": 515.05, "entry_date": "2026-05-15"},
-    {"coin": "MOTILALOFS", "units": 9, "entry_price": 869.30, "entry_date": "2026-07-27"},
-    {"coin": "NATCOPHARM", "units": 8, "entry_price": 927.55, "entry_date": "2026-03-23"},
-    {"coin": "NATIONALUM", "units": 14, "entry_price": 374.00, "entry_date": "2026-09-03"},
-    {"coin": "NHPC", "units": 67, "entry_price": 78.50, "entry_date": "2026-05-12"},
-    {"coin": "NTPCGREEN", "units": 73, "entry_price": 110.15, "entry_date": "2026-05-15"},
-    {"coin": "PHOENIXLTD", "units": 4, "entry_price": 1908.70, "entry_date": "2026-08-11"},
-    {"coin": "TATAPOWER", "units": 20, "entry_price": 395.00, "entry_date": "2026-04-08"},
+    # {"coin": "ADANIGREEN", "units": 6, "entry_price": 1377.80, "entry_date": "2026-07-28"},
+    # {"coin": "BPCL", "units": 20, "entry_price": 293.90, "entry_date": "2026-07-12"},
+    # {"coin": "CGPOWER", "units": 14, "entry_price": 740.55, "entry_date": "2026-03-13"},
+    # {"coin": "CHOLAFIN", "units": 4, "entry_price": 1765.60, "entry_date": "2026-09-16"},
+    # {"coin": "GAIL", "units": 45, "entry_price": 175.78, "entry_date": "2026-06-18"},
+    # {"coin": "HDBFS", "units": 12, "entry_price": 684.85, "entry_date": "2026-07-29"},
+    # {"coin": "HUDCO", "units": 38, "entry_price": 208.71, "entry_date": "2026-07-13"},
+    # {"coin": "IOC", "units": 23, "entry_price": 131.38, "entry_date": "2026-05-18"},
+    # {"coin": "ITC", "units": 20, "entry_price": 348.90, "entry_date": "2026-01-06"},
+    # {"coin": "ITCHOTELS", "units": 48, "entry_price": 164.93, "entry_date": "2026-08-17"},
+    # {"coin": "JSWENERGY", "units": 15, "entry_price": 515.05, "entry_date": "2026-05-15"},
+    # {"coin": "MOTILALOFS", "units": 9, "entry_price": 869.30, "entry_date": "2026-07-27"},
+    # {"coin": "NATCOPHARM", "units": 8, "entry_price": 927.55, "entry_date": "2026-03-23"},
+    # {"coin": "NATIONALUM", "units": 14, "entry_price": 374.00, "entry_date": "2026-09-03"},
+    # {"coin": "NHPC", "units": 67, "entry_price": 78.50, "entry_date": "2026-05-12"},
+    # {"coin": "NTPCGREEN", "units": 73, "entry_price": 110.15, "entry_date": "2026-05-15"},
+    # {"coin": "PHOENIXLTD", "units": 4, "entry_price": 1908.70, "entry_date": "2026-08-11"},
+    # {"coin": "TATAPOWER", "units": 20, "entry_price": 395.00, "entry_date": "2026-04-08"},
 ]
 # Positions sold manually: {"coin": "X", "entry_date": "YYYY-MM-DD", "exit_date": "YYYY-MM-DD", "exit_price": 123.4}
 MANUAL_HOLDINGS_REMOVE: List[Dict[str, Any]] = []
@@ -93,7 +95,7 @@ except Exception:
     GMAIL_APP_PASSWORD = os.environ.get("GMAIL_APP_PASSWORD", "")
     RECIPIENT_EMAIL = os.environ.get("RECIPIENT_EMAIL", "")
 
-LIVE_ENGINE_VERSION = "V14.0"
+LIVE_ENGINE_VERSION = "V14.1"
 IST = dt.timezone(dt.timedelta(hours=5, minutes=30))
 
 # ==============================================================================
@@ -624,11 +626,11 @@ class FastIndicators:
 _SPLIT_RATIOS = (0.10, 0.20, 0.25, 0.3333, 0.50, 0.6667, 0.75, 2.0, 3.0, 4.0, 5.0, 10.0)
 
 
-def _is_plausible_split_ratio(qe: float, vol_jump: bool) -> bool:
+def _is_plausible_split_ratio(qe: float, vol_jump: bool = False) -> bool:
     for r in _SPLIT_RATIOS:
         if abs(qe - r) / r <= 0.08:
             return True
-    return bool(vol_jump and (qe <= 0.55 or qe >= 1.90))
+    return False
 
 
 def repair_price_artifacts(df: pd.DataFrame, sym: str, mkt_ret: Optional[pd.Series],
@@ -1029,11 +1031,11 @@ def _eval_exit_signal(bank: VectorIndicatorBank, grid: MarketGrid, xname: str, p
     elif xname == "RSI_CROSS_DOWN":
         rf = bank.rsi_smoothed(p[f"{prefix}_rsi_f_len"], p[f"{prefix}_rsi_f_smt"])
         rs = bank.rsi_smoothed(p[f"{prefix}_rsi_s_len"], p[f"{prefix}_rsi_s_smt"])
-        return (~np.isnan(rf)) & (~np.isnan(rs)) & (rf < rs) & (shift_2d(rf) >= shift_2d(rs))
+        return (~np.isnan(rf)) & (~np.isnan(rs)) & (rf < rs)
     elif xname == "MA_XOVER_DOWN":
         s_ma = bank.ma(p[f"{prefix}_xover_s_len"], p[f"{prefix}_xover_s_type"])
         l_ma = bank.ma(p[f"{prefix}_xover_l_len"], p[f"{prefix}_xover_l_type"])
-        return (~np.isnan(s_ma)) & (~np.isnan(l_ma)) & (s_ma < l_ma) & (shift_2d(s_ma) >= shift_2d(l_ma))
+        return (~np.isnan(s_ma)) & (~np.isnan(l_ma)) & (s_ma < l_ma)
     elif xname == "CLIMAX_VOLUME_RED":
         w = max(2, int(p[f"{prefix}_vol_ma_len"]))
         v_shift = shift_2d(v, fill_value=0.0)
@@ -1564,7 +1566,7 @@ def replay_position(grid: MarketGrid, rules: Rules, sig, pos: Dict[str, Any], n:
         )
         if reason and out["overdue_since"] is None:
             out["overdue_since"] = str(grid.dates[t].date())
-        # If the price recovered back above the stop on a later day while still held, clear pending_stop
+        # Forgive historical dips on adopted holdings if price has since recovered above the stop
         tr.pending_stop = False
         tr.pending_reason = ""
         tranche_eod_update(tr, t, grid, rules.trail_mode, rules.be_trigger_mult, rules.trail_pct_mult, rules.trail_mult)
